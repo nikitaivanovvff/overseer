@@ -11,6 +11,8 @@ use crate::{
     app::{App, Focus},
 };
 
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub fn render(frame: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -27,14 +29,17 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(7)])
         .split(body[0]);
 
-    render_agent_tree(frame, app, left[0]);
-    render_agent_detail(frame, app, left[1]);
-    render_pane(frame, app, body[1]);
+    // Compute once and share — avoids 4 separate flatten() traversals per frame.
+    let flat = app.agent_tree.flatten();
+    let selected = flat.get(app.agent_tree.cursor).cloned();
+
+    render_agent_tree(frame, app, left[0], &flat);
+    render_agent_detail(frame, left[1], &selected);
+    render_pane(frame, app, body[1], &selected);
     render_status_bar(frame, app, outer[1]);
 }
 
-fn render_agent_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let flat = app.agent_tree.flatten();
+fn render_agent_tree(frame: &mut Frame, app: &App, area: Rect, flat: &[FlatNode]) {
     let focused = app.focus == Focus::Tree;
 
     let items: Vec<ListItem> = flat
@@ -42,7 +47,7 @@ fn render_agent_tree(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, node)| {
             let selected = i == app.agent_tree.cursor;
-            let line = tree_row(node, selected);
+            let line = tree_row(node, selected, app.tick);
             if selected {
                 ListItem::new(line).style(Style::default().bg(Color::DarkGray))
             } else {
@@ -59,44 +64,54 @@ fn render_agent_tree(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn tree_row(node: &FlatNode, selected: bool) -> Line<'static> {
+fn tree_row(node: &FlatNode, selected: bool, tick: u64) -> Line<'static> {
     let name_style = if selected {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
 
+    let badge = if node.status == AgentStatus::Running {
+        let frame = (tick as usize / 2) % SPINNER_FRAMES.len();
+        SPINNER_FRAMES[frame].to_string()
+    } else {
+        node.status.badge().to_string()
+    };
+
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
-        Span::styled(node.status.badge(), status_style(&node.status)),
+        Span::styled(badge, node.status.style()),
         Span::raw(" "),
         Span::styled(node.name.clone(), name_style),
     ])
 }
 
-fn render_agent_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let content = match app.agent_tree.selected() {
+fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>) {
+    let content = match selected {
         Some(node) => vec![
             Line::from(vec![
                 Span::styled("task:   ", Style::default().fg(Color::DarkGray)),
-                Span::raw(node.name),
+                Span::raw(node.name.clone()),
             ]),
             Line::from(vec![
                 Span::styled("status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.status.label(), status_style(&node.status)),
+                Span::styled(node.status.label(), node.status.style()),
             ]),
             Line::from(vec![
                 Span::styled("repo:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    node.repo.unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(node.repo.clone(), Style::default().fg(Color::Cyan)),
             ]),
             Line::from(vec![
                 Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(node.branch.clone(), Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::styled("ctx:    ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    node.branch.unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(Color::Yellow),
+                    node.context_pct
+                        .map(|p| format!("{p}%  {}", context_bar(p)))
+                        .unwrap_or_else(|| "—".to_string()),
+                    Style::default().fg(Color::White),
                 ),
             ]),
             Line::from(vec![
@@ -113,39 +128,33 @@ fn render_agent_detail(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" DETAIL ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(focused_border(false));
 
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
-fn render_pane(frame: &mut Frame, app: &App, area: Rect) {
+fn render_pane(frame: &mut Frame, app: &App, area: Rect, selected: &Option<FlatNode>) {
     let focused = app.focus == Focus::Pane;
-    let selected = app.agent_tree.selected();
 
-    // Split pane area: 1-line repo/branch header + rest for the terminal
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
-    render_pane_header(frame, &selected, chunks[0]);
-    render_pane_body(frame, &selected, focused, chunks[1]);
+    render_pane_header(frame, selected, chunks[0]);
+    render_pane_body(frame, selected, focused, chunks[1]);
 }
 
 fn render_pane_header(frame: &mut Frame, selected: &Option<FlatNode>, area: Rect) {
     let line = match selected {
-        Some(node) => {
-            let repo = node.repo.clone().unwrap_or_else(|| "—".to_string());
-            let branch = node.branch.clone().unwrap_or_else(|| "—".to_string());
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled("repo: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(repo, Style::default().fg(Color::Cyan)),
-                Span::raw("   "),
-                Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(branch, Style::default().fg(Color::Yellow)),
-            ])
-        }
+        Some(node) => Line::from(vec![
+            Span::raw(" "),
+            Span::styled("repo: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(node.repo.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw("   "),
+            Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(node.branch.clone(), Style::default().fg(Color::Yellow)),
+        ]),
         None => Line::from(Span::styled(
             " no agent selected",
             Style::default().fg(Color::DarkGray),
@@ -174,7 +183,7 @@ fn render_pane_body(frame: &mut Frame, selected: &Option<FlatNode>, focused: boo
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  press Tab to focus this panel",
+            "  o / ↵ to open  •  F2 to toggle focus",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -188,9 +197,8 @@ fn render_pane_body(frame: &mut Frame, selected: &Option<FlatNode>, focused: boo
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let flat = app.agent_tree.flatten();
-    let running = flat.iter().filter(|n| n.status == AgentStatus::Running).count();
-    let total = flat.len();
+    // agent_counts walks the full tree regardless of expand/collapse state.
+    let (running, total) = app.agent_tree.agent_counts();
 
     let bar = Line::from(vec![
         Span::styled(
@@ -209,8 +217,10 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("j/k", Style::default().fg(Color::Yellow)),
         Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
         Span::styled("<space>", Style::default().fg(Color::Yellow)),
-        Span::styled(" expand  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("o/↵", Style::default().fg(Color::Yellow)),
+        Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("F2", Style::default().fg(Color::Yellow)),
         Span::styled(" focus  ", Style::default().fg(Color::DarkGray)),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
@@ -219,14 +229,9 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(bar), area);
 }
 
-fn status_style(status: &AgentStatus) -> Style {
-    match status {
-        AgentStatus::Spawning => Style::default().fg(Color::Cyan),
-        AgentStatus::Running => Style::default().fg(Color::Green),
-        AgentStatus::Waiting => Style::default().fg(Color::Yellow),
-        AgentStatus::Done => Style::default().fg(Color::Blue),
-        AgentStatus::Error => Style::default().fg(Color::Red),
-    }
+fn context_bar(pct: u8) -> String {
+    let filled = (pct as usize * 8 / 100).min(8);
+    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
 }
 
 fn focused_border(focused: bool) -> Style {

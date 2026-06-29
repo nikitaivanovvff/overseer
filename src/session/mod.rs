@@ -9,7 +9,7 @@ pub struct SessionInfo {
 
 /// Parse a single line from `tmux list-sessions -F "#{session_name}|#{session_windows}"`.
 pub fn parse_session_line(line: &str) -> Option<SessionInfo> {
-    let (name, rest) = line.split_once('|')?;
+    let (name, rest) = line.rsplit_once('|')?;
     Some(SessionInfo {
         name: name.trim().to_string(),
         windows: rest.trim().parse().unwrap_or(0),

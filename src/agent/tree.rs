@@ -1,0 +1,454 @@
+use super::{AgentId, AgentNode, AgentRole, AgentStatus};
+
+/// A flattened snapshot of one AgentNode for rendering and navigation.
+/// `prefix` is the pre-computed tree-connector string (e.g. "│ ├ ").
+#[derive(Debug, Clone)]
+pub struct FlatNode {
+    pub id: AgentId,
+    pub name: String,
+    pub status: AgentStatus,
+    pub role: AgentRole,
+    pub repo: String,
+    pub branch: String,
+    pub context_pct: Option<u8>,
+    pub depth: usize,
+    pub has_children: bool,
+    pub expanded: bool,
+    pub is_last_sibling: bool,
+    pub prefix: String,
+}
+
+#[derive(Debug, Default)]
+pub struct AgentTree {
+    pub roots: Vec<AgentNode>,
+    pub cursor: usize,
+}
+
+impl AgentTree {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_root(&mut self, node: AgentNode) {
+        self.roots.push(node);
+    }
+
+    /// Returns visible nodes in traversal order, respecting expand/collapse state.
+    pub fn flatten(&self) -> Vec<FlatNode> {
+        let mut result = Vec::new();
+        let n = self.roots.len();
+        for (i, root) in self.roots.iter().enumerate() {
+            flatten_node(root, 0, i == n - 1, "", &mut result);
+        }
+        result
+    }
+
+    /// Returns (running, total) counts across ALL agents, ignoring expand/collapse state.
+    pub fn agent_counts(&self) -> (usize, usize) {
+        fn count(nodes: &[AgentNode], running: &mut usize, total: &mut usize) {
+            for node in nodes {
+                *total += 1;
+                if node.status == AgentStatus::Running {
+                    *running += 1;
+                }
+                count(&node.children, running, total);
+            }
+        }
+        let (mut running, mut total) = (0, 0);
+        count(&self.roots, &mut running, &mut total);
+        (running, total)
+    }
+
+    pub fn move_down(&mut self) {
+        let count = self.flatten().len();
+        if count > 0 {
+            // Clamp first so a stale cursor doesn't jump backward.
+            let capped = self.cursor.min(count - 1);
+            self.cursor = (capped + 1).min(count - 1);
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn toggle_expand(&mut self) {
+        let flat = self.flatten();
+        if let Some(node) = flat.get(self.cursor) {
+            if node.has_children {
+                let id = node.id.clone();
+                toggle_expand_by_id(&mut self.roots, &id);
+                let new_count = self.flatten().len();
+                self.cursor = self.cursor.min(new_count.saturating_sub(1));
+            }
+        }
+    }
+
+    pub fn selected(&self) -> Option<FlatNode> {
+        self.flatten().into_iter().nth(self.cursor)
+    }
+
+    pub fn with_mock_data() -> Self {
+        let mut root1 = AgentNode::new_root("implement-auth", "overseer");
+        root1.context_pct = Some(45);
+
+        let mut child_a = AgentNode::new_child("auth-module", "overseer");
+        child_a.context_pct = Some(23);
+
+        let mut child_b = AgentNode::new_child("write-tests", "overseer");
+        child_b.status = AgentStatus::Done;
+        child_b.context_pct = Some(87);
+
+        let mut child_c = AgentNode::new_child("update-docs", "overseer");
+        child_c.status = AgentStatus::Waiting;
+        child_c.context_pct = Some(5);
+
+        root1.children.push(child_a);
+        root1.children.push(child_b);
+        root1.children.push(child_c);
+
+        let mut root2 = AgentNode::new_root("refactor-api", "overseer");
+        root2.status = AgentStatus::Waiting;
+
+        let mut root3 = AgentNode::new_root("fix-login-bug", "overseer");
+        root3.status = AgentStatus::Error;
+        root3.context_pct = Some(62);
+
+        let mut tree = Self::new();
+        tree.add_root(root1);
+        tree.add_root(root2);
+        tree.add_root(root3);
+        tree
+    }
+}
+
+// Recursively flatten, building the tree-connector prefix as we go.
+// `indent` is the accumulated indentation string from ancestor levels.
+fn flatten_node(
+    node: &AgentNode,
+    depth: usize,
+    is_last: bool,
+    indent: &str,
+    result: &mut Vec<FlatNode>,
+) {
+    let connector = if depth == 0 {
+        ""
+    } else if is_last {
+        "└ "
+    } else {
+        "├ "
+    };
+
+    result.push(FlatNode {
+        id: node.id.clone(),
+        name: node.name.clone(),
+        status: node.status.clone(),
+        role: node.role.clone(),
+        repo: node.repo.clone(),
+        branch: node.branch.clone(),
+        context_pct: node.context_pct,
+        depth,
+        has_children: !node.children.is_empty(),
+        expanded: node.expanded,
+        is_last_sibling: is_last,
+        prefix: format!("{indent}{connector}"),
+    });
+
+    if node.expanded {
+        // When a root node (depth=0) is not the last root, its children need
+        // a "│ " continuation bar so the visual tree shows root2 still follows.
+        let child_indent = if is_last {
+            if depth == 0 {
+                String::new()
+            } else {
+                format!("{indent}  ")
+            }
+        } else {
+            format!("{indent}│ ")
+        };
+        let n = node.children.len();
+        for (i, child) in node.children.iter().enumerate() {
+            flatten_node(child, depth + 1, i == n - 1, &child_indent, result);
+        }
+    }
+}
+
+fn toggle_expand_by_id(nodes: &mut Vec<AgentNode>, target: &AgentId) -> bool {
+    for node in nodes.iter_mut() {
+        if &node.id == target {
+            node.expanded = !node.expanded;
+            return true;
+        }
+        if toggle_expand_by_id(&mut node.children, target) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // make_tree builds a 3-level tree to exercise the flatten/navigation logic
+    // at depth > 1. Production code enforces max_depth=1 at the IPC layer (Phase 2),
+    // not at the model level, so this fixture is valid for testing the traversal.
+    fn make_tree() -> AgentTree {
+        let mut root = AgentNode::new_root("root", "repo");
+        let mut child_a = AgentNode::new_child("child-a", "repo");
+        let grandchild = AgentNode::new_child("grandchild", "repo");
+        child_a.children.push(grandchild);
+        let child_b = AgentNode::new_child("child-b", "repo");
+        root.children.push(child_a);
+        root.children.push(child_b);
+        let mut tree = AgentTree::new();
+        tree.add_root(root);
+        tree
+    }
+
+    #[test]
+    fn test_flatten_empty() {
+        let tree = AgentTree::new();
+        assert!(tree.flatten().is_empty());
+    }
+
+    #[test]
+    fn test_flatten_single_root_no_prefix() {
+        let mut tree = AgentTree::new();
+        tree.add_root(AgentNode::new_root("root", "repo"));
+        let flat = tree.flatten();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].prefix, "");
+        assert_eq!(flat[0].depth, 0);
+    }
+
+    #[test]
+    fn test_flatten_node_count() {
+        let tree = make_tree();
+        // root, child-a, grandchild, child-b
+        assert_eq!(tree.flatten().len(), 4);
+    }
+
+    #[test]
+    fn test_flatten_order() {
+        let tree = make_tree();
+        let flat = tree.flatten();
+        assert_eq!(flat[0].name, "root");
+        assert_eq!(flat[1].name, "child-a");
+        assert_eq!(flat[2].name, "grandchild");
+        assert_eq!(flat[3].name, "child-b");
+    }
+
+    #[test]
+    fn test_flatten_depths() {
+        let tree = make_tree();
+        let flat = tree.flatten();
+        assert_eq!(flat[0].depth, 0);
+        assert_eq!(flat[1].depth, 1);
+        assert_eq!(flat[2].depth, 2);
+        assert_eq!(flat[3].depth, 1);
+    }
+
+    #[test]
+    fn test_flatten_prefixes() {
+        let tree = make_tree();
+        let flat = tree.flatten();
+        assert_eq!(flat[0].prefix, "");       // root
+        assert_eq!(flat[1].prefix, "├ ");     // child-a (not last)
+        assert_eq!(flat[2].prefix, "│ └ ");   // grandchild (parent not last, grandchild is last)
+        assert_eq!(flat[3].prefix, "└ ");     // child-b (last)
+    }
+
+    #[test]
+    fn test_flatten_multi_root_child_indent() {
+        // Regression for child_indent depth==0 bug: children of a non-last root
+        // must receive "│ " child_indent so their subtrees show the continuation bar.
+        let mut tree = AgentTree::new();
+        let mut root1 = AgentNode::new_root("root1", "repo");
+        let child = AgentNode::new_child("child", "repo");
+        let mut child_with_kids = AgentNode::new_child("child-with-kids", "repo");
+        // Give child-with-kids its own child so we can check grand-indent.
+        let grandchild = AgentNode::new_child("grandchild", "repo");
+        child_with_kids.children.push(grandchild);
+        root1.children.push(child);
+        root1.children.push(child_with_kids);
+        let root2 = AgentNode::new_root("root2", "repo");
+        tree.add_root(root1);
+        tree.add_root(root2);
+
+        let flat = tree.flatten();
+        // root1 is not last: children should use "│ " indent
+        assert_eq!(flat[1].prefix, "│ ├ "); // child (not last, under non-last root)
+        assert_eq!(flat[2].prefix, "│ └ "); // child-with-kids (last, under non-last root)
+        assert_eq!(flat[3].prefix, "│   └ "); // grandchild (last, parent is last under non-last root)
+    }
+
+    #[test]
+    fn test_flatten_last_sibling_flags() {
+        let tree = make_tree();
+        let flat = tree.flatten();
+        assert!(flat[0].is_last_sibling);
+        assert!(!flat[1].is_last_sibling);
+        assert!(flat[2].is_last_sibling);
+        assert!(flat[3].is_last_sibling);
+    }
+
+    #[test]
+    fn test_flatten_collapsed_hides_children() {
+        let mut tree = make_tree();
+        let child_a_id = tree.flatten()[1].id.clone();
+        toggle_expand_by_id(&mut tree.roots, &child_a_id);
+        let flat = tree.flatten();
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0].name, "root");
+        assert_eq!(flat[1].name, "child-a");
+        assert_eq!(flat[2].name, "child-b");
+    }
+
+    #[test]
+    fn test_flatten_multiple_roots() {
+        let mut tree = AgentTree::new();
+        tree.add_root(AgentNode::new_root("root1", "repo"));
+        tree.add_root(AgentNode::new_root("root2", "repo"));
+        let flat = tree.flatten();
+        assert_eq!(flat.len(), 2);
+        assert!(!flat[0].is_last_sibling);
+        assert!(flat[1].is_last_sibling);
+    }
+
+    #[test]
+    fn test_move_down_advances_cursor() {
+        let mut tree = make_tree();
+        tree.move_down();
+        assert_eq!(tree.cursor, 1);
+        tree.move_down();
+        assert_eq!(tree.cursor, 2);
+    }
+
+    #[test]
+    fn test_move_up_decrements_cursor() {
+        let mut tree = make_tree();
+        tree.cursor = 2;
+        tree.move_up();
+        assert_eq!(tree.cursor, 1);
+        tree.move_up();
+        assert_eq!(tree.cursor, 0);
+    }
+
+    #[test]
+    fn test_move_up_at_top_stays() {
+        let mut tree = make_tree();
+        tree.move_up();
+        assert_eq!(tree.cursor, 0);
+    }
+
+    #[test]
+    fn test_move_down_at_bottom_stays() {
+        let mut tree = make_tree();
+        let last = tree.flatten().len() - 1;
+        tree.cursor = last;
+        tree.move_down();
+        assert_eq!(tree.cursor, last);
+    }
+
+    #[test]
+    fn test_move_down_on_empty_is_noop() {
+        let mut tree = AgentTree::new();
+        tree.move_down();
+        assert_eq!(tree.cursor, 0);
+    }
+
+    #[test]
+    fn test_move_down_clamps_stale_cursor() {
+        // cursor above count must not jump backward when move_down is called
+        let mut tree = make_tree();
+        tree.cursor = 99; // stale / out-of-bounds
+        tree.move_down();
+        let last = tree.flatten().len() - 1;
+        assert_eq!(tree.cursor, last);
+    }
+
+    #[test]
+    fn test_toggle_expand_collapses_children() {
+        let mut tree = make_tree();
+        tree.cursor = 1;
+        let before = tree.flatten().len();
+        tree.toggle_expand();
+        assert_eq!(tree.flatten().len(), before - 1);
+    }
+
+    #[test]
+    fn test_toggle_expand_re_expands() {
+        let mut tree = make_tree();
+        tree.cursor = 1;
+        tree.toggle_expand();
+        tree.toggle_expand();
+        assert_eq!(tree.flatten().len(), 4);
+    }
+
+    #[test]
+    fn test_toggle_expand_on_leaf_is_noop() {
+        let mut tree = make_tree();
+        tree.cursor = 3;
+        let before = tree.flatten().len();
+        tree.toggle_expand();
+        assert_eq!(tree.flatten().len(), before);
+    }
+
+    #[test]
+    fn test_cursor_clamped_after_collapse() {
+        let mut tree = make_tree();
+        tree.cursor = 2;
+        let child_a_id = tree.flatten()[1].id.clone();
+        toggle_expand_by_id(&mut tree.roots, &child_a_id);
+        let new_count = tree.flatten().len();
+        tree.cursor = tree.cursor.min(new_count.saturating_sub(1));
+        assert!(tree.cursor < tree.flatten().len());
+    }
+
+    #[test]
+    fn test_selected_returns_cursor_node() {
+        let tree = make_tree();
+        assert_eq!(tree.selected().unwrap().name, "root");
+    }
+
+    #[test]
+    fn test_selected_after_move() {
+        let mut tree = make_tree();
+        tree.move_down();
+        assert_eq!(tree.selected().unwrap().name, "child-a");
+    }
+
+    #[test]
+    fn test_selected_on_empty_is_none() {
+        let tree = AgentTree::new();
+        assert!(tree.selected().is_none());
+    }
+
+    #[test]
+    fn test_has_children_flag() {
+        let tree = make_tree();
+        let flat = tree.flatten();
+        assert!(flat[0].has_children);
+        assert!(flat[1].has_children);
+        assert!(!flat[2].has_children);
+        assert!(!flat[3].has_children);
+    }
+
+    #[test]
+    fn test_agent_counts_includes_collapsed() {
+        let mut tree = AgentTree::new();
+        let mut root = AgentNode::new_root("root", "repo");
+        root.status = AgentStatus::Running;
+        let mut child = AgentNode::new_child("child", "repo");
+        child.status = AgentStatus::Running;
+        root.children.push(child);
+        root.expanded = false; // collapsed — child hidden from flatten()
+        tree.add_root(root);
+
+        let (running, total) = tree.agent_counts();
+        assert_eq!(total, 2);
+        assert_eq!(running, 2);
+        assert_eq!(tree.flatten().len(), 1); // only root visible
+    }
+}

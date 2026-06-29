@@ -5,7 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io;
+use std::{io, time::Duration};
 
 mod agent;
 mod app;
@@ -50,24 +50,43 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
-                KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                    app.agent_tree.move_down();
+        // Poll with a 100ms timeout so the spinner and future IPC updates can
+        // redraw without waiting for a keypress.
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
+                    KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
+                    KeyCode::Char('j') | KeyCode::Down
+                        if key.modifiers == KeyModifiers::NONE =>
+                    {
+                        app.agent_tree.move_down();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up
+                        if key.modifiers == KeyModifiers::NONE =>
+                    {
+                        app.agent_tree.move_up();
+                    }
+                    // Space collapses/expands a root agent's children list.
+                    KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+                        app.agent_tree.toggle_expand();
+                    }
+                    // Enter / o — focus the selected agent's pane.
+                    // F2 — toggle focus back to tree from anywhere.
+                    KeyCode::Enter | KeyCode::Char('o')
+                        if key.modifiers == KeyModifiers::NONE =>
+                    {
+                        app.toggle_focus();
+                    }
+                    KeyCode::F(2) => {
+                        app.toggle_focus();
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
-                    app.agent_tree.move_up();
-                }
-                KeyCode::Char(' ') | KeyCode::Enter => {
-                    app.agent_tree.toggle_expand();
-                }
-                KeyCode::Tab => {
-                    app.toggle_focus();
-                }
-                _ => {}
             }
         }
+
+        app.tick();
     }
     Ok(())
 }

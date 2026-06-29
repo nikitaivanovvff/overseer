@@ -9,6 +9,7 @@ pub enum Focus {
 pub struct App {
     pub agent_tree: AgentTree,
     pub focus: Focus,
+    pub tick: u64,
 }
 
 impl App {
@@ -16,6 +17,7 @@ impl App {
         Self {
             agent_tree: AgentTree::new(),
             focus: Focus::Tree,
+            tick: 0,
         }
     }
 
@@ -23,7 +25,12 @@ impl App {
         Self {
             agent_tree: AgentTree::with_mock_data(),
             focus: Focus::Tree,
+            tick: 0,
         }
+    }
+
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
     }
 
     pub fn toggle_focus(&mut self) {
@@ -32,6 +39,7 @@ impl App {
             Focus::Pane => Focus::Tree,
         };
     }
+
 }
 
 impl Default for App {
