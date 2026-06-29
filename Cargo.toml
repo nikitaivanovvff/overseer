@@ -1,0 +1,16 @@
+[package]
+name = "overseer"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal IDE for orchestrating AI agent hierarchies"
+license = "MIT"
+
+[[bin]]
+name = "overseer"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
