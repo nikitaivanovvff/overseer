@@ -82,16 +82,7 @@ fn run_app<B: ratatui::backend::Backend>(
                         _ => {}
                     },
                     Focus::Pane => match key.code {
-                        // Esc: universal back-to-tree key, always works.
-                        // Cmd+1 (SUPER): works in terminals that forward modifier keys
-                        // to applications. Note: Terminal.app and iTerm2 default Cmd+1
-                        // to tab switching — configure them to forward it if desired.
                         KeyCode::Esc => {
-                            app.focus = Focus::Tree;
-                        }
-                        KeyCode::Char('1')
-                            if key.modifiers.contains(KeyModifiers::SUPER) =>
-                        {
                             app.focus = Focus::Tree;
                         }
                         _ => {}

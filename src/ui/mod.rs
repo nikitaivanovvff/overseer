@@ -183,7 +183,7 @@ fn render_pane_body(frame: &mut Frame, selected: &Option<FlatNode>, focused: boo
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Esc or Cmd+1 to return to agents",
+            "  Esc to return to agents",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -213,8 +213,6 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ],
         Focus::Pane => vec![
             Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::styled(" or ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Cmd+1", Style::default().fg(Color::Yellow)),
             Span::styled(" → agents  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::styled(" quit", Style::default().fg(Color::DarkGray)),
