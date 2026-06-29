@@ -12,7 +12,7 @@ mod app;
 mod session;
 mod ui;
 
-use app::App;
+use app::{App, Focus};
 
 fn main() -> Result<()> {
     // Restore terminal on panic so the shell isn't left in raw mode.
@@ -50,38 +50,52 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        // Poll with a 100ms timeout so the spinner and future IPC updates can
-        // redraw without waiting for a keypress.
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Quit is always active regardless of which panel has focus.
                 match key.code {
                     KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
                     KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
-                    KeyCode::Char('j') | KeyCode::Down
-                        if key.modifiers == KeyModifiers::NONE =>
-                    {
-                        app.agent_tree.move_down();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up
-                        if key.modifiers == KeyModifiers::NONE =>
-                    {
-                        app.agent_tree.move_up();
-                    }
-                    // Space collapses/expands a root agent's children list.
-                    KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-                        app.agent_tree.toggle_expand();
-                    }
-                    // Enter / o — focus the selected agent's pane.
-                    // F2 — toggle focus back to tree from anywhere.
-                    KeyCode::Enter | KeyCode::Char('o')
-                        if key.modifiers == KeyModifiers::NONE =>
-                    {
-                        app.toggle_focus();
-                    }
-                    KeyCode::F(2) => {
-                        app.toggle_focus();
-                    }
                     _ => {}
+                }
+
+                match app.focus {
+                    Focus::Tree => match key.code {
+                        KeyCode::Char('j') | KeyCode::Down
+                            if key.modifiers == KeyModifiers::NONE =>
+                        {
+                            app.agent_tree.move_down();
+                        }
+                        KeyCode::Char('k') | KeyCode::Up
+                            if key.modifiers == KeyModifiers::NONE =>
+                        {
+                            app.agent_tree.move_up();
+                        }
+                        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+                            app.agent_tree.toggle_expand();
+                        }
+                        KeyCode::Enter | KeyCode::Char('o')
+                            if key.modifiers == KeyModifiers::NONE =>
+                        {
+                            app.focus = Focus::Pane;
+                        }
+                        _ => {}
+                    },
+                    Focus::Pane => match key.code {
+                        // Esc: universal back-to-tree key, always works.
+                        // Cmd+1 (SUPER): works in terminals that forward modifier keys
+                        // to applications. Note: Terminal.app and iTerm2 default Cmd+1
+                        // to tab switching — configure them to forward it if desired.
+                        KeyCode::Esc => {
+                            app.focus = Focus::Tree;
+                        }
+                        KeyCode::Char('1')
+                            if key.modifiers.contains(KeyModifiers::SUPER) =>
+                        {
+                            app.focus = Focus::Tree;
+                        }
+                        _ => {}
+                    },
                 }
             }
         }

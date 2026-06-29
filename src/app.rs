@@ -33,12 +33,6 @@ impl App {
         self.tick = self.tick.wrapping_add(1);
     }
 
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Tree => Focus::Pane,
-            Focus::Pane => Focus::Tree,
-        };
-    }
 
 }
 

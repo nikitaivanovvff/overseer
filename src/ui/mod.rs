@@ -183,7 +183,7 @@ fn render_pane_body(frame: &mut Frame, selected: &Option<FlatNode>, focused: boo
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  o / ↵ to open  •  F2 to toggle focus",
+            "  Esc or Cmd+1 to return to agents",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -200,7 +200,28 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // agent_counts walks the full tree regardless of expand/collapse state.
     let (running, total) = app.agent_tree.agent_counts();
 
-    let bar = Line::from(vec![
+    let hints: Vec<Span> = match app.focus {
+        Focus::Tree => vec![
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("<space>", Style::default().fg(Color::Yellow)),
+            Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("o/↵", Style::default().fg(Color::Yellow)),
+            Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        ],
+        Focus::Pane => vec![
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(" or ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Cmd+1", Style::default().fg(Color::Yellow)),
+            Span::styled(" → agents  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        ],
+    };
+
+    let mut spans = vec![
         Span::styled(
             " OVERSEER ",
             Style::default()
@@ -214,17 +235,10 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
-        Span::styled("j/k", Style::default().fg(Color::Yellow)),
-        Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("<space>", Style::default().fg(Color::Yellow)),
-        Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("o/↵", Style::default().fg(Color::Yellow)),
-        Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("F2", Style::default().fg(Color::Yellow)),
-        Span::styled(" focus  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+    spans.extend(hints);
+
+    let bar = Line::from(spans);
 
     frame.render_widget(Paragraph::new(bar), area);
 }
