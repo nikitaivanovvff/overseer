@@ -13,7 +13,7 @@ mod ipc;
 mod session;
 mod ui;
 
-use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use app::{App, Focus};
 use ipc::protocol::Request;
 
@@ -21,6 +21,8 @@ use ipc::protocol::Request;
 struct Cli {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+    #[arg(long)]
+    mock: bool,
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -99,12 +101,12 @@ fn main() -> Result<()> {
     let socket = resolve_socket(cli.socket);
 
     match cli.cmd {
-        None => run_tui(socket),
+        None => run_tui(socket, cli.mock),
         Some(cmd) => run_client(socket, cmd),
     }
 }
 
-fn run_tui(socket: PathBuf) -> Result<()> {
+fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -112,7 +114,11 @@ fn run_tui(socket: PathBuf) -> Result<()> {
         default_panic(info);
     }));
 
-    let registry = Arc::new(AgentRegistry::new());
+    let registry = Arc::new(if mock {
+        AgentRegistry::from_tree(AgentTree::with_mock_data())
+    } else {
+        AgentRegistry::new()
+    });
     let reg_clone = registry.clone();
     let socket_clone = socket.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
