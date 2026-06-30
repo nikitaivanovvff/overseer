@@ -88,6 +88,18 @@ impl AgentTree {
         }
     }
 
+    /// Removes the node with the given id (root or descendant).
+    /// Returns `true` if found and removed.
+    pub fn remove(&mut self, id: &AgentId) -> bool {
+        if let Some(pos) = self.roots.iter().position(|n| n.id == *id) {
+            self.roots.remove(pos);
+            let len = self.flatten().len();
+            self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
+            return true;
+        }
+        remove_descendant(&mut self.roots, id)
+    }
+
     pub fn toggle_expand(&mut self) {
         let flat = self.flatten();
         if let Some(node) = flat.get(self.cursor) {
@@ -199,6 +211,19 @@ fn find_node_mut<'a>(nodes: &'a mut [AgentNode], id: &AgentId) -> Option<&'a mut
         return Some(found);
     }
     find_node_mut(tail, id)
+}
+
+fn remove_descendant(nodes: &mut Vec<AgentNode>, id: &AgentId) -> bool {
+    for node in nodes.iter_mut() {
+        if let Some(pos) = node.children.iter().position(|c| c.id == *id) {
+            node.children.remove(pos);
+            return true;
+        }
+        if remove_descendant(&mut node.children, id) {
+            return true;
+        }
+    }
+    false
 }
 
 fn toggle_expand_by_id(nodes: &mut [AgentNode], target: &AgentId) -> bool {
@@ -517,6 +542,63 @@ mod tests {
         let unknown = AgentId::new();
         let child = AgentNode::new_child("orphan", "repo");
         assert!(!tree.insert_child(&unknown, child));
+    }
+
+    #[test]
+    fn remove_root_shrinks_tree() {
+        let mut tree = AgentTree::new();
+        let r1 = AgentNode::new_root("r1", "repo");
+        let r2 = AgentNode::new_root("r2", "repo");
+        let id1 = r1.id.clone();
+        tree.add_root(r1);
+        tree.add_root(r2);
+        assert!(tree.remove(&id1));
+        assert_eq!(tree.flatten().len(), 1);
+        assert_eq!(tree.flatten()[0].name, "r2");
+    }
+
+    #[test]
+    fn remove_child_shrinks_parent() {
+        let mut tree = make_tree();
+        let child_id = tree.roots[0].children[0].id.clone();
+        assert!(tree.remove(&child_id));
+        // grandchild was under child-a, so it's gone too
+        assert!(tree.roots[0].children.iter().all(|c| c.name != "child-a"));
+    }
+
+    #[test]
+    fn remove_unknown_returns_false() {
+        let mut tree = make_tree();
+        assert!(!tree.remove(&AgentId::new()));
+    }
+
+    #[test]
+    fn remove_clamps_cursor() {
+        let mut tree = AgentTree::new();
+        let r1 = AgentNode::new_root("r1", "repo");
+        let id1 = r1.id.clone();
+        tree.add_root(r1);
+        tree.cursor = 0;
+        tree.remove(&id1);
+        assert_eq!(tree.cursor, 0); // must not panic on empty
+    }
+
+    #[test]
+    fn registry_remove_deletes_agent() {
+        use super::super::registry::AgentRegistry;
+        let reg = AgentRegistry::new();
+        let result = reg.register(super::super::registry::RegisterArgs {
+            id: None,
+            name: "tmp".to_string(),
+            role: super::super::AgentRole::Root,
+            parent_id: None,
+            adapter: "claude".to_string(),
+            repo: "r".to_string(),
+            branch: None,
+        }).unwrap();
+        assert!(!reg.snapshot().is_empty());
+        reg.remove(&result.id);
+        assert!(reg.snapshot().is_empty());
     }
 
     #[test]

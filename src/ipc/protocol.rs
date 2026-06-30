@@ -34,6 +34,12 @@ pub enum Request {
     Agent {
         agent_id: AgentId,
     },
+    /// Server-side launch: register a root agent and start it in a tmux session.
+    Start {
+        task: String,
+        adapter: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,5 +190,18 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&s).unwrap();
         assert!(matches!(back.data, Some(OkBody::Agents { agents }) if agents.is_empty()));
+    }
+
+    #[test]
+    fn request_start_round_trip() {
+        let req = Request::Start {
+            task: "implement auth".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"cmd\":\"start\""), "should serialize as 'start'");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Start { task, .. } if task == "implement auth"));
     }
 }

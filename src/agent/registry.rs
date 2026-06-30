@@ -25,6 +25,8 @@ pub struct RegisterArgs {
     pub parent_id: Option<AgentId>,
     pub adapter: String,
     pub repo: String,
+    /// Explicit branch override. Defaults to "main" for root, "overseer/<id>" for child.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug)]
@@ -47,7 +49,7 @@ impl AgentRegistry {
         match args.role {
             AgentRole::Root => {
                 let id = args.id.unwrap_or_default();
-                let branch = "main".to_string();
+                let branch = args.branch.unwrap_or_else(|| "main".to_string());
                 let node = AgentNode {
                     id: id.clone(),
                     name: args.name,
@@ -122,6 +124,12 @@ impl AgentRegistry {
     pub fn with_tree<R>(&self, f: impl FnOnce(&AgentTree) -> R) -> R {
         let guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         f(&guard)
+    }
+
+    /// Removes an agent from the tree. Returns `true` if found and removed.
+    pub fn remove(&self, id: &AgentId) -> bool {
+        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(id)
     }
 
     pub fn with_tree_mut<R>(&self, f: impl FnOnce(&mut AgentTree) -> R) -> R {
@@ -203,6 +211,7 @@ mod tests {
             parent_id: None,
             adapter: "claude".to_string(),
             repo: "overseer".to_string(),
+            branch: None,
         }
     }
 
@@ -225,6 +234,7 @@ mod tests {
                 parent_id: Some(root.id.clone()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                branch: None,
             })
             .unwrap();
         assert!(child_result.branch.starts_with("overseer/"));
@@ -241,6 +251,7 @@ mod tests {
                 parent_id: Some(AgentId::new()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                branch: None,
             })
             .unwrap_err();
         assert!(matches!(err, RegistryError::UnknownParent(_)));
@@ -267,6 +278,7 @@ mod tests {
                 parent_id: Some(root.id.clone()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                branch: None,
             })
             .unwrap();
 
@@ -293,5 +305,22 @@ mod tests {
     fn get_returns_none_for_unknown_agent() {
         let reg = AgentRegistry::new();
         assert!(reg.get(&AgentId::new()).is_none());
+    }
+
+    #[test]
+    fn register_root_with_branch_override() {
+        let reg = AgentRegistry::new();
+        let result = reg
+            .register(RegisterArgs {
+                id: None,
+                name: "my-task".to_string(),
+                role: AgentRole::Root,
+                parent_id: None,
+                adapter: "claude".to_string(),
+                repo: "myrepo".to_string(),
+                branch: Some("feature/auth".to_string()),
+            })
+            .unwrap();
+        assert_eq!(result.branch, "feature/auth");
     }
 }

@@ -1,30 +1,32 @@
 pub mod client;
 pub mod protocol;
-pub(crate) mod handlers;
+pub mod handlers;
 pub(crate) mod server;
 
-use std::{path::PathBuf, sync::Arc};
+pub use handlers::AppCtx;
 
-use crate::agent::AgentRegistry;
+use std::{path::PathBuf, sync::Arc};
 
 /// Runs the IPC server on a dedicated OS thread's current-thread tokio runtime.
 /// Call this from `std::thread::spawn`; it blocks until the server exits.
 pub fn serve_blocking(
-    reg: Arc<AgentRegistry>,
+    ctx: Arc<AppCtx>,
     socket: PathBuf,
     ready: Option<std::sync::mpsc::SyncSender<()>>,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(server::run(reg, socket, ready))
+    rt.block_on(server::run(ctx, socket, ready))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRole, AgentStatus};
+    use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+    use crate::git::GitClient;
     use crate::ipc::protocol::{OkBody, Request, Response};
+    use crate::session::TmuxClient;
     use std::path::Path;
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -34,11 +36,17 @@ mod tests {
     fn start_server() -> PathBuf {
         let id = &uuid::Uuid::new_v4().to_string()[..8];
         let socket = PathBuf::from(format!("/tmp/ovsr-{id}.sock"));
-        let reg = Arc::new(AgentRegistry::new());
+        let ctx = Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            tmux: Arc::new(TmuxClient::dry_run()),
+            socket: socket.clone(),
+            git: Arc::new(GitClient::dry_run()),
+            watch_sessions: false,
+        });
         let socket_clone = socket.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = serve_blocking(reg, socket_clone, Some(ready_tx));
+            let _ = serve_blocking(ctx, socket_clone, Some(ready_tx));
         });
         ready_rx.recv().expect("server failed to start");
         socket
@@ -240,6 +248,35 @@ mod tests {
         assert_eq!(dto.repo, "my-repo");
         assert_eq!(dto.branch, "main");
         assert_eq!(dto.status, AgentStatus::Running);
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    // ── start tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn integration_start_registers_and_returns_id() {
+        let socket = start_server();
+
+        let resp = send(&socket, Request::Start {
+            task: "implement auth".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: None,
+        });
+        assert!(resp.ok, "Start failed: {:?}", resp.error);
+        let (agent_id, branch) = match resp.data {
+            Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        assert_eq!(branch, "test-branch"); // GitClient::dry_run
+
+        let list_resp = send(&socket, Request::List);
+        let agents = match list_resp.data {
+            Some(OkBody::Agents { agents }) => agents,
+            _ => panic!(),
+        };
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, agent_id);
 
         let _ = std::fs::remove_file(&socket);
     }

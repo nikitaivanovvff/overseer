@@ -1,8 +1,10 @@
+pub mod adapters;
 mod id;
 mod node;
 mod registry;
 mod status;
 mod tree;
+pub mod spawn;
 
 pub use id::AgentId;
 pub use node::{AgentNode, AgentRole};
