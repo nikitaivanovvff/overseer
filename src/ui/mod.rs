@@ -7,13 +7,13 @@ use ratatui::{
 };
 
 use crate::{
-    agent::{AgentStatus, FlatNode},
-    app::{App, Focus},
+    agent::{AgentStatus, AgentTree, FlatNode},
+    app::Focus,
 };
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, focus: &Focus, tree: &AgentTree, tick: u64) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -29,25 +29,30 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(7)])
         .split(body[0]);
 
-    // Compute once and share — avoids 4 separate flatten() traversals per frame.
-    let flat = app.agent_tree.flatten();
-    let selected = flat.get(app.agent_tree.cursor).cloned();
+    let flat = tree.flatten();
+    let selected = flat.get(tree.cursor).cloned();
+    let (running, total) = tree.agent_counts();
 
-    render_agent_tree(frame, app, left[0], &flat);
+    render_agent_tree(frame, focus == &Focus::Tree, tree.cursor, tick, left[0], &flat);
     render_agent_detail(frame, left[1], &selected);
-    render_pane(frame, app, body[1], &selected);
-    render_status_bar(frame, app, outer[1]);
+    render_pane(frame, focus, body[1], &selected);
+    render_status_bar(frame, focus, running, total, outer[1]);
 }
 
-fn render_agent_tree(frame: &mut Frame, app: &App, area: Rect, flat: &[FlatNode]) {
-    let focused = app.focus == Focus::Tree;
-
+fn render_agent_tree(
+    frame: &mut Frame,
+    focused: bool,
+    cursor: usize,
+    tick: u64,
+    area: Rect,
+    flat: &[FlatNode],
+) {
     let items: Vec<ListItem> = flat
         .iter()
         .enumerate()
         .map(|(i, node)| {
-            let selected = i == app.agent_tree.cursor;
-            let line = tree_row(node, selected, app.tick);
+            let selected = i == cursor;
+            let line = tree_row(node, selected, tick);
             if selected {
                 ListItem::new(line).style(Style::default().bg(Color::DarkGray))
             } else {
@@ -133,8 +138,8 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
-fn render_pane(frame: &mut Frame, app: &App, area: Rect, selected: &Option<FlatNode>) {
-    let focused = app.focus == Focus::Pane;
+fn render_pane(frame: &mut Frame, focus: &Focus, area: Rect, selected: &Option<FlatNode>) {
+    let focused = focus == &Focus::Pane;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -196,11 +201,14 @@ fn render_pane_body(frame: &mut Frame, selected: &Option<FlatNode>, focused: boo
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    // agent_counts walks the full tree regardless of expand/collapse state.
-    let (running, total) = app.agent_tree.agent_counts();
-
-    let hints: Vec<Span> = match app.focus {
+fn render_status_bar(
+    frame: &mut Frame,
+    focus: &Focus,
+    running: usize,
+    total: usize,
+    area: Rect,
+) {
+    let hints: Vec<Span> = match focus {
         Focus::Tree => vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
@@ -236,9 +244,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     ];
     spans.extend(hints);
 
-    let bar = Line::from(spans);
-
-    frame.render_widget(Paragraph::new(bar), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn context_bar(pct: u8) -> String {

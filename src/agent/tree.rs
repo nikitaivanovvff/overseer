@@ -72,6 +72,22 @@ impl AgentTree {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
+    /// Returns a mutable reference to the node with the given id (recursive).
+    pub fn find_mut(&mut self, id: &AgentId) -> Option<&mut AgentNode> {
+        find_node_mut(&mut self.roots, id)
+    }
+
+    /// Inserts `node` as a child of the node identified by `parent_id`.
+    /// Returns `true` if the parent was found, `false` otherwise.
+    pub fn insert_child(&mut self, parent_id: &AgentId, node: AgentNode) -> bool {
+        if let Some(parent) = self.find_mut(parent_id) {
+            parent.children.push(node);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn toggle_expand(&mut self) {
         let flat = self.flatten();
         if let Some(node) = flat.get(self.cursor) {
@@ -173,7 +189,19 @@ fn flatten_node(
     }
 }
 
-fn toggle_expand_by_id(nodes: &mut Vec<AgentNode>, target: &AgentId) -> bool {
+/// Recursive mutable node lookup using split_first_mut to satisfy the borrow checker.
+fn find_node_mut<'a>(nodes: &'a mut [AgentNode], id: &AgentId) -> Option<&'a mut AgentNode> {
+    let (head, tail) = nodes.split_first_mut()?;
+    if head.id == *id {
+        return Some(head);
+    }
+    if let Some(found) = find_node_mut(&mut head.children, id) {
+        return Some(found);
+    }
+    find_node_mut(tail, id)
+}
+
+fn toggle_expand_by_id(nodes: &mut [AgentNode], target: &AgentId) -> bool {
     for node in nodes.iter_mut() {
         if &node.id == target {
             node.expanded = !node.expanded;
@@ -190,8 +218,8 @@ fn toggle_expand_by_id(nodes: &mut Vec<AgentNode>, target: &AgentId) -> bool {
 mod tests {
     use super::*;
 
-    // make_tree builds a 3-level tree to exercise the flatten/navigation logic
-    // at depth > 1. Production code enforces max_depth=1 at the IPC layer (Phase 2),
+    // make_tree builds a 3-level tree to exercise the flatten/navigation logic at
+    // depth > 1. The two-level constraint is enforced in the Phase 4 `spawn` handler,
     // not at the model level, so this fixture is valid for testing the traversal.
     fn make_tree() -> AgentTree {
         let mut root = AgentNode::new_root("root", "repo");
@@ -433,6 +461,62 @@ mod tests {
         assert!(flat[1].has_children);
         assert!(!flat[2].has_children);
         assert!(!flat[3].has_children);
+    }
+
+    #[test]
+    fn test_find_mut_root() {
+        let mut tree = make_tree();
+        let root_id = tree.roots[0].id.clone();
+        assert!(tree.find_mut(&root_id).is_some());
+    }
+
+    #[test]
+    fn test_find_mut_child() {
+        let mut tree = make_tree();
+        let child_id = tree.roots[0].children[0].id.clone();
+        let found = tree.find_mut(&child_id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "child-a");
+    }
+
+    #[test]
+    fn test_find_mut_grandchild() {
+        let mut tree = make_tree();
+        let gc_id = tree.roots[0].children[0].children[0].id.clone();
+        let found = tree.find_mut(&gc_id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "grandchild");
+    }
+
+    #[test]
+    fn test_find_mut_unknown_returns_none() {
+        let mut tree = make_tree();
+        let unknown = AgentId::new();
+        assert!(tree.find_mut(&unknown).is_none());
+    }
+
+    #[test]
+    fn test_insert_child_under_existing_parent() {
+        let mut tree = AgentTree::new();
+        let root = AgentNode::new_root("root", "repo");
+        let root_id = root.id.clone();
+        tree.add_root(root);
+
+        let child = AgentNode::new_child("child", "repo");
+        let inserted = tree.insert_child(&root_id, child);
+
+        assert!(inserted);
+        assert_eq!(tree.roots[0].children.len(), 1);
+        assert_eq!(tree.roots[0].children[0].name, "child");
+    }
+
+    #[test]
+    fn test_insert_child_unknown_parent_returns_false() {
+        let mut tree = AgentTree::new();
+        tree.add_root(AgentNode::new_root("root", "repo"));
+        let unknown = AgentId::new();
+        let child = AgentNode::new_child("orphan", "repo");
+        assert!(!tree.insert_child(&unknown, child));
     }
 
     #[test]

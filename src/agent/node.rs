@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use super::{AgentId, AgentStatus};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Root,
     Child,
@@ -14,6 +17,7 @@ pub struct AgentNode {
     pub role: AgentRole,
     pub repo: String,
     pub branch: String,
+    pub adapter: String,
     pub context_pct: Option<u8>,
     pub children: Vec<AgentNode>,
     pub expanded: bool,
@@ -28,6 +32,7 @@ impl AgentNode {
             role: AgentRole::Root,
             repo: repo.into(),
             branch: "main".to_string(),
+            adapter: "claude".to_string(),
             context_pct: None,
             children: Vec::new(),
             expanded: true,
@@ -44,6 +49,7 @@ impl AgentNode {
             role: AgentRole::Child,
             repo: repo.into(),
             branch,
+            adapter: "claude".to_string(),
             context_pct: None,
             children: Vec::new(),
             expanded: true,
