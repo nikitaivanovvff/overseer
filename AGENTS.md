@@ -42,9 +42,11 @@ overseer (binary)
 ├── workspace/        Git worktree management
 │   ├── worktree      Create / delete / list worktrees via git2 or git CLI
 │   └── branch        Branch naming: overseer/<agent-id>
-├── ipc/              Unix socket HTTP server (tokio + axum)
-│   ├── server        Binds to $OVERSEER_SOCKET, serves agent API
-│   └── handlers      /register, /status, /spawn, /agents, /agents/:id
+├── ipc/              Unix socket server (tokio, newline-delimited JSON)
+│   ├── server        Binds to $OVERSEER_SOCKET, accepts connections
+│   ├── handlers      dispatch: register, status, list, agent
+│   ├── protocol      Request / Response / AgentDto wire types (serde)
+│   └── client        One-shot sync client used by CLI subcommands
 └── config/           TOML config (~/.config/overseer/config.toml)
     ├── schema        Config struct (adapters, keybinds, theme, defaults)
     └── loader        Load + merge with CLI flags
