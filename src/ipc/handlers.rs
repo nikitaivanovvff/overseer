@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::agent::adapters::{adapter_for, LaunchContext};
+use crate::agent::drop::drop_agent;
+use crate::agent::spawn::{spawn_agent, SpawnRequest};
 use crate::agent::{AgentRegistry, AgentRole, RegisterArgs};
 use crate::git::GitClient;
 use crate::ipc::protocol::{OkBody, Request, Response};
@@ -32,6 +33,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 parent_id,
                 adapter: adapter.unwrap_or_else(|| "claude".to_string()),
                 repo: repo.unwrap_or_else(|| "overseer".to_string()),
+                cwd: PathBuf::from("."),
                 branch: None,
             };
             match ctx.registry.register(args) {
@@ -58,10 +60,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         },
 
         Request::Start { task, adapter, cwd } => {
-            let adapter_name = adapter.as_deref().unwrap_or("claude").to_string();
-            let Some(adapter) = adapter_for(&adapter_name) else {
-                return Response::err(format!("unknown adapter: {adapter_name}"));
-            };
+            let adapter_name = adapter.unwrap_or_else(|| "claude".to_string());
 
             let cwd = cwd.unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
@@ -70,39 +69,61 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             let repo = ctx.git.repo_name(&cwd).unwrap_or_else(|_| "unknown".to_string());
             let branch = ctx.git.current_branch(&cwd).unwrap_or_else(|_| "main".to_string());
 
-            let args = RegisterArgs {
-                id: None,
-                name: task.clone(),
+            let req = SpawnRequest {
                 role: AgentRole::Root,
                 parent_id: None,
-                adapter: adapter_name,
+                task,
+                adapter_name,
+                cwd,
                 repo,
                 branch: Some(branch),
             };
-            let result = match ctx.registry.register(args) {
-                Ok(r) => r,
-                Err(e) => return Response::err(e.to_string()),
-            };
 
-            let launch_ctx = LaunchContext {
-                agent_id: result.id.clone(),
-                role: AgentRole::Root,
-                parent_id: None,
-                socket: ctx.socket.clone(),
-                cwd,
-                task,
-                command: "claude".to_string(),
-                extra_args: vec![],
-            };
+            match spawn_agent(&ctx.registry, &ctx.tmux, &ctx.socket, req) {
+                Ok(result) => Response::ok(Some(OkBody::Registered {
+                    agent_id: result.id,
+                    branch: result.branch,
+                })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
 
-            if let Err(e) = crate::agent::spawn::launch(&launch_ctx, adapter.as_ref(), &ctx.tmux) {
-                return Response::err(format!("launch failed: {e}"));
+        Request::Spawn { parent_id, task, adapter, cwd } => {
+            let adapter_name = adapter.unwrap_or_else(|| "claude".to_string());
+
+            let Some(parent) = ctx.registry.get(&parent_id) else {
+                return Response::err(format!("unknown agent: {}", parent_id.short()));
+            };
+            // The one and only "no grandchildren" check (AGENTS.md) — not duplicated
+            // anywhere else, including the TUI, which routes through this same arm.
+            if parent.role == AgentRole::Child {
+                return Response::err("children cannot spawn further agents".to_string());
             }
 
-            Response::ok(Some(OkBody::Registered {
-                agent_id: result.id,
-                branch: result.branch,
-            }))
+            let req = SpawnRequest {
+                role: AgentRole::Child,
+                parent_id: Some(parent_id),
+                task,
+                adapter_name,
+                cwd,
+                repo: parent.repo,
+                branch: None,
+            };
+
+            match spawn_agent(&ctx.registry, &ctx.tmux, &ctx.socket, req) {
+                Ok(result) => Response::ok(Some(OkBody::Registered {
+                    agent_id: result.id,
+                    branch: result.branch,
+                })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::Drop { agent_id, recursive } => {
+            match drop_agent(&ctx.registry, &ctx.tmux, &agent_id, recursive, false) {
+                Ok(()) => Response::ok(None),
+                Err(e) => Response::err(e.to_string()),
+            }
         }
     }
 }
@@ -270,5 +291,112 @@ mod tests {
         });
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap_or("").contains("unknown adapter"));
+    }
+
+    fn start_root(ctx: &AppCtx, task: &str) -> AgentId {
+        let resp = dispatch(ctx, Request::Start {
+            task: task.to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: None,
+        });
+        match resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_spawn_under_root_succeeds() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx, "root task");
+
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id.clone(),
+            task: "write tests".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        assert!(resp.ok, "Spawn failed: {:?}", resp.error);
+        assert!(matches!(resp.data, Some(OkBody::Registered { branch, .. })
+            if branch.starts_with("overseer/")));
+
+        let list_resp = dispatch(&ctx, Request::List);
+        let agents = match list_resp.data {
+            Some(OkBody::Agents { agents }) => agents,
+            _ => panic!("expected Agents"),
+        };
+        assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_spawn_under_child_is_rejected() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx, "root task");
+        let spawn_resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "child task".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        let child_id = match spawn_resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+
+        // A child trying to spawn its own child — the one "no grandchildren" check.
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: child_id,
+            task: "grandchild task".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("cannot spawn"));
+    }
+
+    #[test]
+    fn dispatch_spawn_unknown_parent_is_error() {
+        let ctx = make_ctx();
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: AgentId::new(),
+            task: "task".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("unknown agent"));
+    }
+
+    #[test]
+    fn dispatch_drop_root_is_rejected() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx, "root task");
+        let resp = dispatch(&ctx, Request::Drop { agent_id: root_id, recursive: false });
+        assert!(!resp.ok);
+
+        let list_resp = dispatch(&ctx, Request::List);
+        assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.len() == 1));
+    }
+
+    #[test]
+    fn dispatch_drop_child_succeeds() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx, "root task");
+        let spawn_resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "child task".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        let child_id = match spawn_resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+
+        let resp = dispatch(&ctx, Request::Drop { agent_id: child_id, recursive: false });
+        assert!(resp.ok, "Drop failed: {:?}", resp.error);
+
+        let list_resp = dispatch(&ctx, Request::List);
+        assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.len() == 1));
     }
 }

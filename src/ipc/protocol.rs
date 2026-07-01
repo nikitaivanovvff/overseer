@@ -40,6 +40,22 @@ pub enum Request {
         adapter: Option<String>,
         cwd: Option<std::path::PathBuf>,
     },
+    /// Register + launch a child of `parent_id`. Rejected if the parent is itself a
+    /// child (flat tree: roots + children only — enforced here, and only here).
+    /// `cwd` is always supplied by the caller (agent CLI or TUI) — the server never
+    /// falls back to its own working directory for a child.
+    Spawn {
+        parent_id: AgentId,
+        task: String,
+        adapter: Option<String>,
+        cwd: std::path::PathBuf,
+    },
+    /// Kill the agent's tmux session and deregister it (+ its subtree if `recursive`).
+    /// Root agents can only be dropped through the TUI, not this command.
+    Drop {
+        agent_id: AgentId,
+        recursive: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +68,7 @@ pub struct AgentDto {
     pub adapter: String,
     pub repo: String,
     pub branch: String,
+    pub cwd: std::path::PathBuf,
     pub context_pct: Option<u8>,
 }
 
@@ -203,5 +220,31 @@ mod tests {
         assert!(s.contains("\"cmd\":\"start\""), "should serialize as 'start'");
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::Start { task, .. } if task == "implement auth"));
+    }
+
+    #[test]
+    fn request_spawn_round_trip() {
+        let parent_id = AgentId::new();
+        let req = Request::Spawn {
+            parent_id: parent_id.clone(),
+            task: "write tests".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: std::path::PathBuf::from("/repo"),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"cmd\":\"spawn\""), "should serialize as 'spawn'");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Spawn { task, parent_id: p, .. }
+            if task == "write tests" && p == parent_id));
+    }
+
+    #[test]
+    fn request_drop_round_trip() {
+        let agent_id = AgentId::new();
+        let req = Request::Drop { agent_id: agent_id.clone(), recursive: true };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"cmd\":\"drop\""), "should serialize as 'drop'");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Drop { agent_id: id, recursive: true } if id == agent_id));
     }
 }

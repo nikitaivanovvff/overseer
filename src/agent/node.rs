@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use super::{AgentId, AgentStatus};
@@ -18,6 +20,7 @@ pub struct AgentNode {
     pub repo: String,
     pub branch: String,
     pub adapter: String,
+    pub cwd: PathBuf,
     pub context_pct: Option<u8>,
     pub children: Vec<AgentNode>,
     pub expanded: bool,
@@ -33,6 +36,7 @@ impl AgentNode {
             repo: repo.into(),
             branch: "main".to_string(),
             adapter: "claude".to_string(),
+            cwd: PathBuf::from("."),
             context_pct: None,
             children: Vec::new(),
             expanded: true,
@@ -50,6 +54,7 @@ impl AgentNode {
             repo: repo.into(),
             branch,
             adapter: "claude".to_string(),
+            cwd: PathBuf::from("."),
             context_pct: None,
             children: Vec::new(),
             expanded: true,

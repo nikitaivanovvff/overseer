@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use thiserror::Error;
@@ -25,6 +26,7 @@ pub struct RegisterArgs {
     pub parent_id: Option<AgentId>,
     pub adapter: String,
     pub repo: String,
+    pub cwd: PathBuf,
     /// Explicit branch override. Defaults to "main" for root, "overseer/<id>" for child.
     pub branch: Option<String>,
 }
@@ -58,6 +60,7 @@ impl AgentRegistry {
                     repo: args.repo,
                     branch: branch.clone(),
                     adapter: args.adapter,
+                    cwd: args.cwd,
                     context_pct: None,
                     children: Vec::new(),
                     expanded: true,
@@ -78,6 +81,7 @@ impl AgentRegistry {
                     repo: args.repo,
                     branch: branch.clone(),
                     adapter: args.adapter,
+                    cwd: args.cwd,
                     context_pct: None,
                     children: Vec::new(),
                     expanded: true,
@@ -166,6 +170,7 @@ fn collect_dtos(
         adapter: node.adapter.clone(),
         repo: node.repo.clone(),
         branch: node.branch.clone(),
+        cwd: node.cwd.clone(),
         context_pct: node.context_pct,
     });
     for child in &node.children {
@@ -189,6 +194,7 @@ fn find_dto(
                 adapter: node.adapter.clone(),
                 repo: node.repo.clone(),
                 branch: node.branch.clone(),
+                cwd: node.cwd.clone(),
                 context_pct: node.context_pct,
             });
         }
@@ -211,6 +217,7 @@ mod tests {
             parent_id: None,
             adapter: "claude".to_string(),
             repo: "overseer".to_string(),
+            cwd: PathBuf::from("."),
             branch: None,
         }
     }
@@ -234,6 +241,7 @@ mod tests {
                 parent_id: Some(root.id.clone()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
                 branch: None,
             })
             .unwrap();
@@ -251,6 +259,7 @@ mod tests {
                 parent_id: Some(AgentId::new()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
                 branch: None,
             })
             .unwrap_err();
@@ -278,6 +287,7 @@ mod tests {
                 parent_id: Some(root.id.clone()),
                 adapter: "claude".to_string(),
                 repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
                 branch: None,
             })
             .unwrap();
@@ -318,6 +328,7 @@ mod tests {
                 parent_id: None,
                 adapter: "claude".to_string(),
                 repo: "myrepo".to_string(),
+                cwd: PathBuf::from("."),
                 branch: Some("feature/auth".to_string()),
             })
             .unwrap();

@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod drop;
 mod id;
 mod node;
 mod registry;

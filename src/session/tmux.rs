@@ -25,17 +25,40 @@ pub fn parse_sessions(output: &str) -> Vec<SessionInfo> {
 
 pub struct TmuxClient {
     dry_run: bool,
+    fail_launch: bool,
+    /// `Some(names)` in dry-run mode reports exactly those session names as existing
+    /// (everything else dead); `None` reports everything dead. Test-only knob.
+    live_sessions: Option<std::collections::HashSet<String>>,
 }
 
 impl TmuxClient {
     pub fn new() -> Self {
-        Self { dry_run: false }
+        Self { dry_run: false, fail_launch: false, live_sessions: None }
     }
 
-    /// Returns a no-op client that succeeds without invoking tmux — for tests.
-    #[cfg(test)]
+    /// Returns a no-op client that succeeds without invoking tmux — for tests, and
+    /// for `--mock` so seeded demo data never launches a real tmux session.
     pub fn dry_run() -> Self {
-        Self { dry_run: true }
+        Self { dry_run: true, fail_launch: false, live_sessions: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// A dry-run client whose `launch()` always fails — for testing rollback behavior
+    /// on launch failure without depending on a real, misconfigured tmux invocation.
+    #[cfg(test)]
+    pub fn dry_run_failing_launch() -> Self {
+        Self { dry_run: true, fail_launch: true, live_sessions: None }
+    }
+
+    /// A dry-run client that reports only `live` as existing sessions — for testing
+    /// code that must distinguish which of several agents' sessions are still alive.
+    #[cfg(test)]
+    pub fn dry_run_with_live_sessions(live: std::collections::HashSet<String>) -> Self {
+        Self { dry_run: true, fail_launch: false, live_sessions: Some(live) }
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
@@ -83,7 +106,7 @@ impl TmuxClient {
 
     pub fn session_exists(&self, name: &str) -> bool {
         if self.dry_run {
-            return false;
+            return self.live_sessions.as_ref().is_some_and(|live| live.contains(name));
         }
         Command::new("tmux")
             .args(["has-session", "-t", name])
@@ -104,6 +127,7 @@ impl TmuxClient {
         env: &HashMap<String, String>,
     ) -> Result<()> {
         if self.dry_run {
+            anyhow::ensure!(!self.fail_launch, "simulated launch failure for '{name}'");
             return Ok(());
         }
         self.check_min_version(3, 0)?;

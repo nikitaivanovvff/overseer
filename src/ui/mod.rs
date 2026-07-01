@@ -13,7 +13,13 @@ use crate::{
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn render(frame: &mut Frame, focus: &Focus, tree: &AgentTree, tick: u64) {
+pub fn render(
+    frame: &mut Frame,
+    focus: &Focus,
+    tree: &AgentTree,
+    tick: u64,
+    prompt: Option<&str>,
+) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -36,7 +42,7 @@ pub fn render(frame: &mut Frame, focus: &Focus, tree: &AgentTree, tick: u64) {
     render_agent_tree(frame, focus == &Focus::Tree, tree.cursor, tick, left[0], &flat);
     render_agent_detail(frame, left[1], &selected);
     render_pane(frame, focus, body[1], &selected);
-    render_status_bar(frame, focus, running, total, outer[1]);
+    render_status_bar(frame, focus, running, total, prompt, outer[1]);
 }
 
 fn render_agent_tree(
@@ -206,27 +212,9 @@ fn render_status_bar(
     focus: &Focus,
     running: usize,
     total: usize,
+    prompt: Option<&str>,
     area: Rect,
 ) {
-    let hints: Vec<Span> = match focus {
-        Focus::Tree => vec![
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("<space>", Style::default().fg(Color::Yellow)),
-            Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("o/↵", Style::default().fg(Color::Yellow)),
-            Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        ],
-        Focus::Pane => vec![
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::styled(" → agents  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        ],
-    };
-
     let mut spans = vec![
         Span::styled(
             " OVERSEER ",
@@ -236,13 +224,40 @@ fn render_status_bar(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
+    ];
+
+    if let Some(prompt) = prompt {
+        spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
+    } else {
+        let hints: Vec<Span> = match focus {
+            Focus::Tree => vec![
+                Span::styled("j/k", Style::default().fg(Color::Yellow)),
+                Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("<space>", Style::default().fg(Color::Yellow)),
+                Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("o/↵", Style::default().fg(Color::Yellow)),
+                Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("n/s", Style::default().fg(Color::Yellow)),
+                Span::styled(" spawn  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("d/D", Style::default().fg(Color::Yellow)),
+                Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Yellow)),
+                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            ],
+            Focus::Pane => vec![
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled(" → agents  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Yellow)),
+                Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            ],
+        };
+        spans.push(Span::styled(
             format!("{running}/{total} running"),
             Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("   "),
-    ];
-    spans.extend(hints);
+        ));
+        spans.push(Span::raw("   "));
+        spans.extend(hints);
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

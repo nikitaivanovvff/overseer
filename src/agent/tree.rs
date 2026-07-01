@@ -91,13 +91,29 @@ impl AgentTree {
     /// Removes the node with the given id (root or descendant).
     /// Returns `true` if found and removed.
     pub fn remove(&mut self, id: &AgentId) -> bool {
-        if let Some(pos) = self.roots.iter().position(|n| n.id == *id) {
+        let removed = if let Some(pos) = self.roots.iter().position(|n| n.id == *id) {
             self.roots.remove(pos);
+            true
+        } else {
+            remove_descendant(&mut self.roots, id)
+        };
+        if removed {
+            // Removing a descendant can shrink the flattened list too (e.g. its own
+            // children go with it), so the cursor must be clamped either way —
+            // otherwise `selected()` can silently start returning `None`.
             let len = self.flatten().len();
             self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
-            return true;
         }
-        remove_descendant(&mut self.roots, id)
+        removed
+    }
+
+    /// Returns the ids of the subtree rooted at `id`, in post-order (children before
+    /// the node itself). `None` if `id` is not found anywhere in the tree.
+    pub fn subtree_ids_postorder(&self, id: &AgentId) -> Option<Vec<AgentId>> {
+        let node = find_node(&self.roots, id)?;
+        let mut out = Vec::new();
+        collect_postorder(node, &mut out);
+        Some(out)
     }
 
     pub fn toggle_expand(&mut self) {
@@ -211,6 +227,27 @@ fn find_node_mut<'a>(nodes: &'a mut [AgentNode], id: &AgentId) -> Option<&'a mut
         return Some(found);
     }
     find_node_mut(tail, id)
+}
+
+/// Recursive immutable node lookup (root or descendant).
+fn find_node<'a>(nodes: &'a [AgentNode], id: &AgentId) -> Option<&'a AgentNode> {
+    for node in nodes {
+        if node.id == *id {
+            return Some(node);
+        }
+        if let Some(found) = find_node(&node.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Appends `node`'s subtree ids in post-order (children before the node itself).
+fn collect_postorder(node: &AgentNode, out: &mut Vec<AgentId>) {
+    for child in &node.children {
+        collect_postorder(child, out);
+    }
+    out.push(node.id.clone());
 }
 
 fn remove_descendant(nodes: &mut Vec<AgentNode>, id: &AgentId) -> bool {
@@ -573,6 +610,31 @@ mod tests {
     }
 
     #[test]
+    fn subtree_ids_postorder_leaf_has_only_itself() {
+        let tree = make_tree();
+        let child_b_id = tree.roots[0].children[1].id.clone();
+        assert_eq!(tree.subtree_ids_postorder(&child_b_id).unwrap(), vec![child_b_id]);
+    }
+
+    #[test]
+    fn subtree_ids_postorder_nested_children_come_before_parent() {
+        let tree = make_tree();
+        let root_id = tree.roots[0].id.clone();
+        let child_a_id = tree.roots[0].children[0].id.clone();
+        let grandchild_id = tree.roots[0].children[0].children[0].id.clone();
+        let child_b_id = tree.roots[0].children[1].id.clone();
+
+        let ids = tree.subtree_ids_postorder(&root_id).unwrap();
+        assert_eq!(ids, vec![grandchild_id, child_a_id, child_b_id, root_id]);
+    }
+
+    #[test]
+    fn subtree_ids_postorder_unknown_id_returns_none() {
+        let tree = make_tree();
+        assert!(tree.subtree_ids_postorder(&AgentId::new()).is_none());
+    }
+
+    #[test]
     fn remove_clamps_cursor() {
         let mut tree = AgentTree::new();
         let r1 = AgentNode::new_root("r1", "repo");
@@ -581,6 +643,25 @@ mod tests {
         tree.cursor = 0;
         tree.remove(&id1);
         assert_eq!(tree.cursor, 0); // must not panic on empty
+    }
+
+    #[test]
+    fn remove_descendant_also_clamps_cursor() {
+        // Regression test: only the root-removal branch used to clamp the cursor,
+        // so removing a child while the cursor pointed at (or past) it left
+        // `selected()` returning `None` even though a valid node remained.
+        let mut tree = make_tree();
+        let child_a_id = tree.roots[0].children[0].id.clone();
+        let grandchild_id = tree.roots[0].children[0].children[0].id.clone();
+
+        // flatten order: root, child-a, grandchild, child-b — cursor on grandchild.
+        tree.cursor = 2;
+        assert!(tree.remove(&grandchild_id));
+        // flatten order is now: root, child-a, child-b (2 items after child-a).
+        assert!(tree.cursor <= tree.flatten().len().saturating_sub(1));
+
+        assert!(tree.remove(&child_a_id));
+        assert!(tree.selected().is_some());
     }
 
     #[test]
@@ -594,6 +675,7 @@ mod tests {
             parent_id: None,
             adapter: "claude".to_string(),
             repo: "r".to_string(),
+            cwd: std::path::PathBuf::from("."),
             branch: None,
         }).unwrap();
         assert!(!reg.snapshot().is_empty());

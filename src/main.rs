@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,8 +17,10 @@ mod ui;
 
 use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, MergeStrategy};
-use app::{App, Focus};
+use agent::drop::drop_agent;
+use app::{App, ConfirmState, Focus, InputState, PendingAction};
 use git::GitClient;
+use ipc::handlers::dispatch;
 use ipc::protocol::Request;
 use ipc::AppCtx;
 use session::TmuxClient;
@@ -78,6 +80,25 @@ enum Command {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
+    /// Request a child agent. Caller identity comes from $OVERSEER_AGENT_ID — rejected
+    /// if the caller is itself a child (flat tree: roots + children only).
+    Spawn {
+        /// Task description — becomes the child's name in the TUI.
+        #[arg(long)]
+        task: String,
+        /// Adapter to use (default: claude).
+        #[arg(long, default_value = "claude")]
+        adapter: String,
+    },
+    /// Kill the agent's tmux session and deregister it. Root agents can only be
+    /// dropped through the TUI, not this command.
+    Drop {
+        /// Agent id to drop.
+        id: String,
+        /// Also drop all of the agent's children (children before parent).
+        #[arg(long)]
+        recursive: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -134,6 +155,11 @@ fn main() -> Result<()> {
     }
 }
 
+/// `--mock` is inert demo data: it must never launch a real tmux session.
+fn tmux_client_for(mock: bool) -> TmuxClient {
+    if mock { TmuxClient::dry_run() } else { TmuxClient::new() }
+}
+
 fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -149,17 +175,18 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     });
 
     let ctx = Arc::new(AppCtx {
-        registry: registry.clone(),
-        tmux: Arc::new(TmuxClient::new()),
+        registry,
+        tmux: Arc::new(tmux_client_for(mock)),
         socket: socket.clone(),
         git: Arc::new(GitClient::new()),
         watch_sessions: !mock,
     });
 
     let socket_clone = socket.clone();
+    let ipc_ctx = ctx.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        if let Err(e) = ipc::serve_blocking(ctx, socket_clone, Some(ready_tx)) {
+        if let Err(e) = ipc::serve_blocking(ipc_ctx, socket_clone, Some(ready_tx)) {
             eprintln!("IPC server error: {e}");
         }
     });
@@ -171,7 +198,7 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(registry);
+    let mut app = App::new(ctx);
     let res = run_app(&mut terminal, &mut app);
 
     let _ = disable_raw_mode();
@@ -326,6 +353,23 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
             adapter: Some(adapter),
             cwd,
         })),
+        Command::Spawn { task, adapter } => {
+            let parent_id_str = std::env::var("OVERSEER_AGENT_ID").map_err(|_| {
+                anyhow::anyhow!("overseer spawn must be run from an agent session (missing $OVERSEER_AGENT_ID)")
+            })?;
+            let parent_id = parent_id_str
+                .parse::<AgentId>()
+                .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
+            let cwd = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
+            Ok(Some(Request::Spawn { parent_id, task, adapter: Some(adapter), cwd }))
+        }
+        Command::Drop { id, recursive } => {
+            let agent_id = id
+                .parse::<AgentId>()
+                .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
+            Ok(Some(Request::Drop { agent_id, recursive }))
+        }
         Command::Teach { .. } => unreachable!("Teach is handled before run_client"),
     }
 }
@@ -336,44 +380,65 @@ fn run_app<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     loop {
         let tick = app.tick;
-        let focus = &app.focus;
-        app.registry.with_tree(|tree| {
-            terminal.draw(|f| ui::render(f, focus, tree, tick))
+        let focus = app.focus.clone();
+        let prompt = build_prompt(app);
+        app.ctx.registry.with_tree(|tree| {
+            terminal.draw(|f| ui::render(f, &focus, tree, tick, prompt.as_deref()))
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
-                    KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
-                    _ => {}
-                }
-
-                match app.focus {
-                    Focus::Tree => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down
-                            if key.modifiers == KeyModifiers::NONE =>
-                        {
-                            app.registry.with_tree_mut(|t| t.move_down());
-                        }
-                        KeyCode::Char('k') | KeyCode::Up
-                            if key.modifiers == KeyModifiers::NONE =>
-                        {
-                            app.registry.with_tree_mut(|t| t.move_up());
-                        }
-                        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-                            app.registry.with_tree_mut(|t| t.toggle_expand());
-                        }
-                        KeyCode::Enter | KeyCode::Char('o')
-                            if key.modifiers == KeyModifiers::NONE =>
-                        {
-                            app.focus = Focus::Pane;
-                        }
+                if app.input.is_some() {
+                    handle_input_key(app, key);
+                } else if app.confirm.is_some() {
+                    handle_confirm_key(app, key);
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
+                        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
                         _ => {}
-                    },
-                    Focus::Pane => {
-                        if key.code == KeyCode::Esc {
-                            app.focus = Focus::Tree;
+                    }
+
+                    match app.focus {
+                        Focus::Tree => match key.code {
+                            KeyCode::Char('j') | KeyCode::Down
+                                if key.modifiers == KeyModifiers::NONE =>
+                            {
+                                app.ctx.registry.with_tree_mut(|t| t.move_down());
+                            }
+                            KeyCode::Char('k') | KeyCode::Up
+                                if key.modifiers == KeyModifiers::NONE =>
+                            {
+                                app.ctx.registry.with_tree_mut(|t| t.move_up());
+                            }
+                            KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+                                app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
+                            }
+                            KeyCode::Enter | KeyCode::Char('o')
+                                if key.modifiers == KeyModifiers::NONE =>
+                            {
+                                app.focus = Focus::Pane;
+                            }
+                            KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                                app.status_message = None;
+                                app.input = Some(InputState {
+                                    action: PendingAction::SpawnRoot,
+                                    buffer: String::new(),
+                                });
+                            }
+                            KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
+                                start_spawn_child_input(app);
+                            }
+                            KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
+                                start_drop_confirm(app, false);
+                            }
+                            KeyCode::Char('D') => start_drop_confirm(app, true),
+                            _ => {}
+                        },
+                        Focus::Pane => {
+                            if key.code == KeyCode::Esc {
+                                app.focus = Focus::Tree;
+                            }
                         }
                     }
                 }
@@ -383,6 +448,138 @@ fn run_app<B: ratatui::backend::Backend>(
         app.tick();
     }
     Ok(())
+}
+
+/// Builds the status-bar override text for the active input/confirm prompt, or the
+/// last status message. `None` means the status bar should show its normal hints.
+fn build_prompt(app: &App) -> Option<String> {
+    if let Some(input) = &app.input {
+        let label = match input.action {
+            PendingAction::SpawnRoot => "spawn root",
+            PendingAction::SpawnChild { .. } => "spawn child",
+        };
+        return Some(format!("{label} task: {}_", input.buffer));
+    }
+
+    if let Some(confirm) = &app.confirm {
+        let name = app
+            .ctx
+            .registry
+            .get(&confirm.agent_id)
+            .map(|d| d.name)
+            .unwrap_or_else(|| "?".to_string());
+        let descendants = app
+            .ctx
+            .registry
+            .with_tree(|t| t.subtree_ids_postorder(&confirm.agent_id))
+            .map(|ids| ids.len().saturating_sub(1))
+            .unwrap_or(0);
+        let suffix = if confirm.recursive && descendants > 0 {
+            format!(" + {descendants} children")
+        } else {
+            String::new()
+        };
+        return Some(format!("drop '{name}'{suffix}? (y/n)"));
+    }
+
+    app.status_message.clone()
+}
+
+/// `s`: opens a task-input prompt for the selected node, whatever its role. Whether
+/// it's actually eligible to take a child is decided by the server's `Spawn` handler
+/// alone (AGENTS.md: the "no grandchildren" rule lives there, "not in the TUI, not as
+/// a UI hint") — a rejection surfaces through `submit_input`'s normal error handling.
+fn start_spawn_child_input(app: &mut App) {
+    if let Some(node) = app.ctx.registry.with_tree(|t| t.selected()) {
+        app.status_message = None;
+        app.input = Some(InputState {
+            action: PendingAction::SpawnChild { parent_id: node.id },
+            buffer: String::new(),
+        });
+    }
+}
+
+fn start_drop_confirm(app: &mut App, recursive: bool) {
+    if let Some(node) = app.ctx.registry.with_tree(|t| t.selected()) {
+        app.status_message = None;
+        app.confirm = Some(ConfirmState { agent_id: node.id, recursive });
+    }
+}
+
+fn handle_input_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.input = None;
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = app.input.as_mut() {
+                input.buffer.pop();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(input) = app.input.take() {
+                submit_input(app, input);
+            }
+        }
+        KeyCode::Char(c)
+            if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            if let Some(input) = app.input.as_mut() {
+                input.buffer.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Dispatches the composed `Start`/`Spawn` request in-process — same call the IPC
+/// socket handler would make, so the grandchild check applies uniformly.
+fn submit_input(app: &mut App, input: InputState) {
+    let task = input.buffer.trim().to_string();
+    if task.is_empty() {
+        app.status_message = Some("spawn cancelled: empty task".to_string());
+        return;
+    }
+
+    let req = match input.action {
+        PendingAction::SpawnRoot => {
+            let cwd = std::env::current_dir().ok();
+            Request::Start { task, adapter: None, cwd }
+        }
+        PendingAction::SpawnChild { parent_id } => {
+            let Some(parent) = app.ctx.registry.get(&parent_id) else {
+                app.status_message = Some("spawn failed: parent no longer exists".to_string());
+                return;
+            };
+            Request::Spawn { parent_id, task, adapter: None, cwd: parent.cwd }
+        }
+    };
+
+    let resp = dispatch(&app.ctx, req);
+    app.status_message = if resp.ok {
+        None
+    } else {
+        Some(format!("spawn failed: {}", resp.error.unwrap_or_else(|| "unknown error".to_string())))
+    };
+}
+
+fn handle_confirm_key(app: &mut App, key: KeyEvent) {
+    let Some(confirm) = app.confirm.take() else { return };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            match drop_agent(&app.ctx.registry, &app.ctx.tmux, &confirm.agent_id, confirm.recursive, true) {
+                Ok(()) => app.status_message = None,
+                Err(e) => app.status_message = Some(format!("drop failed: {e}")),
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.status_message = None;
+        }
+        _ => {
+            // Not a recognized response — keep the confirm prompt open.
+            app.confirm = Some(confirm);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +622,43 @@ mod tests {
     fn build_request_list_returns_list() {
         let req = build_request(Command::List).unwrap().unwrap();
         assert!(matches!(req, Request::List));
+    }
+
+    #[test]
+    fn build_request_spawn_without_env_var_is_error() {
+        std::env::remove_var("OVERSEER_AGENT_ID");
+        let cmd = Command::Spawn { task: "write tests".to_string(), adapter: "claude".to_string() };
+        assert!(build_request(cmd).is_err());
+    }
+
+    #[test]
+    fn build_request_spawn_with_env_var_returns_spawn() {
+        let id = AgentId::new();
+        std::env::set_var("OVERSEER_AGENT_ID", id.0.to_string());
+        let cmd = Command::Spawn { task: "write tests".to_string(), adapter: "claude".to_string() };
+        let req = build_request(cmd).unwrap().unwrap();
+        assert!(matches!(req, Request::Spawn { parent_id, task, .. }
+            if parent_id == id && task == "write tests"));
+        std::env::remove_var("OVERSEER_AGENT_ID");
+    }
+
+    #[test]
+    fn build_request_drop_returns_drop() {
+        let id = AgentId::new();
+        let cmd = Command::Drop { id: id.0.to_string(), recursive: true };
+        let req = build_request(cmd).unwrap().unwrap();
+        assert!(matches!(req, Request::Drop { agent_id, recursive: true } if agent_id == id));
+    }
+
+    #[test]
+    fn build_request_drop_invalid_id_is_error() {
+        let cmd = Command::Drop { id: "not-a-uuid".to_string(), recursive: false };
+        assert!(build_request(cmd).is_err());
+    }
+
+    #[test]
+    fn mock_mode_never_gets_a_real_tmux_client() {
+        assert!(tmux_client_for(true).is_dry_run());
+        assert!(!tmux_client_for(false).is_dry_run());
     }
 }
