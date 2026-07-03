@@ -383,7 +383,11 @@ fn run_app<B: ratatui::backend::Backend>(
         let prompt = build_prompt(app);
         let input = app.input.as_ref();
         app.ctx.registry.with_tree(|tree| {
-            terminal.draw(|f| ui::render(f, tree, tick, prompt.as_deref(), input))
+            terminal.draw(|f| {
+                // Pane focus/jump-in is wired next (PHASE6.md Task 3) — always
+                // unfocused (read-only preview) for now.
+                ui::render(f, tree, tick, prompt.as_deref(), input, &app.ctx.sessions, false)
+            })
         })?;
 
         if event::poll(Duration::from_millis(100))? {

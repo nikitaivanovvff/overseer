@@ -1,3 +1,5 @@
+mod term_pane;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -8,22 +10,28 @@ use ratatui::{
 
 use crate::agent::{AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction};
+use crate::session::SessionManager;
+
+pub use term_pane::render_term_pane;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Width of the tree column as a percentage of the full window — the pane
+/// takes the rest (PHASE6.md §3.5).
+const TREE_COLUMN_PCT: u16 = 25;
 
-/// Renders only the tree/detail column — the live agent pane is a genuinely
-/// separate tmux pane (a real pty the terminal/tmux compositor draws, with
-/// correct color and width by construction) that ratatui has no part in
-/// drawing. `frame.area()` here is already just this pane's own real size —
-/// meaning it's much narrower than a full terminal (the tree pane is ~25% of
-/// the window), so the status bar wraps rather than silently truncating
-/// confirm prompts and error messages.
+/// Renders the whole window: the tree|pane split plus a full-width status
+/// bar. `frame.area()` is now the entire terminal — there is no longer a
+/// separate tmux pane on the right; `render_term_pane` draws the selected
+/// agent's live grid directly into this same ratatui frame.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     tree: &AgentTree,
     tick: u64,
     prompt: Option<&str>,
     input: Option<&InputState>,
+    sessions: &SessionManager,
+    pane_focused: bool,
 ) {
     let area = frame.area();
     let (running, total) = tree.agent_counts();
@@ -36,16 +44,25 @@ pub fn render(
         .constraints([Constraint::Min(0), Constraint::Length(status_height)])
         .split(area);
 
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(TREE_COLUMN_PCT),
+            Constraint::Percentage(100 - TREE_COLUMN_PCT),
+        ])
+        .split(outer[0]);
+
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(7)])
-        .split(outer[0]);
+        .split(columns[0]);
 
     let flat = tree.flatten();
     let selected = flat.get(tree.cursor).cloned();
 
     render_agent_tree(frame, tree.cursor, tick, left[0], &flat);
     render_agent_detail(frame, left[1], &selected);
+    render_term_pane(frame, columns[1], sessions, selected.as_ref().map(|n| &n.id), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything — a bordered, centered modal instead of
