@@ -55,7 +55,7 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
             Ok(_) => {
                 let resp = match serde_json::from_str::<Request>(line.trim()) {
                     Ok(req) => {
-                        // Blocking I/O (git, tmux) must not block the tokio thread.
+                        // Blocking I/O (git, PTY launch) must not block the tokio thread.
                         let ctx = ctx.clone();
                         tokio::task::spawn_blocking(move || dispatch(&ctx, req))
                             .await

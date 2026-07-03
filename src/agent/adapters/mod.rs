@@ -8,7 +8,7 @@ pub mod claude;
 
 /// Identity passed to an adapter at launch time.
 /// No filesystem/worktree paths — Overseer does not own a workspace.
-/// `cwd` is where tmux starts the session (the repo root).
+/// `cwd` is where the PTY starts the session (the repo root).
 pub struct LaunchContext {
     pub agent_id: AgentId,
     pub role: AgentRole,
@@ -94,10 +94,10 @@ pub trait AgentAdapter: Send + Sync {
 
     // --- launch (runtime, pure) ---
 
-    /// Returns the command to run inside the tmux session (program + args; no cwd/env).
+    /// Returns the command to run inside the agent's PTY (program + args; no cwd/env).
     fn spawn_command(&self, ctx: &LaunchContext) -> Command;
 
-    /// Returns env vars to inject into the tmux session.
+    /// Returns env vars to inject into the agent's PTY.
     fn env_inject(&self, ctx: &LaunchContext) -> HashMap<String, String>;
 }
 

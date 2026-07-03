@@ -1,10 +1,10 @@
 # Overseer
 
-**An IDE for agents.** A terminal-native TUI for observing and steering a fleet of parallel AI coding agents from a single window — instead of juggling five terminal tabs. Built in Rust. Nvim-aesthetic, backed by tmux, with a Unix socket IPC layer that gives agents a lightweight API to register, report status, and spawn children — without MCP overhead.
+**An IDE for agents.** A terminal-native TUI for observing and steering a fleet of parallel AI coding agents from a single window — instead of juggling five terminal tabs. Built in Rust. Nvim-aesthetic; a single ordinary alt-screen app with no bundled multiplexer — each agent is a PTY Overseer owns directly, emulated in-process via `alacritty_terminal` and rendered straight into the same ratatui frame — with a Unix socket IPC layer that gives agents a lightweight API to register, report status, and spawn children — without MCP overhead.
 
 The agents are already smart. Overseer does **not** reimplement what they do — it does not manage git worktrees, branches, or merges; agents handle their own isolation. Overseer is the observability, routing, and approval surface on top: see every agent's state at a glance, jump into any one to approve or intervene, or leave the parent to supervise its own children.
 
-The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself, in your own time, exactly as you would without Overseer; the row appears in the tree immediately, named after the repo, and its status flips from `idle` to `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own tmux session (auto-launched via the configured adapter) and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
+The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself, in your own time, exactly as you would without Overseer; the row appears in the tree immediately, named after the repo, and its status flips from `idle` to `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own PTY (auto-launched via the configured adapter) and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
 
 The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the **task description** it was spawned with. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, aider, etc.) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
 
@@ -16,11 +16,11 @@ The hierarchy is intentionally **flat**: a parent (root) can spawn children, but
 You (the user)
   └─ Overseer TUI                                                        ← one window, the whole fleet
        └─ Root  (name: overseer, adapter: shell → claude once you run it) ← bare shell in the repo checkout
-            ├─ Child Agent A  (task: auth-module, adapter: claude)       ← own tmux session, own branch
-            └─ Child Agent B  (task: write-tests, adapter: aider)        ← own tmux session, own branch
+            ├─ Child Agent A  (task: auth-module, adapter: claude)       ← own PTY, own branch
+            └─ Child Agent B  (task: write-tests, adapter: aider)        ← own PTY, own branch
 ```
 
-You spawn the root, run your own agent inside it, and talk to it directly; the agent then fans out children on your behalf. Each agent is a tmux session Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
+You spawn the root, run your own agent inside it, and talk to it directly; the agent then fans out children on your behalf. Each agent is a PTY Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
 
 Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer teach <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens consumed, nothing written into your repo.
 
@@ -30,21 +30,21 @@ Agents know their role (`root` or `child`) via injected env vars and a **user-le
 
 ```
 overseer (binary)
-├── tui/              Ratatui-based terminal UI
-│   ├── layout        Left panel (agent tree, ~25% width) + a real tmux split pane on the
-│   │                 right, permanently attached to the selected agent's live session
-│   ├── agent_tree    Renders hierarchy, status badges, keyboard nav
-│   └── status_bar    Global status, keybind hints
-├── session/          Tmux management
-│   ├── tmux          Control-mode client (launches sessions w/ env, parses events)
-│   └── registry      In-memory map of AgentSession → tmux session/window/pane
+├── ui/               Ratatui-based terminal UI
+│   ├── mod           Tree|pane split (~25/75): agent tree, detail, status bar, spawn modal
+│   └── term_pane     Paints the selected agent's live alacritty_terminal grid into the pane half
+├── session/          PTY + terminal-emulator management
+│   ├── pty           SessionManager: owns one alacritty_terminal Term + PTY per agent, keyed by AgentId
+│   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder (input path for a focused pane)
 ├── agent/            Agent model and lifecycle
 │   ├── model         AgentNode, AgentStatus, AgentRole, AgentTree
+│   ├── registry      AgentRegistry: in-memory tree of registered agents + their metadata
 │   ├── adapters/     Pluggable per-agent-type behaviour
 │   │   ├── mod       AgentAdapter trait (teach_files, spawn_command, env_inject)
 │   │   ├── claude    Claude Code adapter (user-level skill + hooks, launch cmd)
 │   │   └── generic   Fallback: raw shell command, env vars only (Phase 5)
-│   └── spawn         Orchestrates session launch + env injection + register
+│   ├── spawn         Orchestrates session launch + env injection + register
+│   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it
 ├── git/              Read-only git info via CLI (repo name, current branch) — no worktrees
 ├── ipc/              Unix socket server (tokio, newline-delimited JSON)
 │   ├── server        Binds to $OVERSEER_SOCKET, accepts connections
@@ -67,11 +67,11 @@ Unix domain socket at `/tmp/overseer-<session-id>.sock`. The only channel agents
 | Command | Args | Description |
 |---------|------|-------------|
 | `overseer teach` | `<agent> --uninstall?` | Install (or remove) the user-level skill + status hooks for an agent type. Run once at setup, not per launch. |
-| `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in a tmux session (default cwd: current directory). No adapter is launched — run your own agent inside it. |
+| `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
 | `overseer register` | `--role --parent-id? --adapter` | Called once on agent startup (usually wired via env, not by hand) |
 | `overseer status` | `<status> --message?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. |
 | `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. |
-| `overseer drop` | `<id> --recursive?` | Kill the agent's tmux session and deregister it. Overseer does not touch the agent's branch/worktree. |
+| `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. |
 | `overseer list` | — | List all agents |
 | `overseer agent` | `<id>` | Get agent detail |
 
@@ -117,11 +117,13 @@ User-level `~/.claude/settings.json` hooks (installed by `overseer teach`, share
 
 ### Workspace
 
-Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer's only job is to launch the tmux session in the repo and inject identity env. It never runs `git worktree`, never creates branches, and never merges. Integrating an agent's branch is the user's call, same as it would be without Overseer.
+Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer's only job is to launch the PTY in the repo and inject identity env. It never runs `git worktree`, never creates branches, and never merges. Integrating an agent's branch is the user's call, same as it would be without Overseer.
 
 ### Cleanup
 
-Dropping an agent kills its tmux session and deregisters it — that's all. Overseer does not delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent, so no session is orphaned. Root agents cannot be dropped via IPC — only via the TUI.
+Dropping an agent kills its PTY and deregisters it — that's all. Overseer does not delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent, so no session is orphaned. Root agents cannot be dropped via IPC — only via the TUI.
+
+**v1 has no persistence.** Agents are child processes of the Overseer process itself — quitting (`q`, with anything registered) kills every one of them, no reattach, no daemon. That's an accepted regression versus the old tmux backend (which survived a TUI restart); a daemon split reusing the same `SessionManager` is the planned path back to persistence, not yet built. `q`/`Ctrl-C` confirm first whenever any agent is still registered, so this is never silent.
 
 ### TUI Layout
 
@@ -129,36 +131,35 @@ Dropping an agent kills its tmux session and deregisters it — that's all. Over
 ┌─────────────────┬──────────────────────────────────────────────────┐
 │ AGENTS          │                                                  │
 │ ◌ overseer      │                                                  │
-│   ├ ● auth-mod  │     a real tmux pane, permanently attached to    │
-│   ├ ○ tests     │     the selected agent's live session — real     │
-│   └ ✓ docs      │     color, real interaction, no snapshot         │
-│ ○ refactor-api  │                                                  │
+│   ├ ● auth-mod  │     the selected agent's live grid, painted      │
+│   ├ ○ tests     │     directly into this same ratatui frame by     │
+│   └ ✓ docs      │     ui/term_pane — real color, real interaction  │
+│ ○ refactor-api  │     once focused (Ctrl-l)                        │
 ├─────────────────┤                                                  │
 │ task:   auth-mod│                                                  │
 │ repo:   overseer│                                                  │
 │ branch: ovsr/a  │                                                  │
 │ status: running │                                                  │
 └─────────────────┴──────────────────────────────────────────────────┘
- OVERSEER   3/6 running   j/k nav  o/↵ jump in  n/s spawn  d/D drop  q quit
+ OVERSEER   3/6 running   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  q quit
 ```
 
-The left column (agent tree + detail + status bar) is ratatui-rendered, in its own real tmux pane at ~25% of the window width. The right column is a *second, genuinely separate* tmux pane — not something ratatui draws — permanently holding a nested tmux client on Overseer's private server, retargeted automatically as the tree selection changes.
+Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; there is no second pane, no multiplexer, nothing external compositing the right side. `ui::term_pane` locks the selected agent's `alacritty_terminal::Term` (owned by `SessionManager`) and paints its grid cell-by-cell into that half of the buffer.
 
 Status badges: `●` running · `○` waiting · `◌` idle (spawned, nothing running there yet) · `✓` done · `✗` error · `…` spawning
 
-**Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` (and, if vertical splits ever exist, `Ctrl-j`/`Ctrl-k`) to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched.
+**Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while a pane is focused (real Backspace still works: terminals send `DEL`, not `^H`).
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate agent tree |
-| `Enter` / `o` | Jump in — moves tmux keyboard focus into the live pane (`select-pane`); it's already showing the selected agent's real session, so this is just a focus change |
+| `j` / `k` | Navigate agent tree (tree focus only) |
+| `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
+| `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
 | `n` | Spawn a root: a bare shell in a chosen repo (default cwd) — no agent launched, run your own |
 | `s` | Spawn child under selected agent (adapter-launched, same as before) |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
-| `<prefix> o` | From inside the live pane, tmux's own stock pane-cycle binding returns focus to the tree — there's no dedicated Overseer keybind for this, since ratatui receives no input while the live pane has focus |
-| `q` | Quit (agents keep running in tmux) |
-| `Q` | Quit + kill all sessions |
+| `q` / `Ctrl-C` | Quit — confirms first if any agent is registered (v1 has no persistence, this kills them) |
 
 ### Spawn Data Flow
 
@@ -168,7 +169,7 @@ Root agent runs: overseer spawn --task "write tests" --adapter claude
 IPC server (spawn_blocking):
   → AgentRegistry::register(child, parent=caller)   // rejects if caller is a child
   → adapter = adapter_for(name)
-  → SessionManager::launch(session_name, cwd=repo, adapter.spawn_command(ctx),
+  → SessionManager::launch(agent_id, cwd=repo, adapter.spawn_command(ctx),
                            adapter.env_inject(ctx))
   → replies: {"agent_id": "..."}
 
@@ -176,7 +177,7 @@ TUI re-renders with the new child visible under the parent. The child sets up it
 branch/worktree on startup, per the Overseer skill.
 ```
 
-`overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the tmux session itself and reports its own status via the same push hooks — Overseer never detects or launches it.
+`overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it.
 
 ---
 
@@ -213,14 +214,14 @@ drop = "d"
 | Async runtime | `tokio` |
 | IPC server | `tokio` `UnixListener` + `serde_json` (newline-delimited JSON, no HTTP) |
 | Git (read-only info) | `std::process::Command` (`git` CLI) — repo name, current branch only |
-| Tmux control | `std::process::Command` (tmux -C) |
+| Terminal backend | `alacritty_terminal` — PTY spawn + VT100/xterm emulation, in-process, no external multiplexer |
 | Config | `toml` + `serde` |
 | CLI | `clap` |
 | Serialization | `serde_json` |
 | UUID | `uuid` |
 | Error handling | `anyhow` + `thiserror` |
 
-**Runtime dependencies:** `git`, `tmux`. Both standard on macOS/Linux.
+**Runtime dependencies:** `git`. Standard on macOS/Linux. (No `tmux` — Overseer owns its own PTYs now.)
 
 ---
 
@@ -234,11 +235,11 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 
 - **IPC is the only shared channel.** Agent ↔ overseer communication always goes through the Unix socket. Never write to shared in-process state from an agent context.
 - **The "no grandchildren" rule lives in the IPC server,** in the `spawn` handler. Not in the TUI, not in adapters. One place, always enforced.
-- **`TmuxClient` is the only tmux boundary.** No raw `Command::new("tmux")` outside of `session/tmux.rs`.
+- **`SessionManager` is the only terminal-backend boundary.** No `alacritty_terminal` imports outside `session/` and the pane renderer (`ui/term_pane.rs`).
 - **Parse functions are pure.** Functions like `parse_session_line` take a `&str` and return a value — no process spawning, no I/O. This makes them trivially testable.
-- **`AgentNode` is a data model, not a handle.** It does not own a tmux session. Session handles live in `SessionRegistry`. Overseer holds no worktree state at all — that's the agent's.
-- **Status is push, not pull.** Agent hooks POST status changes to the socket. Overseer never polls tmux pane output to infer status.
-- **`tui.rs` is a render layer only.** No business logic. All state mutations go through `App` / `AgentTree` methods.
+- **`AgentNode` is a data model, not a handle.** It does not own a PTY. Session handles live in `SessionManager`, keyed by `AgentId`. Overseer holds no worktree state at all — that's the agent's.
+- **Status is push, not pull.** Agent hooks POST status changes to the socket. Overseer never infers status from PTY output.
+- **`ui/` is a render layer only.** No business logic. All state mutations go through `App` / `AgentTree` / `SessionManager` methods.
 
 ## What to Avoid
 
@@ -248,4 +249,4 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 - **Don't add agent status polling.** If hooks aren't firing, the fix is in `overseer teach` (the installed hooks), not in adding a background poller.
 - **Don't reimplement git.** No worktree creation, no branching, no merging, no `git worktree` anywhere. Agents own their isolation. Overseer's only git use is read-only display info (repo name, current branch).
 - **Don't write into the user's repo.** All agent config (skill, hooks) is installed at the user level by `overseer teach`. Launch injects env only.
-- **Don't skip the confirm prompt for `d`/`D`.** Killing a running agent's session interrupts in-flight work — confirm first.
+- **Don't skip the confirm prompt for `d`/`D`, or for quitting with agents registered.** Killing a running agent's session interrupts in-flight work — confirm first. v1 has no persistence, so quitting is exactly as destructive as a drop.

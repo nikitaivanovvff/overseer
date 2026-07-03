@@ -83,6 +83,10 @@ struct PtySession {
     channel: EventLoopSender,
     alive: Arc<AtomicBool>,
     reader: Option<JoinHandle<(SessionEventLoop, EventLoopState)>>,
+    /// The child's own pid, captured before it moves into the `EventLoop` —
+    /// needed because `kill()` must be able to force-terminate it directly
+    /// (see the comment there for why a hangup alone isn't enough).
+    pid: u32,
 }
 
 enum Mode {
@@ -204,6 +208,7 @@ impl SessionManager {
 
         let pty = tty::new(&pty_options, window_size, 0)
             .with_context(|| format!("failed to spawn pty for agent '{}'", id.short()))?;
+        let pid = pty.child().id();
 
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
             .with_context(|| format!("failed to start pty event loop for agent '{}'", id.short()))?;
@@ -213,7 +218,7 @@ impl SessionManager {
 
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
-            PtySession { term, channel, alive, reader: Some(reader) },
+            PtySession { term, channel, alive, reader: Some(reader), pid },
         );
         Ok(())
     }
@@ -221,13 +226,21 @@ impl SessionManager {
     /// Kills the agent's PTY and forgets it. Best-effort: killing an unknown
     /// (already-dead) id is not an error — callers rely on this for recursive
     /// drop and the dead-session watcher.
+    ///
+    /// Sends `SIGKILL` to the child directly rather than relying on the PTY
+    /// hangup alone: some agents (observed with real Claude Code) don't die
+    /// from a hangup, and joining the reader thread drops the `Pty`, whose
+    /// `Drop` impl calls the blocking `Child::wait()` — with a hangup-only
+    /// signal, that `wait()` can block this calling thread (the UI thread,
+    /// for a `d`/`D`/quit-confirmed kill) forever. `SIGKILL` can't be caught
+    /// or ignored, so the child is reliably dead by the time we join.
     pub fn kill(&self, id: &AgentId) {
         let session = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         let Some(session) = session else { return };
         let _ = session.channel.send(Msg::Shutdown);
-        // Join so the `Pty`'s master fd actually drops here (closing it is what
-        // sends the child process SIGHUP) rather than whenever the detached
-        // reader thread's return value happens to be reclaimed.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &session.pid.to_string()])
+            .status();
         if let Some(handle) = session.reader {
             let _ = handle.join();
         }
@@ -367,5 +380,33 @@ mod tests {
         assert!(s.is_alive(&id));
         s.kill(&id);
         assert!(!s.is_alive(&id), "killed session must be forgotten");
+    }
+
+    /// Regression test: some real agents (observed with Claude Code) don't
+    /// die from a PTY hangup alone. `kill()` used to join the reader thread
+    /// and then drop its `Pty`, whose `Drop` blocks on `Child::wait()` — with
+    /// only a hangup, that blocked the *calling* thread (the UI thread, for a
+    /// `d`/`D`/quit-confirmed kill) forever if the child ignored it. Runs
+    /// `kill()` on a background thread and asserts it completes quickly
+    /// rather than actually blocking the test run forever if it regresses.
+    #[test]
+    fn kill_does_not_block_on_a_child_that_ignores_hangup_and_terminate() {
+        let s = Arc::new(SessionManager::new());
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP TERM; sleep 60 & wait $!"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+        assert!(s.is_alive(&id));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s2, id2) = (s.clone(), id.clone());
+        std::thread::spawn(move || {
+            s2.kill(&id2);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("kill() must not block forever on a child that ignores HUP/TERM");
+        assert!(!s.is_alive(&id));
     }
 }

@@ -35,7 +35,7 @@ pub enum Request {
         agent_id: AgentId,
     },
     /// Server-side launch: register a root agent and start a bare shell for it in
-    /// a tmux session, in `cwd` (defaults to the server's own cwd). No adapter is
+    /// its own PTY, in `cwd` (defaults to the server's own cwd). No adapter is
     /// launched — the user runs their own agent inside it whenever ready.
     Start {
         cwd: Option<std::path::PathBuf>,
@@ -50,7 +50,7 @@ pub enum Request {
         adapter: Option<String>,
         cwd: std::path::PathBuf,
     },
-    /// Kill the agent's tmux session and deregister it (+ its subtree if `recursive`).
+    /// Kill the agent's PTY and deregister it (+ its subtree if `recursive`).
     /// Root agents can only be dropped through the TUI, not this command.
     Drop {
         agent_id: AgentId,

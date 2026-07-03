@@ -16,10 +16,20 @@ pub struct InputState {
     pub buffer: String,
 }
 
-/// Active while awaiting y/n confirmation for `d`/`D`.
+/// What a y/n confirmation prompt is asking about.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    Drop { agent_id: AgentId, recursive: bool },
+    /// `q`/`Ctrl-C` with live agents (PHASE6.md §3.2): v1 has no persistence,
+    /// quitting kills every running agent, so it's confirmed rather than
+    /// silent — the one real regression from the tmux backend it replaces.
+    Quit,
+}
+
+/// Active while awaiting y/n confirmation for `d`/`D`, or for quitting with
+/// live agents.
 pub struct ConfirmState {
-    pub agent_id: AgentId,
-    pub recursive: bool,
+    pub action: ConfirmAction,
 }
 
 /// Which half of the tree|pane split receives keyboard input (PHASE6.md §3.3).

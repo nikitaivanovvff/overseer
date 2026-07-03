@@ -26,7 +26,7 @@ mod ui;
 use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, MergeStrategy};
 use agent::drop::drop_agent;
-use app::{App, ConfirmState, Focus, InputState, PendingAction};
+use app::{App, ConfirmAction, ConfirmState, Focus, InputState, PendingAction};
 use git::GitClient;
 use ipc::handlers::dispatch;
 use ipc::protocol::Request;
@@ -418,7 +418,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             if app.input.is_some() {
                                 handle_input_key(app, key);
                             } else if app.confirm.is_some() {
-                                handle_confirm_key(app, key);
+                                if !handle_confirm_key(app, key) {
+                                    break;
+                                }
                             } else if !handle_tree_key(app, key) {
                                 break;
                             }
@@ -439,8 +441,8 @@ fn run_app<B: ratatui::backend::Backend>(
 /// `false` to request the run loop break (quit).
 fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return false,
-        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return false,
+        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return start_quit(app),
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return start_quit(app),
         _ => {}
     }
 
@@ -494,6 +496,30 @@ fn jump_in(app: &mut App) {
     }
 }
 
+/// `q`/`Ctrl-C` from the tree: quit immediately if nothing would be lost,
+/// otherwise ask for confirmation first — v1 has no persistence, quitting
+/// kills every live agent (PHASE6.md §1/§3.2). Returns `false` only when it's
+/// safe to quit immediately (the confirm path breaks the loop itself, from
+/// `handle_confirm_key`, once the user answers).
+fn start_quit(app: &mut App) -> bool {
+    if count_live_agents(app) == 0 {
+        return false;
+    }
+    app.status_message = None;
+    app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
+    true
+}
+
+fn count_live_agents(app: &App) -> usize {
+    app.ctx.registry.snapshot().iter().filter(|a| app.ctx.sessions.is_alive(&a.id)).count()
+}
+
+fn quit_all_agents(app: &App) {
+    for agent in app.ctx.registry.snapshot() {
+        app.ctx.sessions.kill(&agent.id);
+    }
+}
+
 /// `Focus::Pane` key handling: `Ctrl-h` is the only intercepted key — it
 /// returns focus to the tree. Everything else, modifiers included, encodes
 /// to bytes and forwards to the agent's PTY untouched (Ctrl-c reaches the
@@ -526,24 +552,33 @@ fn forward_paste(app: &mut App, text: &str) {
 /// its own modal (`ui::render_spawn_modal`), driven directly by `app.input`.
 fn build_prompt(app: &App) -> Option<String> {
     if let Some(confirm) = &app.confirm {
-        let name = app
-            .ctx
-            .registry
-            .get(&confirm.agent_id)
-            .map(|d| d.name)
-            .unwrap_or_else(|| "?".to_string());
-        let descendants = app
-            .ctx
-            .registry
-            .with_tree(|t| t.subtree_ids_postorder(&confirm.agent_id))
-            .map(|ids| ids.len().saturating_sub(1))
-            .unwrap_or(0);
-        let suffix = if confirm.recursive && descendants > 0 {
-            format!(" + {descendants} children")
-        } else {
-            String::new()
-        };
-        return Some(format!("drop '{name}'{suffix}? (y/n)"));
+        return Some(match &confirm.action {
+            ConfirmAction::Drop { agent_id, recursive } => {
+                let name = app
+                    .ctx
+                    .registry
+                    .get(agent_id)
+                    .map(|d| d.name)
+                    .unwrap_or_else(|| "?".to_string());
+                let descendants = app
+                    .ctx
+                    .registry
+                    .with_tree(|t| t.subtree_ids_postorder(agent_id))
+                    .map(|ids| ids.len().saturating_sub(1))
+                    .unwrap_or(0);
+                let suffix = if *recursive && descendants > 0 {
+                    format!(" + {descendants} children")
+                } else {
+                    String::new()
+                };
+                format!("drop '{name}'{suffix}? (y/n)")
+            }
+            ConfirmAction::Quit => {
+                let n = count_live_agents(app);
+                let noun = if n == 1 { "agent" } else { "agents" };
+                format!("{n} {noun} running and will be killed — quit? (y/n)")
+            }
+        });
     }
 
     app.status_message.clone()
@@ -566,7 +601,7 @@ fn start_spawn_child_input(app: &mut App) {
 fn start_drop_confirm(app: &mut App, recursive: bool) {
     if let Some(node) = app.ctx.registry.with_tree(|t| t.selected()) {
         app.status_message = None;
-        app.confirm = Some(ConfirmState { agent_id: node.id, recursive });
+        app.confirm = Some(ConfirmState { action: ConfirmAction::Drop { agent_id: node.id, recursive } });
     }
 }
 
@@ -648,21 +683,31 @@ fn expand_repo_path(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-fn handle_confirm_key(app: &mut App, key: KeyEvent) {
-    let Some(confirm) = app.confirm.take() else { return };
+/// Returns `false` to request the run loop break (a confirmed quit).
+fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(confirm) = app.confirm.take() else { return true };
     match key.code {
-        KeyCode::Char('y') | KeyCode::Enter => {
-            match drop_agent(&app.ctx.registry, &app.ctx.sessions, &confirm.agent_id, confirm.recursive, true) {
-                Ok(()) => app.status_message = None,
-                Err(e) => app.status_message = Some(format!("drop failed: {e}")),
+        KeyCode::Char('y') | KeyCode::Enter => match confirm.action {
+            ConfirmAction::Drop { agent_id, recursive } => {
+                match drop_agent(&app.ctx.registry, &app.ctx.sessions, &agent_id, recursive, true) {
+                    Ok(()) => app.status_message = None,
+                    Err(e) => app.status_message = Some(format!("drop failed: {e}")),
+                }
+                true
             }
-        }
+            ConfirmAction::Quit => {
+                quit_all_agents(app);
+                false
+            }
+        },
         KeyCode::Char('n') | KeyCode::Esc => {
             app.status_message = None;
+            true
         }
         _ => {
             // Not a recognized response — keep the confirm prompt open.
             app.confirm = Some(confirm);
+            true
         }
     }
 }
@@ -741,5 +786,104 @@ mod tests {
     fn mock_mode_never_gets_a_real_session_manager() {
         assert!(session_manager_for(true).is_dry_run());
         assert!(!session_manager_for(false).is_dry_run());
+    }
+
+    // ── quit guard ────────────────────────────────────────────────────────────
+
+    fn register_agent(app: &App, id: Option<AgentId>) -> AgentId {
+        use crate::agent::RegisterArgs;
+        app.ctx
+            .registry
+            .register(RegisterArgs {
+                id,
+                name: "agent".to_string(),
+                role: AgentRole::Root,
+                parent_id: None,
+                adapter: "shell".to_string(),
+                repo: "repo".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                branch: None,
+                initial_status: AgentStatus::Idle,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn app_with_sessions(sessions: SessionManager) -> App {
+        let ctx = Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            sessions: Arc::new(sessions),
+            socket: PathBuf::from("/tmp/overseer-quit-test.sock"),
+            git: Arc::new(GitClient::new()),
+            watch_sessions: false,
+        });
+        App::new(ctx)
+    }
+
+    #[test]
+    fn count_live_agents_reflects_session_liveness_not_registry_size() {
+        let live_id = AgentId::new();
+        let sessions =
+            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
+        let app = app_with_sessions(sessions);
+        register_agent(&app, Some(live_id));
+        register_agent(&app, None); // registered, but its session isn't in the live set
+
+        assert_eq!(count_live_agents(&app), 1);
+    }
+
+    #[test]
+    fn start_quit_returns_false_immediately_when_nothing_is_live() {
+        let mut app = app_with_sessions(SessionManager::dry_run());
+        register_agent(&app, None); // registered but dead — nothing to lose
+
+        assert!(!start_quit(&mut app));
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn start_quit_asks_for_confirmation_when_an_agent_is_live() {
+        let live_id = AgentId::new();
+        let sessions =
+            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
+        let mut app = app_with_sessions(sessions);
+        register_agent(&app, Some(live_id));
+
+        assert!(start_quit(&mut app));
+        assert!(matches!(app.confirm.as_ref().unwrap().action, ConfirmAction::Quit));
+    }
+
+    #[test]
+    fn confirming_quit_breaks_the_loop() {
+        let mut app = app_with_sessions(SessionManager::dry_run());
+        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
+
+        let should_continue = handle_confirm_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(!should_continue);
+    }
+
+    #[test]
+    fn cancelling_quit_keeps_running_and_clears_the_prompt() {
+        let mut app = app_with_sessions(SessionManager::dry_run());
+        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
+
+        let should_continue = handle_confirm_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert!(should_continue);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn quit_prompt_text_pluralizes_correctly() {
+        let live_id = AgentId::new();
+        let sessions =
+            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
+        let mut app = app_with_sessions(sessions);
+        register_agent(&app, Some(live_id));
+        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
+
+        let prompt = build_prompt(&app).unwrap();
+        assert!(prompt.contains("1 agent running and will be killed"), "{prompt}");
     }
 }

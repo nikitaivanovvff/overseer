@@ -217,19 +217,22 @@ fn build_status_line(running: usize, total: usize, prompt: Option<&str>) -> Line
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
+        // v1 has no persistence (PHASE6.md §1): quitting with any agents still
+        // registered kills them, so the hint says so rather than a bare "quit".
+        let quit_hint = if total > 0 { " quit (confirms)" } else { " quit" };
         let hints: Vec<Span> = vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
             Span::styled("<space>", Style::default().fg(Color::Yellow)),
             Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("o/↵", Style::default().fg(Color::Yellow)),
+            Span::styled("Ctrl-l/↵", Style::default().fg(Color::Yellow)),
             Span::styled(" jump in  ", Style::default().fg(Color::DarkGray)),
             Span::styled("n/s", Style::default().fg(Color::Yellow)),
             Span::styled(" spawn  ", Style::default().fg(Color::DarkGray)),
             Span::styled("d/D", Style::default().fg(Color::Yellow)),
             Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(quit_hint, Style::default().fg(Color::DarkGray)),
         ];
         spans.push(Span::styled(
             format!("{running}/{total} running"),

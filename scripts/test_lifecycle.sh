@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
 # End-to-end lifecycle test for `overseer start`/`spawn`/`drop`, driven against a
-# real tmux server and a real overseer binary — no unit-test mocking involved.
-#
-# Runs in an isolated tmux server (own TMUX_TMPDIR) and a stub "claude" binary on
-# PATH, so it never touches your real tmux sessions or launches a real agent.
+# real overseer binary — no unit-test mocking involved. Overseer itself is a
+# single ordinary process now (PHASE6.md): no tmux server, no bootstrap. The only
+# tmux involved here is our own *test harness*, hosting the TUI in a scriptable
+# outer pane so we can drive it with `send-keys`/`capture-pane`, same as a human
+# would type into a real terminal.
 #
 # Part A drives the CLI (`overseer spawn`/`drop`) directly — this is what an agent
 # calling `overseer spawn` from its own shell actually does.
 # Part B drives the TUI itself via `tmux send-keys` + `capture-pane`, since some
 # behavior (root agents can only be dropped via the TUI, not the CLI) only exists
 # on that path.
+# Part C exercises the pane rendering + focus model (jump in/out) and the quit
+# guard, against a stub agent binary that reports its own liveness.
 #
 # Requires: cargo, tmux, jq, git.
 
@@ -30,19 +33,35 @@ cargo build --quiet || { echo "build failed" >&2; exit 1; }
 OVERSEER="$REPO_ROOT/target/debug/overseer"
 
 WORKDIR="$(mktemp -d)"
-export TMUX_TMPDIR="$WORKDIR/tmux"       # isolated tmux server — never touches your real sessions
-mkdir -p "$TMUX_TMPDIR"
 STUBDIR="$WORKDIR/bin"
 mkdir -p "$STUBDIR"
 TEST_REPO="$WORKDIR/repo"
 mkdir -p "$TEST_REPO"
+MARKER_DIR="$WORKDIR/markers"
+mkdir -p "$MARKER_DIR"
 SOCK="$WORKDIR/overseer.sock"
 HARNESS=overseer-harness-test
 
-# Stub "claude" so tmux panes stay alive without launching a real agent.
+# Stub agent/shell binary: no real PTY-owning terminal emulator to fake here (the
+# real one is alacritty_terminal, in-process) — this just needs to (a) stay alive
+# so its session is inspectable, (b) prove it was actually launched with the
+# right identity env, (c) prove it actually dies when killed. `kill()` sends
+# SIGKILL directly to this process (session/pty.rs: some real agents, Claude
+# Code included, don't die from a hangup alone, and blocking on Child::wait()
+# for one that doesn't would hang the UI thread) — SIGKILL can't be trapped, so
+# self-cleanup-on-exit isn't possible here. The marker file instead records this
+# process's own pid at startup and is never removed; liveness is checked with
+# `kill -0` against that pid from the outside, keyed by $OVERSEER_AGENT_ID
+# (present for roots and children alike per identity_env). The printed banner
+# additionally lets Part C assert on the rendered pane content.
 cat > "$STUBDIR/claude" <<'EOF'
 #!/bin/sh
-exec sleep 3600
+: "${MARKER_DIR:?}"
+marker="$MARKER_DIR/${OVERSEER_AGENT_ID:-unknown}"
+echo $$ > "$marker"
+printf 'STUB-ALIVE-%s\n' "${OVERSEER_AGENT_ID:-unknown}"
+sleep 3600 &
+wait $!
 EOF
 chmod +x "$STUBDIR/claude"
 export PATH="$STUBDIR:$PATH"
@@ -66,31 +85,33 @@ assert_contains() {
     if printf '%s' "$2" | grep -qF -- "$3"; then pass "$1"; else fail "$1 (missing '$3')"; fi
 }
 
+assert_not_contains() {
+    # assert_not_contains <description> <haystack> <needle>
+    if printf '%s' "$2" | grep -qF -- "$3"; then fail "$1 (unexpectedly found '$3')"; else pass "$1"; fi
+}
+
 cleanup() {
-    tmux kill-server >/dev/null 2>&1 || true
-    tmux -L overseer kill-server >/dev/null 2>&1 || true
+    tmux kill-session -t "$HARNESS" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 start_harness() {
-    # The overseer binary (non-mock) now hosts its TUI in a private "-L overseer"
-    # tmux session and reconnects to it if one is already running (PHASE5.md §3.2).
-    # Kill any such leftover session first so each start_harness() call gets a
-    # truly fresh registry, not whatever a previous Part left behind.
-    tmux -L overseer kill-server >/dev/null 2>&1 || true
-    # A force-killed server never runs the normal shutdown path that removes the
-    # socket file, so a stale one could satisfy the readiness check below early.
-    rm -f "$SOCK"
     # Explicit -x/-y: with no attached client, a detached new-session defaults to
     # a small fallback size — narrow enough that even a short wrapped status-bar
     # message (e.g. a drop confirm) can split across lines and defeat a
     # single-line `grep -F` assertion. 160x40 comfortably fits the tree pane
     # (~25% width) without wrapping normal-length messages, matching a
     # realistically-sized real terminal.
+    tmux kill-session -t "$HARNESS" >/dev/null 2>&1 || true
+    rm -f "$SOCK"
+    # tmux special-cases $SHELL on `new-session -e` (verified: it does not
+    # apply there, unlike other vars) — set it via a wrapping shell instead so
+    # the root's bare-shell PTY (`resolve_shell()`) actually resolves to our
+    # stub, not the real system shell.
     tmux new-session -d -s "$HARNESS" -x 160 -y 40 -c "$TEST_REPO" \
-        -e "PATH=$PATH" -e "TMUX_TMPDIR=$TMUX_TMPDIR" \
-        -- "$OVERSEER" --socket "$SOCK"
+        -e "PATH=$PATH" -e "MARKER_DIR=$MARKER_DIR" \
+        -- sh -c "SHELL='$STUBDIR/claude' exec '$OVERSEER' --socket '$SOCK'"
     for _ in $(seq 1 50); do
         [ -S "$SOCK" ] && return 0
         sleep 0.1
@@ -110,9 +131,23 @@ ov_as() { # ov_as <agent_id> <cwd> <args...>
 list_json() { ov list; }
 agent_count() { list_json | jq '.data.agents | length'; }
 agent_id_by_name() { list_json | jq -r --arg n "$1" '.data.agents[] | select(.name==$n) | .id'; }
-# Agent sessions launched by TmuxClient live on the private "overseer" tmux server
-# (PHASE5.md §2), not the default one — check there.
-session_exists() { tmux -L overseer has-session -t "overseer-${1:0:8}" 2>/dev/null; }
+
+# An agent's PTY is in-process now (alacritty_terminal, PHASE6.md) — no external
+# session to query. The stub's marker file is the liveness source of truth.
+pty_alive() {
+    local marker="$MARKER_DIR/$1" pid
+    [ -e "$marker" ] || return 1
+    pid="$(cat "$marker" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+wait_for_pty_alive() {
+    for _ in $(seq 1 50); do pty_alive "$1" && return 0; sleep 0.1; done
+    return 1
+}
+wait_for_pty_gone() {
+    for _ in $(seq 1 50); do pty_alive "$1" || return 0; sleep 0.1; done
+    return 1
+}
 
 echo
 echo "== Part A: CLI-driven lifecycle (spawn/drop as an agent would call them) =="
@@ -122,7 +157,8 @@ echo "-- start a root agent --"
 RESP="$(ov start --cwd "$TEST_REPO")"
 ROOT_ID="$(printf '%s' "$RESP" | jq -r '.data.agent_id')"
 assert "start returns an agent id" "$([ -n "$ROOT_ID" ] && echo yes || echo no)" "yes"
-assert "root tmux session exists" "$(session_exists "$ROOT_ID" && echo yes || echo no)" "yes"
+wait_for_pty_alive "$ROOT_ID"
+assert "root pty is alive" "$(pty_alive "$ROOT_ID" && echo yes || echo no)" "yes"
 assert "registry shows 1 agent" "$(agent_count)" "1"
 assert "root is named after the repo, not a typed task" \
     "$(list_json | jq -r --arg id "$ROOT_ID" '.data.agents[] | select(.id==$id) | .name')" "repo"
@@ -137,7 +173,8 @@ CHILD_ID="$(printf '%s' "$RESP" | jq -r '.data.agent_id')"
 assert "spawn returns an agent id" "$([ -n "$CHILD_ID" ] && echo yes || echo no)" "yes"
 assert "child branch is overseer/<id>" \
     "$(printf '%s' "$RESP" | jq -r '.data.branch' | cut -d/ -f1)" "overseer"
-assert "child tmux session exists" "$(session_exists "$CHILD_ID" && echo yes || echo no)" "yes"
+wait_for_pty_alive "$CHILD_ID"
+assert "child pty is alive" "$(pty_alive "$CHILD_ID" && echo yes || echo no)" "yes"
 assert "registry shows 2 agents" "$(agent_count)" "2"
 assert "child's parent_id is the root" \
     "$(list_json | jq -r --arg id "$CHILD_ID" '.data.agents[] | select(.id==$id) | .parent_id')" "$ROOT_ID"
@@ -153,7 +190,8 @@ assert "registry still shows 2 agents (grandchild not created)" "$(agent_count)"
 
 echo "-- drop the child (non-root) --"
 ov drop "$CHILD_ID" >/dev/null
-assert "child tmux session is gone" "$(session_exists "$CHILD_ID" && echo yes || echo no)" "no"
+wait_for_pty_gone "$CHILD_ID"
+assert "child pty is gone" "$(pty_alive "$CHILD_ID" && echo yes || echo no)" "no"
 assert "registry shows 1 agent" "$(agent_count)" "1"
 
 echo "-- root agents cannot be dropped via the command --"
@@ -162,7 +200,7 @@ if ov drop "$ROOT_ID" >/tmp/drop_root.out 2>&1; then
 else
     assert_contains "root drop rejected with the right message" "$(cat /tmp/drop_root.out)" "TUI"
 fi
-assert "root tmux session still exists" "$(session_exists "$ROOT_ID" && echo yes || echo no)" "yes"
+assert "root pty still alive" "$(pty_alive "$ROOT_ID" && echo yes || echo no)" "yes"
 
 echo "-- dropping an unknown agent is an error --"
 if ov drop "00000000-0000-0000-0000-000000000000" >/tmp/drop_unknown.out 2>&1; then
@@ -173,7 +211,6 @@ fi
 
 echo
 echo "== Part B: TUI-driven lifecycle (n/s/d/D keybinds via tmux send-keys) =="
-tmux kill-session -t "$HARNESS" >/dev/null 2>&1 || true
 start_harness   # fresh, empty tree
 
 tui_key() { tmux send-keys -t "$HARNESS" -- "$1"; sleep 0.3; }
@@ -188,7 +225,8 @@ tui_key n
 tui_enter
 assert_contains "tree shows the new root, named after the repo" "$(pane)" "repo"
 ROOT_A="$(agent_id_by_name repo)"
-assert "root tmux session exists" "$(session_exists "$ROOT_A" && echo yes || echo no)" "yes"
+wait_for_pty_alive "$ROOT_A"
+assert "root pty is alive" "$(pty_alive "$ROOT_A" && echo yes || echo no)" "yes"
 
 echo "-- 's' on a root: spawn a child from the TUI --"
 tui_key s
@@ -196,7 +234,8 @@ tui_text "tui-child-a"
 tui_enter
 assert "registry shows root + child" "$(agent_count)" "2"
 CHILD_A="$(agent_id_by_name tui-child-a)"
-assert "child tmux session exists" "$(session_exists "$CHILD_A" && echo yes || echo no)" "yes"
+wait_for_pty_alive "$CHILD_A"
+assert "child pty is alive" "$(pty_alive "$CHILD_A" && echo yes || echo no)" "yes"
 
 echo "-- 'j' then 's' on a child: spawning under a child is refused server-side --"
 # The TUI no longer pre-checks this client-side (AGENTS.md: the "no grandchildren"
@@ -213,14 +252,16 @@ echo "-- 'd' + 'y' on the child: drop succeeds --"
 tui_key d
 assert_contains "confirm prompt shown" "$(pane)" "drop 'tui-child-a'"
 tui_key y
+wait_for_pty_gone "$CHILD_A"
 assert "child removed from registry" "$(agent_count)" "1"
-assert "child tmux session is gone" "$(session_exists "$CHILD_A" && echo yes || echo no)" "no"
+assert "child pty is gone" "$(pty_alive "$CHILD_A" && echo yes || echo no)" "no"
 
 echo "-- 'd' + 'y' on the now-childless root: TUI *can* drop a root --"
 tui_key d
 tui_key y
+wait_for_pty_gone "$ROOT_A"
 assert "root removed from registry" "$(agent_count)" "0"
-assert "root tmux session is gone" "$(session_exists "$ROOT_A" && echo yes || echo no)" "no"
+assert "root pty is gone" "$(pty_alive "$ROOT_A" && echo yes || echo no)" "no"
 
 echo "-- non-recursive 'd' on a root WITH children is refused, 'D' works --"
 # The previous "repo"-named root was fully dropped above, so re-spawning from the
@@ -232,6 +273,7 @@ tui_text "tui-child-b"
 tui_enter
 ROOT_B="$(agent_id_by_name repo)"
 CHILD_B="$(agent_id_by_name tui-child-b)"
+wait_for_pty_alive "$CHILD_B"
 
 tui_key d
 tui_key y
@@ -241,60 +283,60 @@ assert "nothing was removed by the non-recursive attempt" "$(agent_count)" "2"
 tui_key D
 assert_contains "recursive confirm mentions the child" "$(pane)" "+ 1 children"
 tui_key y
+wait_for_pty_gone "$ROOT_B"
+wait_for_pty_gone "$CHILD_B"
 assert "recursive drop removed both agents" "$(agent_count)" "0"
-assert "root-b tmux session is gone" "$(session_exists "$ROOT_B" && echo yes || echo no)" "no"
-assert "child-b tmux session is gone" "$(session_exists "$CHILD_B" && echo yes || echo no)" "no"
+assert "root-b pty is gone" "$(pty_alive "$ROOT_B" && echo yes || echo no)" "no"
+assert "child-b pty is gone" "$(pty_alive "$CHILD_B" && echo yes || echo no)" "no"
 
 echo
-echo "== Part C: live split-pane view =="
-tmux kill-session -t "$HARNESS" >/dev/null 2>&1 || true
+echo "== Part C: pane rendering, focus model, and the quit guard =="
 start_harness   # fresh, empty tree
 
-# The overseer TUI's own window on the private server now has two real tmux
-# panes: pane 0 is ratatui (tree), pane 1 is a nested client permanently
-# attached to whichever agent session is selected (or the placeholder).
-# Assert via that nested client's session, not the outer client's — jump-in
-# is now a focus change (select-pane), not a client switch.
-live_pane_tty() {
-    tmux -L overseer list-panes -t overseer -F '#{pane_index} #{pane_tty}' 2>/dev/null | awk '$1==1{print $2}'
-}
-nested_client_session() {
-    local tty
-    tty="$(live_pane_tty)"
-    [ -n "$tty" ] || return
-    tmux -L overseer list-clients -F '#{client_tty} #{client_session}' 2>/dev/null | awk -v t="$tty" '$1==t{print $2}'
-}
-active_pane_index() {
-    tmux -L overseer list-panes -t overseer -F '#{pane_index} #{pane_active}' 2>/dev/null | awk '$2==1{print $1}'
-}
+echo "-- fresh tree: pane shows the placeholder, no agent selected --"
+assert_contains "pane shows 'no agent selected'" "$(pane)" "no agent selected"
 
-echo "-- fresh tree: live pane shows the placeholder --"
-assert "nested client starts on the placeholder session" "$(nested_client_session)" "overseer-placeholder"
+echo "-- 'q' with nothing running: quits immediately, no confirm --"
+tui_key q
+sleep 0.3
+assert "harness pane exited (no confirm needed)" \
+    "$(tmux list-panes -t "$HARNESS" >/dev/null 2>&1 && echo alive || echo gone)" "gone"
 
-echo "-- 'n': spawn a root — live pane retargets automatically, no keypress needed --"
+start_harness   # fresh again for the rest of Part C
+
+echo "-- 'n': spawn a root — pane renders its live PTY output once selected --"
 tui_key n
 tui_enter
 ROOT_C="$(agent_id_by_name repo)"
-AGENT_SESSION="overseer-${ROOT_C:0:8}"
-assert "live pane retargeted to the new root's session" "$(nested_client_session)" "$AGENT_SESSION"
+wait_for_pty_alive "$ROOT_C"
+sleep 0.3 # let the next redraw tick pick up the stub's banner
+assert_contains "pane renders the root's own PTY output" "$(pane)" "STUB-ALIVE-$ROOT_C"
 
-echo "-- 'Enter': jump in moves tmux focus into the live pane --"
-tui_enter
-assert "active pane is the live pane (index 1)" "$(active_pane_index)" "1"
-
-echo "-- <prefix> o: default pane-cycle binding returns focus to the tree pane --"
-tmux send-keys -t "$HARNESS" C-b
-sleep 0.2
-tmux send-keys -t "$HARNESS" o
+echo "-- Ctrl-l: jump in moves focus into the pane --"
+tmux send-keys -t "$HARNESS" C-l
 sleep 0.3
-assert "active pane is back to the tree (index 0)" "$(active_pane_index)" "0"
-assert_contains "TUI repainted and still shows the root" "$(pane)" "repo"
+assert_contains "pane border shows it's focused" "$(pane)" "FOCUSED"
 
-echo "-- 'd' + 'y': dropping the displayed agent retargets to the placeholder before the kill --"
-tui_key d
+echo "-- Ctrl-h: jump out returns focus to the tree --"
+tmux send-keys -t "$HARNESS" C-h
+sleep 0.3
+assert_not_contains "pane border no longer shows focused" "$(pane)" "FOCUSED"
+
+echo "-- 'q' with a live agent: quit guard asks for confirmation first --"
+tui_key q
+assert_contains "quit confirm prompt shown" "$(pane)" "running and will be killed"
+assert "root pty still alive while the prompt is up" "$(pty_alive "$ROOT_C" && echo yes || echo no)" "yes"
+
+echo "-- 'n' cancels the quit --"
+tui_key n
+assert_contains "tree still shows the agent after cancelling quit" "$(pane)" "repo"
+assert "root pty untouched by a cancelled quit" "$(pty_alive "$ROOT_C" && echo yes || echo no)" "yes"
+
+echo "-- 'q' then 'y': confirmed quit kills the agent and exits --"
+tui_key q
 tui_key y
-assert "live pane retargeted back to the placeholder" "$(nested_client_session)" "overseer-placeholder"
-assert "root tmux session is gone" "$(session_exists "$ROOT_C" && echo yes || echo no)" "no"
+wait_for_pty_gone "$ROOT_C"
+assert "root pty was killed by the confirmed quit" "$(pty_alive "$ROOT_C" && echo yes || echo no)" "no"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 
