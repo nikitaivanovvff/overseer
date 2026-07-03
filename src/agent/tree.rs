@@ -677,6 +677,7 @@ mod tests {
             repo: "r".to_string(),
             cwd: std::path::PathBuf::from("."),
             branch: None,
+            initial_status: super::super::AgentStatus::Running,
         }).unwrap();
         assert!(!reg.snapshot().is_empty());
         reg.remove(&result.id);

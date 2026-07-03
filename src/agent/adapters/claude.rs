@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::{AgentAdapter, InstalledFile, LaunchContext, MergeStrategy};
-use crate::agent::AgentRole;
 
 const SKILL_PATH: &str = "skills/overseer/SKILL.md";
 const SETTINGS_PATH: &str = "settings.json";
@@ -33,8 +32,11 @@ impl ClaudeAdapter {
     fn settings_content(&self) -> String {
         let post_tool_cmd = self.hook_command("status running");
         let stop_cmd = self.hook_command("status done");
+        // Also pushes `running` immediately at session start (not just at the first
+        // tool call) — closes the gap between "user runs claude" and "first tool
+        // use" for a bare-shell root that started `Idle`. Still pure push, no polling.
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE" || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE"; {post_tool_cmd}; }} || true"#
         );
 
         serde_json::json!({
@@ -102,21 +104,7 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn env_inject(&self, ctx: &LaunchContext) -> HashMap<String, String> {
-        let mut env = HashMap::new();
-        env.insert("OVERSEER_SOCKET".to_string(), ctx.socket.to_string_lossy().to_string());
-        env.insert("OVERSEER_AGENT_ID".to_string(), ctx.agent_id.0.to_string());
-        env.insert(
-            "OVERSEER_ROLE".to_string(),
-            match ctx.role {
-                AgentRole::Root => "root".to_string(),
-                AgentRole::Child => "child".to_string(),
-            },
-        );
-        if let Some(parent_id) = &ctx.parent_id {
-            env.insert("OVERSEER_PARENT_ID".to_string(), parent_id.0.to_string());
-        }
-        env.insert("OVERSEER_REPO".to_string(), ctx.task.clone());
-        env
+        super::identity_env(&ctx.identity())
     }
 }
 
@@ -137,7 +125,7 @@ mod tests {
             parent_id: None,
             socket: PathBuf::from("/tmp/overseer.sock"),
             cwd: PathBuf::from("/projects/myrepo"),
-            task: "implement auth".to_string(),
+            repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec!["--some-flag".to_string()],
         }
@@ -150,7 +138,7 @@ mod tests {
             parent_id: Some(parent),
             socket: PathBuf::from("/tmp/overseer.sock"),
             cwd: PathBuf::from("/projects/myrepo"),
-            task: "write tests".to_string(),
+            repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec![],
         }
@@ -203,6 +191,15 @@ mod tests {
     }
 
     #[test]
+    fn settings_session_start_also_pushes_running() {
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("status running"), "SessionStart should also push running: {cmd}");
+        assert!(cmd.contains("OVERSEER_AGENT_ID"), "must stay guarded, no-op outside Overseer");
+    }
+
+    #[test]
     fn settings_hook_commands_use_absolute_path() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
@@ -235,6 +232,14 @@ mod tests {
         assert_eq!(env.get("OVERSEER_ROLE").map(|s| s.as_str()), Some("root"));
         assert!(!env.contains_key("OVERSEER_PARENT_ID"));
         assert!(!env.contains_key("OVERSEER_BRANCH"));
+    }
+
+    #[test]
+    fn env_inject_repo_is_repo_name_not_task() {
+        let a = make_adapter();
+        let ctx = make_root_ctx();
+        let env = a.env_inject(&ctx);
+        assert_eq!(env.get("OVERSEER_REPO").map(|s| s.as_str()), Some("myrepo"));
     }
 
     #[test]

@@ -1,29 +1,23 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use thiserror::Error;
 
-use crate::agent::adapters::{adapter_for, AgentAdapter, LaunchContext};
+use crate::agent::adapters::{adapter_for, identity_env, AgentAdapter, AgentIdentity, LaunchContext};
 use crate::agent::registry::{RegisterArgs, RegisterResult, RegistryError};
-use crate::agent::{AgentId, AgentRegistry, AgentRole};
-use crate::session::TmuxClient;
+use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+use crate::session::SessionManager;
 
-/// Derives a deterministic tmux session name from an agent id.
-/// Phase 4 drop / Phase 5 focus can locate the session without a registry.
-pub fn tmux_session_name(id: &AgentId) -> String {
-    format!("overseer-{}", id.short())
-}
-
-/// Launches `ctx` in a new tmux session using the given adapter.
+/// Launches `ctx` in a new PTY session using the given adapter.
 /// Pure I/O boundary: all logic lives in the adapter; this function only orchestrates.
 pub fn launch(
     ctx: &LaunchContext,
     adapter: &dyn AgentAdapter,
-    tmux: &TmuxClient,
+    sessions: &SessionManager,
 ) -> anyhow::Result<()> {
-    let session = tmux_session_name(&ctx.agent_id);
     let cmd = adapter.spawn_command(ctx);
     let env = adapter.env_inject(ctx);
-    tmux.launch(&session, &ctx.cwd, &cmd, &env)
+    sessions.launch(ctx.agent_id.clone(), &ctx.cwd, &cmd, &env)
 }
 
 /// Everything needed to register + launch one agent. Used by both `Request::Start`
@@ -50,11 +44,73 @@ pub enum SpawnError {
     Launch(anyhow::Error),
 }
 
-/// Registers a new agent and launches its tmux session in one step.
-/// The single shared orchestration path for root (`start`) and child (`spawn`) launches.
+/// Registers a new agent and launches its PTY session in one step.
+/// The single shared orchestration entry point for root (`start`) and child (`spawn`)
+/// launches — dispatches to a role-specific path since they no longer share a
+/// launch mechanism (root is a bare shell, child is adapter-driven).
 pub fn spawn_agent(
     registry: &AgentRegistry,
-    tmux: &TmuxClient,
+    sessions: &SessionManager,
+    socket: &Path,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
+    match req.role.clone() {
+        AgentRole::Root => spawn_root_shell(registry, sessions, socket, req),
+        AgentRole::Child => spawn_child_agent(registry, sessions, socket, req),
+    }
+}
+
+/// Root path: no `AgentAdapter`, no configured agent binary — just a plain shell
+/// in the chosen repo, registered `Idle`. Whatever the user later runs inside
+/// (e.g. `claude`) inherits the identity env vars via the PTY's normal
+/// process-environment inheritance, and the existing PostToolUse/Stop hooks pick
+/// it up from there — no new detection/polling code, this is pure push.
+fn spawn_root_shell(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
+    let args = RegisterArgs {
+        id: None,
+        name: req.repo.clone(), // tree label = repo name, not typed task text
+        role: AgentRole::Root,
+        parent_id: None,
+        adapter: "shell".to_string(), // honest label: nothing else was launched
+        repo: req.repo.clone(),
+        cwd: req.cwd.clone(),
+        branch: req.branch,
+        initial_status: AgentStatus::Idle,
+    };
+    let result = registry.register(args)?;
+
+    let identity = AgentIdentity {
+        agent_id: &result.id,
+        role: &AgentRole::Root,
+        parent_id: None,
+        socket,
+        repo: &req.repo,
+    };
+    let env = identity_env(&identity);
+    let cmd = Command::new(resolve_shell());
+
+    if let Err(e) = sessions.launch(result.id.clone(), &req.cwd, &cmd, &env) {
+        registry.remove(&result.id);
+        return Err(SpawnError::Launch(e));
+    }
+    Ok(result)
+}
+
+/// `$SHELL`, falling back to `/bin/sh`. No args — an interactive, non-login shell.
+fn resolve_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// Child path — unchanged from before the root/child split: adapter-driven,
+/// registers `Running` since it auto-launches immediately.
+fn spawn_child_agent(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
     socket: &Path,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
@@ -64,27 +120,28 @@ pub fn spawn_agent(
     let args = RegisterArgs {
         id: None,
         name: req.task.clone(),
-        role: req.role.clone(),
+        role: AgentRole::Child,
         parent_id: req.parent_id.clone(),
         adapter: req.adapter_name.clone(),
-        repo: req.repo,
+        repo: req.repo.clone(),
         cwd: req.cwd.clone(),
         branch: req.branch,
+        initial_status: AgentStatus::Running,
     };
     let result = registry.register(args)?;
 
     let launch_ctx = LaunchContext {
         agent_id: result.id.clone(),
-        role: req.role,
+        role: AgentRole::Child,
         parent_id: req.parent_id,
         socket: socket.to_path_buf(),
         cwd: req.cwd,
-        task: req.task,
+        repo: req.repo,
         command: req.adapter_name,
         extra_args: vec![],
     };
 
-    if let Err(e) = launch(&launch_ctx, adapter.as_ref(), tmux) {
+    if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
         // Don't leave a phantom "Running" node behind with no session backing it.
         registry.remove(&result.id);
         return Err(SpawnError::Launch(e));
@@ -101,40 +158,24 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn session_name_is_deterministic() {
-        let id = AgentId::new();
-        let name1 = tmux_session_name(&id);
-        let name2 = tmux_session_name(&id);
-        assert_eq!(name1, name2);
-        assert!(name1.starts_with("overseer-"));
-    }
-
-    #[test]
-    fn session_name_differs_across_ids() {
-        let a = tmux_session_name(&AgentId::new());
-        let b = tmux_session_name(&AgentId::new());
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn launch_dry_run_succeeds() {
         let adapter = ClaudeAdapter::with_bin(PathBuf::from("/usr/local/bin/overseer"));
-        let tmux = TmuxClient::dry_run();
+        let sessions = SessionManager::dry_run();
         let ctx = LaunchContext {
             agent_id: AgentId::new(),
             role: AgentRole::Root,
             parent_id: None,
             socket: PathBuf::from("/tmp/overseer.sock"),
             cwd: PathBuf::from("/tmp"),
-            task: "test task".to_string(),
+            repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec![],
         };
-        launch(&ctx, &adapter, &tmux).unwrap();
+        launch(&ctx, &adapter, &sessions).unwrap();
     }
 
-    fn make_registry_and_tmux() -> (AgentRegistry, TmuxClient) {
-        (AgentRegistry::new(), TmuxClient::dry_run())
+    fn make_registry_and_sessions() -> (AgentRegistry, SessionManager) {
+        (AgentRegistry::new(), SessionManager::dry_run())
     }
 
     fn base_request(role: AgentRole, parent_id: Option<AgentId>) -> SpawnRequest {
@@ -151,10 +192,10 @@ mod tests {
 
     #[test]
     fn spawn_agent_root_succeeds() {
-        let (registry, tmux) = make_registry_and_tmux();
+        let (registry, sessions) = make_registry_and_sessions();
         let result = spawn_agent(
             &registry,
-            &tmux,
+            &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             base_request(AgentRole::Root, None),
         )
@@ -164,11 +205,51 @@ mod tests {
     }
 
     #[test]
+    fn spawn_agent_root_registers_idle_with_shell_adapter_label() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let result = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        assert_eq!(dto.status, AgentStatus::Idle);
+        assert_eq!(dto.adapter, "shell");
+    }
+
+    #[test]
+    fn spawn_agent_root_names_node_after_repo_ignoring_task() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let mut req = base_request(AgentRole::Root, None);
+        req.task = "this text should never become the name".to_string();
+        req.repo = "distinct-repo-name".to_string();
+        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), req)
+            .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        assert_eq!(dto.name, "distinct-repo-name");
+    }
+
+    #[test]
+    fn resolve_shell_uses_env_var() {
+        std::env::set_var("SHELL", "/bin/zsh");
+        assert_eq!(resolve_shell(), "/bin/zsh");
+        std::env::remove_var("SHELL");
+    }
+
+    #[test]
+    fn resolve_shell_falls_back_to_bin_sh() {
+        std::env::remove_var("SHELL");
+        assert_eq!(resolve_shell(), "/bin/sh");
+    }
+
+    #[test]
     fn spawn_agent_child_succeeds_under_known_parent() {
-        let (registry, tmux) = make_registry_and_tmux();
+        let (registry, sessions) = make_registry_and_sessions();
         let root = spawn_agent(
             &registry,
-            &tmux,
+            &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             base_request(AgentRole::Root, None),
         )
@@ -176,7 +257,7 @@ mod tests {
 
         let child = spawn_agent(
             &registry,
-            &tmux,
+            &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             base_request(AgentRole::Child, Some(root.id)),
         )
@@ -187,20 +268,30 @@ mod tests {
 
     #[test]
     fn spawn_agent_unknown_adapter_errors() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let mut req = base_request(AgentRole::Root, None);
+        // Root no longer validates any adapter (it's always a bare shell), so this
+        // now has to go through a child spawn — the only path that still consults one.
+        let (registry, sessions) = make_registry_and_sessions();
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        let mut req = base_request(AgentRole::Child, Some(root.id));
         req.adapter_name = "nonexistent".to_string();
-        let err = spawn_agent(&registry, &tmux, &PathBuf::from("/tmp/overseer.sock"), req)
+        let err = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), req)
             .unwrap_err();
         assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "nonexistent"));
     }
 
     #[test]
     fn spawn_agent_unknown_parent_errors() {
-        let (registry, tmux) = make_registry_and_tmux();
+        let (registry, sessions) = make_registry_and_sessions();
         let err = spawn_agent(
             &registry,
-            &tmux,
+            &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             base_request(AgentRole::Child, Some(AgentId::new())),
         )
@@ -211,10 +302,10 @@ mod tests {
     #[test]
     fn spawn_agent_rolls_back_registration_on_launch_failure() {
         let registry = AgentRegistry::new();
-        let failing_tmux = TmuxClient::dry_run_failing_launch();
+        let failing_sessions = SessionManager::dry_run_failing_launch();
         let err = spawn_agent(
             &registry,
-            &failing_tmux,
+            &failing_sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             base_request(AgentRole::Root, None),
         )

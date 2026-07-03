@@ -4,9 +4,9 @@
 
 The agents are already smart. Overseer does **not** reimplement what they do — it does not manage git worktrees, branches, or merges; agents handle their own isolation. Overseer is the observability, routing, and approval surface on top: see every agent's state at a glance, jump into any one to approve or intervene, or leave the parent to supervise its own children.
 
-The usual shape is **one parent agent per repository**. You talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own tmux session and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
+The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself, in your own time, exactly as you would without Overseer; the row appears in the tree immediately, named after the repo, and its status flips from `idle` to `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own tmux session (auto-launched via the configured adapter) and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
 
-The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. The node name in the tree is the **task description**, not the agent binary. The adapter (claude, aider, etc.) is shown in the detail panel.
+The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the **task description** it was spawned with. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, aider, etc.) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
 
 ---
 
@@ -14,13 +14,13 @@ The hierarchy is intentionally **flat**: a parent (root) can spawn children, but
 
 ```
 You (the user)
-  └─ Overseer TUI                                                  ← one window, the whole fleet
-       └─ Parent Agent  (task: implement-auth, adapter: claude)    ← runs in the repo checkout
-            ├─ Child Agent A  (task: auth-module, adapter: claude) ← own tmux session, own branch
-            └─ Child Agent B  (task: write-tests, adapter: aider)  ← own tmux session, own branch
+  └─ Overseer TUI                                                        ← one window, the whole fleet
+       └─ Root  (name: overseer, adapter: shell → claude once you run it) ← bare shell in the repo checkout
+            ├─ Child Agent A  (task: auth-module, adapter: claude)       ← own tmux session, own branch
+            └─ Child Agent B  (task: write-tests, adapter: aider)        ← own tmux session, own branch
 ```
 
-You communicate with the parent; the parent fans out children. Each agent is a tmux session Overseer launched and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
+You spawn the root, run your own agent inside it, and talk to it directly; the agent then fans out children on your behalf. Each agent is a tmux session Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
 
 Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer teach <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens consumed, nothing written into your repo.
 
@@ -31,7 +31,8 @@ Agents know their role (`root` or `child`) via injected env vars and a **user-le
 ```
 overseer (binary)
 ├── tui/              Ratatui-based terminal UI
-│   ├── layout        Left panel (agent tree) + right panel (active tmux pane embed)
+│   ├── layout        Left panel (agent tree, ~25% width) + a real tmux split pane on the
+│   │                 right, permanently attached to the selected agent's live session
 │   ├── agent_tree    Renders hierarchy, status badges, keyboard nav
 │   └── status_bar    Global status, keybind hints
 ├── session/          Tmux management
@@ -66,7 +67,7 @@ Unix domain socket at `/tmp/overseer-<session-id>.sock`. The only channel agents
 | Command | Args | Description |
 |---------|------|-------------|
 | `overseer teach` | `<agent> --uninstall?` | Install (or remove) the user-level skill + status hooks for an agent type. Run once at setup, not per launch. |
-| `overseer start` | `--task --adapter? --cwd?` | Launch a parent (root) agent in a tmux session and register it. |
+| `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in a tmux session (default cwd: current directory). No adapter is launched — run your own agent inside it. |
 | `overseer register` | `--role --parent-id? --adapter` | Called once on agent startup (usually wired via env, not by hand) |
 | `overseer status` | `<status> --message?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. |
 | `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. |
@@ -125,35 +126,37 @@ Dropping an agent kills its tmux session and deregisters it — that's all. Over
 ### TUI Layout
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ OVERSEER  session: project-x                      [q]uit [?]help │
-├─────────────────┬───────────────────────────────────────────────┤
-│ AGENTS          │ repo: overseer   branch: overseer/a3f2        │
-│                 ├───────────────────────────────────────────────┤
-│ ● implement-auth│                                               │
-│   ├ ● auth-mod  │       active tmux pane (embedded or           │
-│   ├ ○ tests     │       switched-to via tmux control mode)      │
-│   └ ✓ docs      │                                               │
-│ ○ refactor-api  │                                               │
-├─────────────────┤                                               │
-│ task:   auth-mod│                                               │
-│ repo:   overseer│                                               │
-│ branch: ovsr/a  │                                               │
-│ status: running │                                               │
-└─────────────────┴───────────────────────────────────────────────┘
+┌─────────────────┬──────────────────────────────────────────────────┐
+│ AGENTS          │                                                  │
+│ ◌ overseer      │                                                  │
+│   ├ ● auth-mod  │     a real tmux pane, permanently attached to    │
+│   ├ ○ tests     │     the selected agent's live session — real     │
+│   └ ✓ docs      │     color, real interaction, no snapshot         │
+│ ○ refactor-api  │                                                  │
+├─────────────────┤                                                  │
+│ task:   auth-mod│                                                  │
+│ repo:   overseer│                                                  │
+│ branch: ovsr/a  │                                                  │
+│ status: running │                                                  │
+└─────────────────┴──────────────────────────────────────────────────┘
+ OVERSEER   3/6 running   j/k nav  o/↵ jump in  n/s spawn  d/D drop  q quit
 ```
 
-Status badges: `●` running · `○` waiting · `✓` done · `✗` error · `…` spawning
+The left column (agent tree + detail + status bar) is ratatui-rendered, in its own real tmux pane at ~25% of the window width. The right column is a *second, genuinely separate* tmux pane — not something ratatui draws — permanently holding a nested tmux client on Overseer's private server, retargeted automatically as the tree selection changes.
+
+Status badges: `●` running · `○` waiting · `◌` idle (spawned, nothing running there yet) · `✓` done · `✗` error · `…` spawning
+
+**Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` (and, if vertical splits ever exist, `Ctrl-j`/`Ctrl-k`) to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched.
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate agent tree |
-| `Enter` | Focus selected agent's pane |
-| `n` | Spawn new root agent |
-| `s` | Spawn child under selected agent |
+| `Enter` / `o` | Jump in — moves tmux keyboard focus into the live pane (`select-pane`); it's already showing the selected agent's real session, so this is just a focus change |
+| `n` | Spawn a root: a bare shell in a chosen repo (default cwd) — no agent launched, run your own |
+| `s` | Spawn child under selected agent (adapter-launched, same as before) |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
-| `Tab` | Toggle focus: tree ↔ pane |
+| `<prefix> o` | From inside the live pane, tmux's own stock pane-cycle binding returns focus to the tree — there's no dedicated Overseer keybind for this, since ratatui receives no input while the live pane has focus |
 | `q` | Quit (agents keep running in tmux) |
 | `Q` | Quit + kill all sessions |
 
@@ -173,7 +176,7 @@ TUI re-renders with the new child visible under the parent. The child sets up it
 branch/worktree on startup, per the Overseer skill.
 ```
 
-`overseer start` (launch a parent) runs the same path with `role=root` and no parent.
+`overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the tmux session itself and reports its own status via the same push hooks — Overseer never detects or launches it.
 
 ---
 

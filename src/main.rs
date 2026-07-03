@@ -5,7 +5,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 mod agent;
 mod app;
@@ -18,12 +23,12 @@ mod ui;
 use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, MergeStrategy};
 use agent::drop::drop_agent;
-use app::{App, ConfirmState, Focus, InputState, PendingAction};
+use app::{App, ConfirmState, InputState, PendingAction};
 use git::GitClient;
 use ipc::handlers::dispatch;
 use ipc::protocol::Request;
 use ipc::AppCtx;
-use session::TmuxClient;
+use session::SessionManager;
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -68,14 +73,11 @@ enum Command {
         #[arg(long)]
         uninstall: bool,
     },
-    /// Start a root agent in a new tmux session (server-side launch via the running TUI).
+    /// Start a root: a bare shell in a repo (server-side launch via the running
+    /// TUI), registered immediately and named after the repo. Run your own agent
+    /// inside it whenever you're ready — Overseer picks up its status via the
+    /// existing push hooks, no adapter is launched on your behalf.
     Start {
-        /// Task description — becomes the agent name in the TUI.
-        #[arg(long)]
-        task: String,
-        /// Adapter to use (default: claude).
-        #[arg(long, default_value = "claude")]
-        adapter: String,
         /// Repo root to start in (default: current directory).
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -90,7 +92,7 @@ enum Command {
         #[arg(long, default_value = "claude")]
         adapter: String,
     },
-    /// Kill the agent's tmux session and deregister it. Root agents can only be
+    /// Kill the agent's session and deregister it. Root agents can only be
     /// dropped through the TUI, not this command.
     Drop {
         /// Agent id to drop.
@@ -155,9 +157,9 @@ fn main() -> Result<()> {
     }
 }
 
-/// `--mock` is inert demo data: it must never launch a real tmux session.
-fn tmux_client_for(mock: bool) -> TmuxClient {
-    if mock { TmuxClient::dry_run() } else { TmuxClient::new() }
+/// `--mock` is inert demo data: it must never spawn a real PTY.
+fn session_manager_for(mock: bool) -> SessionManager {
+    if mock { SessionManager::dry_run() } else { SessionManager::new() }
 }
 
 fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
@@ -176,7 +178,7 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
 
     let ctx = Arc::new(AppCtx {
         registry,
-        tmux: Arc::new(tmux_client_for(mock)),
+        sessions: Arc::new(session_manager_for(mock)),
         socket: socket.clone(),
         git: Arc::new(GitClient::new()),
         watch_sessions: !mock,
@@ -192,13 +194,14 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     });
     ready_rx.recv().ok();
 
+    let mut app = App::new(ctx);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(ctx);
     let res = run_app(&mut terminal, &mut app);
 
     let _ = disable_raw_mode();
@@ -348,11 +351,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             Ok(Some(Request::Agent { agent_id }))
         }
-        Command::Start { task, adapter, cwd } => Ok(Some(Request::Start {
-            task,
-            adapter: Some(adapter),
-            cwd,
-        })),
+        Command::Start { cwd } => Ok(Some(Request::Start { cwd })),
         Command::Spawn { task, adapter } => {
             let parent_id_str = std::env::var("OVERSEER_AGENT_ID").map_err(|_| {
                 anyhow::anyhow!("overseer spawn must be run from an agent session (missing $OVERSEER_AGENT_ID)")
@@ -380,10 +379,11 @@ fn run_app<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     loop {
         let tick = app.tick;
-        let focus = app.focus.clone();
+
         let prompt = build_prompt(app);
+        let input = app.input.as_ref();
         app.ctx.registry.with_tree(|tree| {
-            terminal.draw(|f| ui::render(f, &focus, tree, tick, prompt.as_deref()))
+            terminal.draw(|f| ui::render(f, tree, tick, prompt.as_deref(), input))
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -399,47 +399,37 @@ fn run_app<B: ratatui::backend::Backend>(
                         _ => {}
                     }
 
-                    match app.focus {
-                        Focus::Tree => match key.code {
-                            KeyCode::Char('j') | KeyCode::Down
-                                if key.modifiers == KeyModifiers::NONE =>
-                            {
-                                app.ctx.registry.with_tree_mut(|t| t.move_down());
-                            }
-                            KeyCode::Char('k') | KeyCode::Up
-                                if key.modifiers == KeyModifiers::NONE =>
-                            {
-                                app.ctx.registry.with_tree_mut(|t| t.move_up());
-                            }
-                            KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-                                app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
-                            }
-                            KeyCode::Enter | KeyCode::Char('o')
-                                if key.modifiers == KeyModifiers::NONE =>
-                            {
-                                app.focus = Focus::Pane;
-                            }
-                            KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
-                                app.status_message = None;
-                                app.input = Some(InputState {
-                                    action: PendingAction::SpawnRoot,
-                                    buffer: String::new(),
-                                });
-                            }
-                            KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
-                                start_spawn_child_input(app);
-                            }
-                            KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
-                                start_drop_confirm(app, false);
-                            }
-                            KeyCode::Char('D') => start_drop_confirm(app, true),
-                            _ => {}
-                        },
-                        Focus::Pane => {
-                            if key.code == KeyCode::Esc {
-                                app.focus = Focus::Tree;
-                            }
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+                            app.ctx.registry.with_tree_mut(|t| t.move_down());
                         }
+                        KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+                            app.ctx.registry.with_tree_mut(|t| t.move_up());
+                        }
+                        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+                            app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
+                        }
+                        // Jump-in is rebuilt on the new focus model in Task 3
+                        // (PHASE6.md) — the old tmux `select_pane` jump has no
+                        // equivalent here yet.
+                        KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                            app.status_message = None;
+                            let default_cwd = std::env::current_dir()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                            app.input = Some(InputState {
+                                action: PendingAction::SpawnRoot,
+                                buffer: default_cwd,
+                            });
+                        }
+                        KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
+                            start_spawn_child_input(app);
+                        }
+                        KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
+                            start_drop_confirm(app, false);
+                        }
+                        KeyCode::Char('D') => start_drop_confirm(app, true),
+                        _ => {}
                     }
                 }
             }
@@ -450,17 +440,11 @@ fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// Builds the status-bar override text for the active input/confirm prompt, or the
-/// last status message. `None` means the status bar should show its normal hints.
+/// Builds the status-bar override text for the active confirm prompt, or the
+/// last status message. `None` means the status bar should show its normal
+/// hints. Spawn input (`n`/`s`) no longer goes through here — it renders as
+/// its own modal (`ui::render_spawn_modal`), driven directly by `app.input`.
 fn build_prompt(app: &App) -> Option<String> {
-    if let Some(input) = &app.input {
-        let label = match input.action {
-            PendingAction::SpawnRoot => "spawn root",
-            PendingAction::SpawnChild { .. } => "spawn child",
-        };
-        return Some(format!("{label} task: {}_", input.buffer));
-    }
-
     if let Some(confirm) = &app.confirm {
         let name = app
             .ctx
@@ -534,27 +518,37 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 
 /// Dispatches the composed `Start`/`Spawn` request in-process — same call the IPC
 /// socket handler would make, so the grandchild check applies uniformly.
+///
+/// `SpawnRoot`'s empty-buffer semantics differ from `SpawnChild`'s: an empty repo
+/// path means "use cwd" (not "cancel") — the buffer is prefilled with cwd on `n`
+/// already, so an empty buffer only happens if the user deliberately cleared it.
 fn submit_input(app: &mut App, input: InputState) {
-    let task = input.buffer.trim().to_string();
-    if task.is_empty() {
-        app.status_message = Some("spawn cancelled: empty task".to_string());
-        return;
-    }
-
-    let req = match input.action {
+    match input.action {
         PendingAction::SpawnRoot => {
-            let cwd = std::env::current_dir().ok();
-            Request::Start { task, adapter: None, cwd }
+            let path_text = input.buffer.trim();
+            let cwd = if path_text.is_empty() {
+                std::env::current_dir().ok()
+            } else {
+                Some(expand_repo_path(path_text))
+            };
+            dispatch_and_report(app, Request::Start { cwd });
         }
         PendingAction::SpawnChild { parent_id } => {
+            let task = input.buffer.trim().to_string();
+            if task.is_empty() {
+                app.status_message = Some("spawn cancelled: empty task".to_string());
+                return;
+            }
             let Some(parent) = app.ctx.registry.get(&parent_id) else {
                 app.status_message = Some("spawn failed: parent no longer exists".to_string());
                 return;
             };
-            Request::Spawn { parent_id, task, adapter: None, cwd: parent.cwd }
+            dispatch_and_report(app, Request::Spawn { parent_id, task, adapter: None, cwd: parent.cwd });
         }
-    };
+    }
+}
 
+fn dispatch_and_report(app: &mut App, req: Request) {
     let resp = dispatch(&app.ctx, req);
     app.status_message = if resp.ok {
         None
@@ -563,11 +557,22 @@ fn submit_input(app: &mut App, input: InputState) {
     };
 }
 
+/// Expands a leading `~/` using `$HOME`, since `PathBuf` does no shell expansion
+/// on its own and the repo-path prompt is otherwise typed like a shell argument.
+fn expand_repo_path(text: &str) -> PathBuf {
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
+
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     let Some(confirm) = app.confirm.take() else { return };
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
-            match drop_agent(&app.ctx.registry, &app.ctx.tmux, &confirm.agent_id, confirm.recursive, true) {
+            match drop_agent(&app.ctx.registry, &app.ctx.sessions, &confirm.agent_id, confirm.recursive, true) {
                 Ok(()) => app.status_message = None,
                 Err(e) => app.status_message = Some(format!("drop failed: {e}")),
             }
@@ -609,13 +614,9 @@ mod tests {
 
     #[test]
     fn build_request_start_returns_start() {
-        let cmd = Command::Start {
-            task: "do stuff".to_string(),
-            adapter: "claude".to_string(),
-            cwd: None,
-        };
+        let cmd = Command::Start { cwd: Some(PathBuf::from("/tmp/myrepo")) };
         let req = build_request(cmd).unwrap().unwrap();
-        assert!(matches!(req, Request::Start { task, .. } if task == "do stuff"));
+        assert!(matches!(req, Request::Start { cwd } if cwd == Some(PathBuf::from("/tmp/myrepo"))));
     }
 
     #[test]
@@ -657,8 +658,8 @@ mod tests {
     }
 
     #[test]
-    fn mock_mode_never_gets_a_real_tmux_client() {
-        assert!(tmux_client_for(true).is_dry_run());
-        assert!(!tmux_client_for(false).is_dry_run());
+    fn mock_mode_never_gets_a_real_session_manager() {
+        assert!(session_manager_for(true).is_dry_run());
+        assert!(!session_manager_for(false).is_dry_run());
     }
 }

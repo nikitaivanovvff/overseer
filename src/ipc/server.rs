@@ -5,10 +5,9 @@ use tokio::{
     net::UnixListener,
 };
 
-use crate::agent::spawn::tmux_session_name;
 use crate::agent::{AgentRegistry, AgentStatus};
 use crate::ipc::{handlers::{dispatch, AppCtx}, protocol::{Request, Response}};
-use crate::session::TmuxClient;
+use crate::session::SessionManager;
 
 pub async fn run(
     ctx: Arc<AppCtx>,
@@ -76,46 +75,50 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
     }
 }
 
-/// Polls every 5 seconds and removes any agent whose tmux session no longer exists.
-/// Covers both clean exits (Stop hook may or may not have fired) and crashed sessions.
-/// Runs only when `ctx.watch_sessions` is true.
+/// Wakes every 5 seconds and drains the set of agents whose PTY child has
+/// exited since the last tick — event-driven, not polling: `SessionManager`
+/// already knows the instant each child exits (`Event::ChildExit`), this just
+/// periodically applies that to the registry. Runs only when
+/// `ctx.watch_sessions` is true.
 ///
-/// `AgentTree::remove` deletes a node's whole subtree in one call, so a dead agent
-/// with children is never auto-removed here — that would silently orphan any of its
-/// children whose own session is still alive. It's marked `Error` instead, leaving
-/// the user to `drop --recursive` deliberately.
+/// `AgentTree::remove` deletes a node's whole subtree in one call, so an exited
+/// agent with children is never auto-removed here — that would silently orphan
+/// any of its children whose own session is still alive. It's marked `Error`
+/// instead, leaving the user to `drop --recursive` deliberately.
 async fn session_watcher(ctx: Arc<AppCtx>) {
     let interval = Duration::from_secs(5);
     loop {
         tokio::time::sleep(interval).await;
 
-        let tmux = ctx.tmux.clone();
+        let sessions = ctx.sessions.clone();
         let registry = ctx.registry.clone();
-        tokio::task::spawn_blocking(move || sweep_dead_sessions(&registry, &tmux)).await.ok();
+        tokio::task::spawn_blocking(move || sweep_exited_sessions(&registry, &sessions)).await.ok();
     }
 }
 
-/// One watcher tick: reap leaf agents whose tmux session is gone, and flag (rather
-/// than remove) dead agents that still have children — see `session_watcher` above
-/// for why removal would be unsafe there. Synchronous and side-effect-only against
-/// `registry`/`tmux`, so it's directly unit-testable without a tokio runtime.
-fn sweep_dead_sessions(registry: &AgentRegistry, tmux: &TmuxClient) {
-    let snapshot = registry.snapshot();
-    let ids_with_children: HashSet<_> =
-        snapshot.iter().filter_map(|a| a.parent_id.clone()).collect();
+/// One watcher tick: reap leaf agents whose PTY child has exited, and flag
+/// (rather than remove) exited agents that still have children — see
+/// `session_watcher` above for why removal would be unsafe there. Synchronous
+/// and side-effect-only against `registry`/`sessions`, so it's directly
+/// unit-testable without a tokio runtime.
+fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
+    let exited = sessions.drain_exits();
+    if exited.is_empty() {
+        return;
+    }
 
-    for agent in snapshot {
-        if tmux.session_exists(&tmux_session_name(&agent.id)) {
-            continue;
-        }
-        if ids_with_children.contains(&agent.id) {
+    let ids_with_children: HashSet<_> =
+        registry.snapshot().iter().filter_map(|a| a.parent_id.clone()).collect();
+
+    for id in exited {
+        if ids_with_children.contains(&id) {
             let _ = registry.set_status(
-                &agent.id,
+                &id,
                 AgentStatus::Error,
-                Some("tmux session exited".to_string()),
+                Some("agent process exited".to_string()),
             );
         } else {
-            registry.remove(&agent.id);
+            registry.remove(&id);
         }
     }
 }
@@ -129,13 +132,13 @@ mod tests {
 
     fn spawn(
         registry: &AgentRegistry,
-        tmux: &TmuxClient,
+        sessions: &SessionManager,
         role: AgentRole,
         parent_id: Option<AgentId>,
     ) -> AgentId {
         spawn_agent(
             registry,
-            tmux,
+            sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             SpawnRequest {
                 role,
@@ -152,18 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn sweep_flags_a_dead_parent_instead_of_removing_it_with_its_live_children() {
+    fn sweep_flags_an_exited_parent_instead_of_removing_it_with_its_live_children() {
         let registry = AgentRegistry::new();
-        let setup_tmux = TmuxClient::dry_run();
-        let root_id = spawn(&registry, &setup_tmux, AgentRole::Root, None);
-        let child_id = spawn(&registry, &setup_tmux, AgentRole::Child, Some(root_id.clone()));
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
 
-        // Root's session is dead, but the child's is still alive — the scenario that
-        // used to get the child silently orphaned by a wholesale subtree removal.
-        let live: HashSet<_> = [tmux_session_name(&child_id)].into_iter().collect();
-        let sweeping_tmux = TmuxClient::dry_run_with_live_sessions(live);
-
-        sweep_dead_sessions(&registry, &sweeping_tmux);
+        // Only the root's PTY exited — the scenario that used to get the child
+        // silently orphaned by a wholesale subtree removal.
+        sessions.simulate_exit(root_id.clone());
+        sweep_exited_sessions(&registry, &sessions);
 
         let root = registry.get(&root_id).expect("root with a live child must not be removed");
         assert_eq!(root.status, AgentStatus::Error);
@@ -172,12 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_a_dead_leaf_root() {
+    fn sweep_removes_an_exited_leaf_root() {
         let registry = AgentRegistry::new();
-        let tmux = TmuxClient::dry_run();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
 
-        sweep_dead_sessions(&registry, &tmux);
+        sessions.simulate_exit(root_id.clone());
+        sweep_exited_sessions(&registry, &sessions);
 
         assert!(registry.get(&root_id).is_none());
     }

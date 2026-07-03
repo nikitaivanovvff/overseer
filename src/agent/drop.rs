@@ -1,8 +1,7 @@
 use thiserror::Error;
 
-use crate::agent::spawn::tmux_session_name;
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
-use crate::session::TmuxClient;
+use crate::session::SessionManager;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DropError {
@@ -14,7 +13,7 @@ pub enum DropError {
     HasChildrenNeedsRecursive,
 }
 
-/// Kills the agent's tmux session and deregisters it (and, if `recursive`, its whole
+/// Kills the agent's PTY session and deregisters it (and, if `recursive`, its whole
 /// subtree). Sessions are killed children-before-parent so nothing is ever orphaned.
 ///
 /// `allow_root` gates AGENTS.md's "root agents cannot be dropped via IPC — only via
@@ -22,7 +21,7 @@ pub enum DropError {
 /// keybind calls it directly (same process, no socket round-trip) with `true`.
 pub fn drop_agent(
     registry: &AgentRegistry,
-    tmux: &TmuxClient,
+    sessions: &SessionManager,
     id: &AgentId,
     recursive: bool,
     allow_root: bool,
@@ -44,7 +43,7 @@ pub fn drop_agent(
     // Best-effort: a session may already be gone (e.g. reaped by the background
     // session watcher), which is not an error condition for a drop.
     for descendant_id in &subtree {
-        let _ = tmux.kill_session(&tmux_session_name(descendant_id));
+        sessions.kill(descendant_id);
     }
 
     registry.remove(id);
@@ -57,19 +56,19 @@ mod tests {
     use crate::agent::spawn::{spawn_agent, SpawnRequest};
     use std::path::PathBuf;
 
-    fn make_registry_and_tmux() -> (AgentRegistry, TmuxClient) {
-        (AgentRegistry::new(), TmuxClient::dry_run())
+    fn make_registry_and_sessions() -> (AgentRegistry, SessionManager) {
+        (AgentRegistry::new(), SessionManager::dry_run())
     }
 
     fn spawn(
         registry: &AgentRegistry,
-        tmux: &TmuxClient,
+        sessions: &SessionManager,
         role: AgentRole,
         parent_id: Option<AgentId>,
     ) -> AgentId {
         spawn_agent(
             registry,
-            tmux,
+            sessions,
             &PathBuf::from("/tmp/overseer.sock"),
             SpawnRequest {
                 role,
@@ -87,54 +86,54 @@ mod tests {
 
     #[test]
     fn drop_unknown_agent_errors() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let err = drop_agent(&registry, &tmux, &AgentId::new(), false, false).unwrap_err();
+        let (registry, sessions) = make_registry_and_sessions();
+        let err = drop_agent(&registry, &sessions, &AgentId::new(), false, false).unwrap_err();
         assert!(matches!(err, DropError::NotFound(_)));
     }
 
     #[test]
     fn drop_root_via_command_is_rejected() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
-        let err = drop_agent(&registry, &tmux, &root_id, false, false).unwrap_err();
+        let (registry, sessions) = make_registry_and_sessions();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let err = drop_agent(&registry, &sessions, &root_id, false, false).unwrap_err();
         assert_eq!(err, DropError::RootRequiresTui);
         assert_eq!(registry.snapshot().len(), 1); // untouched
     }
 
     #[test]
     fn drop_root_via_tui_succeeds() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
-        drop_agent(&registry, &tmux, &root_id, false, true).unwrap();
+        let (registry, sessions) = make_registry_and_sessions();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        drop_agent(&registry, &sessions, &root_id, false, true).unwrap();
         assert!(registry.snapshot().is_empty());
     }
 
     #[test]
     fn drop_leaf_child_succeeds_without_recursive() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
-        let child_id = spawn(&registry, &tmux, AgentRole::Child, Some(root_id.clone()));
-        drop_agent(&registry, &tmux, &child_id, false, false).unwrap();
+        let (registry, sessions) = make_registry_and_sessions();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        drop_agent(&registry, &sessions, &child_id, false, false).unwrap();
         assert_eq!(registry.snapshot().len(), 1);
     }
 
     #[test]
     fn drop_non_recursive_with_children_is_rejected() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
-        spawn(&registry, &tmux, AgentRole::Child, Some(root_id.clone()));
-        let err = drop_agent(&registry, &tmux, &root_id, false, true).unwrap_err();
+        let (registry, sessions) = make_registry_and_sessions();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        let err = drop_agent(&registry, &sessions, &root_id, false, true).unwrap_err();
         assert_eq!(err, DropError::HasChildrenNeedsRecursive);
         assert_eq!(registry.snapshot().len(), 2); // untouched
     }
 
     #[test]
     fn drop_recursive_removes_whole_subtree() {
-        let (registry, tmux) = make_registry_and_tmux();
-        let root_id = spawn(&registry, &tmux, AgentRole::Root, None);
-        spawn(&registry, &tmux, AgentRole::Child, Some(root_id.clone()));
-        spawn(&registry, &tmux, AgentRole::Child, Some(root_id.clone()));
-        drop_agent(&registry, &tmux, &root_id, true, true).unwrap();
+        let (registry, sessions) = make_registry_and_sessions();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        drop_agent(&registry, &sessions, &root_id, true, true).unwrap();
         assert!(registry.snapshot().is_empty());
     }
 }

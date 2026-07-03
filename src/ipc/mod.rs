@@ -26,7 +26,7 @@ mod tests {
     use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
     use crate::git::GitClient;
     use crate::ipc::protocol::{OkBody, Request, Response};
-    use crate::session::TmuxClient;
+    use crate::session::SessionManager;
     use std::path::Path;
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -38,7 +38,7 @@ mod tests {
         let socket = PathBuf::from(format!("/tmp/ovsr-{id}.sock"));
         let ctx = Arc::new(AppCtx {
             registry: Arc::new(AgentRegistry::new()),
-            tmux: Arc::new(TmuxClient::dry_run()),
+            sessions: Arc::new(SessionManager::dry_run()),
             socket: socket.clone(),
             git: Arc::new(GitClient::dry_run()),
             watch_sessions: false,
@@ -258,11 +258,7 @@ mod tests {
     fn integration_start_registers_and_returns_id() {
         let socket = start_server();
 
-        let resp = send(&socket, Request::Start {
-            task: "implement auth".to_string(),
-            adapter: Some("claude".to_string()),
-            cwd: None,
-        });
+        let resp = send(&socket, Request::Start { cwd: None });
         assert!(resp.ok, "Start failed: {:?}", resp.error);
         let (agent_id, branch) = match resp.data {
             Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
@@ -277,6 +273,7 @@ mod tests {
         };
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, agent_id);
+        assert_eq!(agents[0].name, "test-repo"); // GitClient::dry_run — root's name = repo
 
         let _ = std::fs::remove_file(&socket);
     }

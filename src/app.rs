@@ -3,12 +3,6 @@ use std::sync::Arc;
 use crate::agent::AgentId;
 use crate::ipc::AppCtx;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Focus {
-    Tree,
-    Pane,
-}
-
 /// What a text-input prompt (`n` / `s`) is being collected for.
 #[derive(Debug, Clone)]
 pub enum PendingAction {
@@ -30,7 +24,6 @@ pub struct ConfirmState {
 
 pub struct App {
     pub ctx: Arc<AppCtx>,
-    pub focus: Focus,
     pub tick: u64,
     pub input: Option<InputState>,
     pub confirm: Option<ConfirmState>,
@@ -41,7 +34,6 @@ impl App {
     pub fn new(ctx: Arc<AppCtx>) -> Self {
         Self {
             ctx,
-            focus: Focus::Tree,
             tick: 0,
             input: None,
             confirm: None,
@@ -51,5 +43,32 @@ impl App {
 
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentRegistry;
+    use crate::git::GitClient;
+    use crate::session::SessionManager;
+    use std::path::PathBuf;
+
+    fn test_app() -> App {
+        let ctx = Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            sessions: Arc::new(SessionManager::dry_run()),
+            socket: PathBuf::from("/tmp/overseer-test.sock"),
+            git: Arc::new(GitClient::new()),
+            watch_sessions: false,
+        });
+        App::new(ctx)
+    }
+
+    #[test]
+    fn new_app_starts_with_no_input_or_confirm_pending() {
+        let app = test_app();
+        assert!(app.input.is_none());
+        assert!(app.confirm.is_none());
     }
 }

@@ -29,6 +29,10 @@ pub struct RegisterArgs {
     pub cwd: PathBuf,
     /// Explicit branch override. Defaults to "main" for root, "overseer/<id>" for child.
     pub branch: Option<String>,
+    /// Status the node starts in. Explicit at every call site — e.g. a bare-shell
+    /// root starts `Idle` (nothing running yet), an adapter-launched child starts
+    /// `Running` (it auto-launches immediately).
+    pub initial_status: AgentStatus,
 }
 
 #[derive(Debug)]
@@ -55,7 +59,7 @@ impl AgentRegistry {
                 let node = AgentNode {
                     id: id.clone(),
                     name: args.name,
-                    status: AgentStatus::Running,
+                    status: args.initial_status,
                     role: AgentRole::Root,
                     repo: args.repo,
                     branch: branch.clone(),
@@ -76,7 +80,7 @@ impl AgentRegistry {
                 let node = AgentNode {
                     id: id.clone(),
                     name: args.name,
-                    status: AgentStatus::Running,
+                    status: args.initial_status,
                     role: AgentRole::Child,
                     repo: args.repo,
                     branch: branch.clone(),
@@ -219,6 +223,7 @@ mod tests {
             repo: "overseer".to_string(),
             cwd: PathBuf::from("."),
             branch: None,
+            initial_status: AgentStatus::Running,
         }
     }
 
@@ -243,6 +248,7 @@ mod tests {
                 repo: "overseer".to_string(),
                 cwd: PathBuf::from("."),
                 branch: None,
+                initial_status: AgentStatus::Running,
             })
             .unwrap();
         assert!(child_result.branch.starts_with("overseer/"));
@@ -261,6 +267,7 @@ mod tests {
                 repo: "overseer".to_string(),
                 cwd: PathBuf::from("."),
                 branch: None,
+                initial_status: AgentStatus::Running,
             })
             .unwrap_err();
         assert!(matches!(err, RegistryError::UnknownParent(_)));
@@ -289,6 +296,7 @@ mod tests {
                 repo: "overseer".to_string(),
                 cwd: PathBuf::from("."),
                 branch: None,
+                initial_status: AgentStatus::Running,
             })
             .unwrap();
 
@@ -318,6 +326,16 @@ mod tests {
     }
 
     #[test]
+    fn register_root_with_initial_status_idle_is_reflected() {
+        let reg = AgentRegistry::new();
+        let mut args = make_register_root("shell-root");
+        args.initial_status = AgentStatus::Idle;
+        let result = reg.register(args).unwrap();
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.status, AgentStatus::Idle);
+    }
+
+    #[test]
     fn register_root_with_branch_override() {
         let reg = AgentRegistry::new();
         let result = reg
@@ -330,6 +348,7 @@ mod tests {
                 repo: "myrepo".to_string(),
                 cwd: PathBuf::from("."),
                 branch: Some("feature/auth".to_string()),
+                initial_status: AgentStatus::Running,
             })
             .unwrap();
         assert_eq!(result.branch, "feature/auth");
