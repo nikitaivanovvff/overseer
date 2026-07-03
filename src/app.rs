@@ -22,12 +22,23 @@ pub struct ConfirmState {
     pub recursive: bool,
 }
 
+/// Which half of the tree|pane split receives keyboard input (PHASE6.md §3.3).
+/// `Ctrl-l` (or `Enter`/`o`) on a live agent moves `Tree -> Pane`; `Ctrl-h` is
+/// the only key `Pane` intercepts, moving back to `Tree` — everything else
+/// forwards to the agent's PTY untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Tree,
+    Pane,
+}
+
 pub struct App {
     pub ctx: Arc<AppCtx>,
     pub tick: u64,
     pub input: Option<InputState>,
     pub confirm: Option<ConfirmState>,
     pub status_message: Option<String>,
+    pub focus: Focus,
 }
 
 impl App {
@@ -38,6 +49,7 @@ impl App {
             input: None,
             confirm: None,
             status_message: None,
+            focus: Focus::Tree,
         }
     }
 
@@ -70,5 +82,11 @@ mod tests {
         let app = test_app();
         assert!(app.input.is_none());
         assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn new_app_starts_focused_on_the_tree() {
+        let app = test_app();
+        assert_eq!(app.focus, Focus::Tree);
     }
 }

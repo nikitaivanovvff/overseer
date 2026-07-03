@@ -22,7 +22,8 @@ const TREE_COLUMN_PCT: u16 = 25;
 /// Renders the whole window: the tree|pane split plus a full-width status
 /// bar. `frame.area()` is now the entire terminal — there is no longer a
 /// separate tmux pane on the right; `render_term_pane` draws the selected
-/// agent's live grid directly into this same ratatui frame.
+/// agent's live grid directly into this same ratatui frame. Returns the
+/// pane's inner rect so the caller can size every agent's PTY to it.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
@@ -32,7 +33,7 @@ pub fn render(
     input: Option<&InputState>,
     sessions: &SessionManager,
     pane_focused: bool,
-) {
+) -> Rect {
     let area = frame.area();
     let (running, total) = tree.agent_counts();
     let status_line = build_status_line(running, total, prompt);
@@ -62,7 +63,8 @@ pub fn render(
 
     render_agent_tree(frame, tree.cursor, tick, left[0], &flat);
     render_agent_detail(frame, left[1], &selected);
-    render_term_pane(frame, columns[1], sessions, selected.as_ref().map(|n| &n.id), pane_focused);
+    let pane_rect =
+        render_term_pane(frame, columns[1], sessions, selected.as_ref().map(|n| &n.id), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything — a bordered, centered modal instead of
@@ -72,6 +74,8 @@ pub fn render(
     if let Some(input) = input {
         render_spawn_modal(frame, area, input);
     }
+
+    pane_rect
 }
 
 /// How many terminal rows `text` needs when word-wrapped to `area_width`

@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::{
     io,
     path::PathBuf,
@@ -23,7 +26,7 @@ mod ui;
 use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, MergeStrategy};
 use agent::drop::drop_agent;
-use app::{App, ConfirmState, InputState, PendingAction};
+use app::{App, ConfirmState, Focus, InputState, PendingAction};
 use git::GitClient;
 use ipc::handlers::dispatch;
 use ipc::protocol::Request;
@@ -198,14 +201,19 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run_app(&mut terminal, &mut app);
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     let _ = terminal.show_cursor();
     let _ = std::fs::remove_file(&socket);
 
@@ -377,71 +385,139 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<()> {
+    let mut last_pane_size: Option<(u16, u16)> = None;
+
     loop {
         let tick = app.tick;
 
         let prompt = build_prompt(app);
         let input = app.input.as_ref();
+        let pane_focused = app.focus == Focus::Pane;
+        let mut pane_rect = Rect::default();
         app.ctx.registry.with_tree(|tree| {
             terminal.draw(|f| {
-                // Pane focus/jump-in is wired next (PHASE6.md Task 3) — always
-                // unfocused (read-only preview) for now.
-                ui::render(f, tree, tick, prompt.as_deref(), input, &app.ctx.sessions, false)
+                pane_rect =
+                    ui::render(f, tree, tick, prompt.as_deref(), input, &app.ctx.sessions, pane_focused);
             })
         })?;
+        // Every agent shares one PTY size (PHASE6.md §2) — resize on layout
+        // change (including the very first draw, sizing new sessions before
+        // the user ever gets to spawn one).
+        let pane_size = (pane_rect.width, pane_rect.height);
+        if last_pane_size != Some(pane_size) {
+            app.ctx.sessions.resize_all(pane_size.0 as usize, pane_size.1 as usize);
+            last_pane_size = Some(pane_size);
+        }
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if app.input.is_some() {
-                    handle_input_key(app, key);
-                } else if app.confirm.is_some() {
-                    handle_confirm_key(app, key);
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => break,
-                        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => break,
-                        _ => {}
-                    }
-
-                    match key.code {
-                        KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                            app.ctx.registry.with_tree_mut(|t| t.move_down());
+            match event::read()? {
+                Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                    match app.focus {
+                        Focus::Pane => handle_pane_key(app, key),
+                        Focus::Tree => {
+                            if app.input.is_some() {
+                                handle_input_key(app, key);
+                            } else if app.confirm.is_some() {
+                                handle_confirm_key(app, key);
+                            } else if !handle_tree_key(app, key) {
+                                break;
+                            }
                         }
-                        KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
-                            app.ctx.registry.with_tree_mut(|t| t.move_up());
-                        }
-                        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-                            app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
-                        }
-                        // Jump-in is rebuilt on the new focus model in Task 3
-                        // (PHASE6.md) — the old tmux `select_pane` jump has no
-                        // equivalent here yet.
-                        KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
-                            app.status_message = None;
-                            let default_cwd = std::env::current_dir()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            app.input = Some(InputState {
-                                action: PendingAction::SpawnRoot,
-                                buffer: default_cwd,
-                            });
-                        }
-                        KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
-                            start_spawn_child_input(app);
-                        }
-                        KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
-                            start_drop_confirm(app, false);
-                        }
-                        KeyCode::Char('D') => start_drop_confirm(app, true),
-                        _ => {}
                     }
                 }
+                Event::Paste(text) if app.focus == Focus::Pane => forward_paste(app, &text),
+                _ => {}
             }
         }
 
         app.tick();
     }
     Ok(())
+}
+
+/// `Focus::Tree` key handling (nav, spawn, drop, jump-in, quit). Returns
+/// `false` to request the run loop break (quit).
+fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return false,
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return false,
+        _ => {}
+    }
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+            app.ctx.registry.with_tree_mut(|t| t.move_down());
+        }
+        KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+            app.ctx.registry.with_tree_mut(|t| t.move_up());
+        }
+        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+            app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
+        }
+        KeyCode::Enter | KeyCode::Char('o') if key.modifiers == KeyModifiers::NONE => {
+            jump_in(app);
+        }
+        KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
+            jump_in(app);
+        }
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+            app.status_message = None;
+            let default_cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            app.input = Some(InputState {
+                action: PendingAction::SpawnRoot,
+                buffer: default_cwd,
+            });
+        }
+        KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
+            start_spawn_child_input(app);
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
+            start_drop_confirm(app, false);
+        }
+        KeyCode::Char('D') => start_drop_confirm(app, true),
+        _ => {}
+    }
+    true
+}
+
+/// `Ctrl-l`/`Enter`/`o` on a selected, live agent moves focus into its pane
+/// (PHASE6.md §3.3) — the same path serves read-only preview and jump-in,
+/// this just starts routing keys to the PTY instead of the tree.
+fn jump_in(app: &mut App) {
+    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else { return };
+    if app.ctx.sessions.is_alive(&id) {
+        app.focus = Focus::Pane;
+    } else {
+        app.status_message = Some("agent is not running".to_string());
+    }
+}
+
+/// `Focus::Pane` key handling: `Ctrl-h` is the only intercepted key — it
+/// returns focus to the tree. Everything else, modifiers included, encodes
+/// to bytes and forwards to the agent's PTY untouched (Ctrl-c reaches the
+/// agent as an interrupt, never quits Overseer while a pane is focused).
+fn handle_pane_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL {
+        app.focus = Focus::Tree;
+        return;
+    }
+
+    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else {
+        app.focus = Focus::Tree;
+        return;
+    };
+    let mode = app.ctx.sessions.with_term(&id, |term| *term.mode()).unwrap_or_default();
+    if let Some(bytes) = session::keys::encode_key(&key, mode) {
+        app.ctx.sessions.write(&id, bytes);
+    }
+}
+
+fn forward_paste(app: &mut App, text: &str) {
+    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else { return };
+    let mode = app.ctx.sessions.with_term(&id, |term| *term.mode()).unwrap_or_default();
+    app.ctx.sessions.write(&id, session::keys::encode_paste(text, mode));
 }
 
 /// Builds the status-bar override text for the active confirm prompt, or the

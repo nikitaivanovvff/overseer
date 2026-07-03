@@ -1,3 +1,4 @@
+pub mod keys;
 mod pty;
 mod tmux;
 

@@ -15,14 +15,15 @@ use crate::session::SessionManager;
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
 /// half of the tree|pane split (PHASE6.md §3.5). `focused` draws the cursor
-/// and a distinct border; read-only preview otherwise.
+/// and a distinct border; read-only preview otherwise. Returns the inner
+/// (border-excluded) rect actually painted, so callers can size the PTY to it.
 pub fn render_term_pane(
     frame: &mut Frame,
     area: Rect,
     sessions: &SessionManager,
     selected: Option<&AgentId>,
     focused: bool,
-) {
+) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if focused { " agent [FOCUSED — Ctrl-h to leave] " } else { " agent " });
@@ -31,13 +32,14 @@ pub fn render_term_pane(
 
     let Some(id) = selected else {
         frame.render_widget(placeholder("no agent selected"), inner);
-        return;
+        return inner;
     };
 
     let painted = sessions.with_term(id, |term| paint_term(term, inner, frame.buffer_mut(), focused));
     if painted.is_none() {
         frame.render_widget(placeholder("agent not running"), inner);
     }
+    inner
 }
 
 fn placeholder(text: &'static str) -> Paragraph<'static> {
