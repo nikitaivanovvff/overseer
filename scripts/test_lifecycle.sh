@@ -2,7 +2,7 @@
 #
 # End-to-end lifecycle test for `overseer start`/`spawn`/`drop`, driven against a
 # real overseer binary — no unit-test mocking involved. Overseer itself is a
-# single ordinary process now (PHASE6.md): no tmux server, no bootstrap. The only
+# single ordinary process: no tmux server, no bootstrap. The only
 # tmux involved here is our own *test harness*, hosting the TUI in a scriptable
 # outer pane so we can drive it with `send-keys`/`capture-pane`, same as a human
 # would type into a real terminal.
@@ -132,7 +132,7 @@ list_json() { ov list; }
 agent_count() { list_json | jq '.data.agents | length'; }
 agent_id_by_name() { list_json | jq -r --arg n "$1" '.data.agents[] | select(.name==$n) | .id'; }
 
-# An agent's PTY is in-process now (alacritty_terminal, PHASE6.md) — no external
+# An agent's PTY is in-process (alacritty_terminal) — no external
 # session to query. The stub's marker file is the liveness source of truth.
 pty_alive() {
     local marker="$MARKER_DIR/$1" pid

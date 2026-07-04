@@ -1,4 +1,4 @@
-//! Task 0 throwaway spike (PHASE6.md §4 Task 0).
+//! Throwaway spike that gated the tmux → alacritty_terminal backend switch.
 //!
 //! Dummy 25/75 sidebar+pane layout; spawns a real agent command in an
 //! alacritty_terminal-owned PTY; renders its grid into the pane; forwards

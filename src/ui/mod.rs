@@ -16,7 +16,7 @@ pub use term_pane::render_term_pane;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Width of the tree column as a percentage of the full window — the pane
-/// takes the rest (PHASE6.md §3.5).
+/// takes the rest.
 const TREE_COLUMN_PCT: u16 = 25;
 
 /// Renders the whole window: the tree|pane split plus a full-width status
@@ -217,7 +217,7 @@ fn build_status_line(running: usize, total: usize, prompt: Option<&str>) -> Line
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
-        // v1 has no persistence (PHASE6.md §1): quitting with any agents still
+        // v1 has no persistence: quitting with any agents still
         // registered kills them, so the hint says so rather than a bare "quit".
         let quit_hint = if total > 0 { " quit (confirms)" } else { " quit" };
         let hints: Vec<Span> = vec![

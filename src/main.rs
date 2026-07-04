@@ -400,7 +400,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     ui::render(f, tree, tick, prompt.as_deref(), input, &app.ctx.sessions, pane_focused);
             })
         })?;
-        // Every agent shares one PTY size (PHASE6.md §2) — resize on layout
+        // Every agent shares one PTY size — resize on layout
         // change (including the very first draw, sizing new sessions before
         // the user ever gets to spawn one).
         let pane_size = (pane_rect.width, pane_rect.height);
@@ -485,7 +485,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 /// `Ctrl-l`/`Enter`/`o` on a selected, live agent moves focus into its pane
-/// (PHASE6.md §3.3) — the same path serves read-only preview and jump-in,
+/// — the same path serves read-only preview and jump-in,
 /// this just starts routing keys to the PTY instead of the tree.
 fn jump_in(app: &mut App) {
     let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else { return };
@@ -498,7 +498,7 @@ fn jump_in(app: &mut App) {
 
 /// `q`/`Ctrl-C` from the tree: quit immediately if nothing would be lost,
 /// otherwise ask for confirmation first — v1 has no persistence, quitting
-/// kills every live agent (PHASE6.md §1/§3.2). Returns `false` only when it's
+/// kills every live agent. Returns `false` only when it's
 /// safe to quit immediately (the confirm path breaks the loop itself, from
 /// `handle_confirm_key`, once the user answers).
 fn start_quit(app: &mut App) -> bool {

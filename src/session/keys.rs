@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Encodes a crossterm key event into the bytes to write to a PTY, respecting
 /// `mode` (application cursor keys). `None` for events with no PTY-meaningful
 /// encoding (e.g. a bare modifier press). This is the one component with no
-/// crate to lean on (PHASE6.md §3.3) — every case here is deliberate.
+/// crate to lean on — every case here is deliberate.
 pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn ctrl_h_still_encodes_even_though_the_app_layer_intercepts_it() {
         // The encoder itself is dumb about Ctrl-h — interception is the caller's
-        // job (PHASE6.md: "Ctrl-h is the only intercepted key" at the app layer).
+        // job ("Ctrl-h is the only intercepted key" lives at the app layer).
         assert_eq!(encode_key(&key_mod(KeyCode::Char('h'), KeyModifiers::CONTROL), TermMode::empty()), Some(vec![0x08]));
     }
 

@@ -20,7 +20,7 @@ pub struct InputState {
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     Drop { agent_id: AgentId, recursive: bool },
-    /// `q`/`Ctrl-C` with live agents (PHASE6.md §3.2): v1 has no persistence,
+    /// `q`/`Ctrl-C` with live agents: v1 has no persistence,
     /// quitting kills every running agent, so it's confirmed rather than
     /// silent — the one real regression from the tmux backend it replaces.
     Quit,
@@ -32,7 +32,7 @@ pub struct ConfirmState {
     pub action: ConfirmAction,
 }
 
-/// Which half of the tree|pane split receives keyboard input (PHASE6.md §3.3).
+/// Which half of the tree|pane split receives keyboard input.
 /// `Ctrl-l` (or `Enter`/`o`) on a live agent moves `Tree -> Pane`; `Ctrl-h` is
 /// the only key `Pane` intercepts, moving back to `Tree` — everything else
 /// forwards to the agent's PTY untouched.

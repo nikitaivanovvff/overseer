@@ -233,7 +233,7 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 
 ## Specs & Planning Docs
 
-Implementation plans (`PHASE*.md`), research notes, and the task checklist live in **`.specs/`**, which is **gitignored** — they are local working documents that drive development, not part of the distributed repo. Every new spec/phase plan goes into `.specs/`; never commit one to the repo root. Code comments may cite them by name (e.g. "PHASE6.md §3.5") — resolve those against `.specs/` on the machine where the work happened.
+Implementation plans (`PHASE*.md`) and research notes live in **`.specs/`**, which is **gitignored** — they are local working documents that drive development, not part of the distributed repo. Every new spec/phase plan goes into `.specs/`; never commit one to the repo root, and never reference a spec from code or committed docs — once a phase ships, its spec is disposable and the code/AGENTS.md must stand on their own.
 
 ---
 

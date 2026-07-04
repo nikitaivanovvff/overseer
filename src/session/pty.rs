@@ -17,15 +17,15 @@ use alacritty_terminal::tty::{self, Options as PtyOptions, Pty, Shell};
 
 use crate::agent::AgentId;
 
-/// Scrollback cap (PHASE6.md §2) — bounds memory for long-running agents.
+/// Scrollback cap — bounds memory for long-running agents.
 const SCROLLBACK_LINES: usize = 10_000;
 /// Grid size used for a session launched before the UI has ever reported a
 /// real pane rect (overwritten by the first `resize_all`).
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_LINES: usize = 24;
 
-/// Every agent PTY is sized to the single, shared live-pane rect (PHASE6.md
-/// §2: "Uniform PTY size") — there are no per-agent sizes.
+/// Every agent PTY is sized to the single, shared live-pane rect — there are
+/// no per-agent sizes.
 #[derive(Clone, Copy)]
 pub struct GridSize {
     pub cols: usize,

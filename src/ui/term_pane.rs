@@ -14,7 +14,7 @@ use crate::agent::AgentId;
 use crate::session::SessionManager;
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
-/// half of the tree|pane split (PHASE6.md §3.5). `focused` draws the cursor
+/// half of the tree|pane split. `focused` draws the cursor
 /// and a distinct border; read-only preview otherwise. Returns the inner
 /// (border-excluded) rect actually painted, so callers can size the PTY to it.
 pub fn render_term_pane(
@@ -46,7 +46,7 @@ fn placeholder(text: &'static str) -> Paragraph<'static> {
     Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
 }
 
-/// Pure grid->buffer painter — the direct unit-test seam (PHASE6.md §5): feed
+/// Pure grid->buffer painter — the direct unit-test seam: feed
 /// canned escape sequences into a `Term`, call this, assert buffer cells.
 /// Generic over `EventListener` so tests can use `VoidListener` without
 /// constructing a real `EventProxy`.
