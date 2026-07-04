@@ -95,7 +95,7 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir. The Claude Code adapter produces a user-level **skill** (`~/.claude/skills/overseer/SKILL.md`, how to operate inside Overseer) and merges status **hooks** into `~/.claude/settings.json`. Nothing is ever written into the user's repo. See `PHASE3.md` for the full design.
+`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir. The Claude Code adapter produces a user-level **skill** (`~/.claude/skills/overseer/SKILL.md`, how to operate inside Overseer) and merges status **hooks** into `~/.claude/settings.json`. Nothing is ever written into the user's repo.
 
 ### Agent Awareness (Claude Code Adapter)
 
@@ -228,6 +228,12 @@ drop = "d"
 ## Distribution
 
 Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`. Homebrew tap: `nikita-ivanov/tap/overseer`. GitHub Actions handles cross-compile, release assets, and tap formula updates.
+
+---
+
+## Specs & Planning Docs
+
+Implementation plans (`PHASE*.md`), research notes, and the task checklist live in **`.specs/`**, which is **gitignored** — they are local working documents that drive development, not part of the distributed repo. Every new spec/phase plan goes into `.specs/`; never commit one to the repo root. Code comments may cite them by name (e.g. "PHASE6.md §3.5") — resolve those against `.specs/` on the machine where the work happened.
 
 ---
 
