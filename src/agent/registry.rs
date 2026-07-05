@@ -99,18 +99,23 @@ impl AgentRegistry {
         }
     }
 
-    /// Updates the status of the agent with the given id.
-    /// `message` is accepted per the protocol but not stored in Phase 2.
+    /// Updates the status of the agent with the given id. `message` is accepted
+    /// per the protocol but not stored. `context_pct` of `None` leaves the
+    /// node's existing value untouched — most status pushes don't carry one.
     pub fn set_status(
         &self,
         id: &AgentId,
         status: AgentStatus,
         _message: Option<String>,
+        context_pct: Option<u8>,
     ) -> Result<(), RegistryError> {
         let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         match guard.find_mut(id) {
             Some(node) => {
                 node.status = status;
+                if let Some(pct) = context_pct {
+                    node.context_pct = Some(pct);
+                }
                 Ok(())
             }
             None => Err(RegistryError::UnknownAgent(id.clone())),
@@ -277,9 +282,26 @@ mod tests {
     fn set_status_unknown_id_returns_error() {
         let reg = AgentRegistry::new();
         let err = reg
-            .set_status(&AgentId::new(), AgentStatus::Done, None)
+            .set_status(&AgentId::new(), AgentStatus::Done, None, None)
             .unwrap_err();
         assert!(matches!(err, RegistryError::UnknownAgent(_)));
+    }
+
+    #[test]
+    fn set_status_with_context_pct_updates_it() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42)).unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
+    }
+
+    #[test]
+    fn set_status_without_context_pct_keeps_existing_value() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42)).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None).unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
     }
 
     #[test]

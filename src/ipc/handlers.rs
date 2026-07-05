@@ -51,8 +51,8 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             }
         }
 
-        Request::Status { agent_id, status, message } => {
-            match ctx.registry.set_status(&agent_id, status, message) {
+        Request::Status { agent_id, status, message, context_pct } => {
+            match ctx.registry.set_status(&agent_id, status, message, context_pct) {
                 Ok(()) => Response::ok(None),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -191,6 +191,7 @@ mod tests {
             agent_id: AgentId::new(),
             status: AgentStatus::Done,
             message: None,
+            context_pct: None,
         };
         let resp = dispatch(&ctx, req);
         assert!(!resp.ok);
@@ -214,13 +215,15 @@ mod tests {
         };
 
         let status_req = Request::Status {
-            agent_id,
+            agent_id: agent_id.clone(),
             status: AgentStatus::Blocked,
             message: None,
+            context_pct: Some(17),
         };
         let resp = dispatch(&ctx, status_req);
         assert!(resp.ok);
         assert!(resp.data.is_none());
+        assert_eq!(ctx.registry.get(&agent_id).unwrap().context_pct, Some(17));
     }
 
     #[test]

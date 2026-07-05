@@ -340,6 +340,14 @@ fn read_hook_payload() -> Option<agent::hook::HookPayload> {
     agent::hook::parse_hook_payload(&raw)
 }
 
+/// Reads the transcript at `path` and extracts a context %. `None` on any read
+/// failure or if the transcript has no usage data yet (e.g. brand new) —
+/// never fails the hook over this, it just means no pct on this push.
+fn read_context_pct(path: &str) -> Option<u8> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    agent::hook::context_pct_from_transcript(&contents)
+}
+
 /// Pure. Only a `blocked` push needs classification — every other status
 /// already means what it says. `Notification` fires for both a real permission
 /// request and the ~60s idle nag; a missing/unparsed payload leaves `blocked`
@@ -386,11 +394,17 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
 
             let mut status: AgentStatus = status.into();
+            let mut context_pct = None;
             if from_hook {
-                status = classify_hook_status(status, read_hook_payload().as_ref());
+                let payload = read_hook_payload();
+                status = classify_hook_status(status, payload.as_ref());
+                context_pct = payload
+                    .as_ref()
+                    .and_then(|p| p.transcript_path.as_deref())
+                    .and_then(read_context_pct);
             }
 
-            Ok(Some(Request::Status { agent_id, status, message }))
+            Ok(Some(Request::Status { agent_id, status, message, context_pct }))
         }
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
@@ -842,6 +856,25 @@ mod tests {
     fn mock_mode_never_gets_a_real_session_manager() {
         assert!(session_manager_for(true).is_dry_run());
         assert!(!session_manager_for(false).is_dry_run());
+    }
+
+    // ── read_context_pct ──────────────────────────────────────────────────────
+
+    #[test]
+    fn read_context_pct_reads_and_parses_a_real_file() {
+        let path = std::env::temp_dir().join(format!("overseer-transcript-test-{}", AgentId::new()));
+        std::fs::write(
+            &path,
+            r#"{"message":{"usage":{"input_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_context_pct(path.to_str().unwrap()), Some(50));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_context_pct_missing_file_returns_none() {
+        assert_eq!(read_context_pct("/nonexistent/transcript.jsonl"), None);
     }
 
     // ── classify_hook_status ──────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 //!
 //! One request line → one response line. Examples:
 //!   register: {"cmd":"register","id":null,"name":"my-task","role":"root","parent_id":null,"adapter":"claude","repo":"overseer"}
-//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null}
+//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null,"context_pct":62}
 //!   list:     {"cmd":"list"}
 //!   agent:    {"cmd":"agent","agent_id":"<uuid>"}
 //!
@@ -29,6 +29,10 @@ pub enum Request {
         agent_id: AgentId,
         status: AgentStatus,
         message: Option<String>,
+        /// From `--from-hook` transcript parsing. `None` leaves the node's
+        /// existing value untouched — most status pushes don't carry one.
+        #[serde(default)]
+        context_pct: Option<u8>,
     },
     List,
     Agent {
@@ -155,10 +159,22 @@ mod tests {
             agent_id: id.clone(),
             status: AgentStatus::Done,
             message: None,
+            context_pct: Some(42),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Request::Status { status: AgentStatus::Done, .. }));
+        assert!(
+            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), .. })
+        );
+    }
+
+    #[test]
+    fn request_status_context_pct_defaults_to_none_when_absent() {
+        // Older callers (or a hand-written request) may omit context_pct entirely.
+        let id = AgentId::new();
+        let raw = format!(r#"{{"cmd":"status","agent_id":"{}","status":"idle","message":null}}"#, id.0);
+        let req: Request = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(req, Request::Status { context_pct: None, .. }));
     }
 
     #[test]

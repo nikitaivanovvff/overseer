@@ -107,7 +107,7 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
         } else {
             (AgentStatus::Error, Some("agent process exited".to_string()))
         };
-        let _ = registry.set_status(&id, status, message);
+        let _ = registry.set_status(&id, status, message, None);
     }
 }
 

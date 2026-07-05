@@ -162,6 +162,7 @@ mod tests {
             agent_id: child_id.clone(),
             status: AgentStatus::Blocked,
             message: None,
+            context_pct: None,
         });
         assert!(resp.ok, "set child status failed");
         assert!(resp.data.is_none(), "status ack should have no data body");
@@ -171,6 +172,7 @@ mod tests {
             agent_id: root_id.clone(),
             status: AgentStatus::Done,
             message: Some("all PRs merged".to_string()),
+            context_pct: None,
         });
         assert!(resp.ok, "set root status failed");
 
@@ -194,6 +196,46 @@ mod tests {
         };
         let child_in_list = agents.iter().find(|a| a.id == child_id).unwrap();
         assert_eq!(child_in_list.status, AgentStatus::Blocked);
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// context_pct flows through the socket and persists across a later push
+    /// that doesn't carry one.
+    #[test]
+    fn lifecycle_context_pct_persists_across_updates_without_it() {
+        let socket = start_server();
+        let root_id = register_root(&socket, "long-task");
+
+        let resp = send(&socket, Request::Status {
+            agent_id: root_id.clone(),
+            status: AgentStatus::Running,
+            message: None,
+            context_pct: Some(37),
+        });
+        assert!(resp.ok);
+
+        let dto = match send(&socket, Request::Agent { agent_id: root_id.clone() }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(dto.context_pct, Some(37));
+
+        // A later push with no context_pct must not clear the last known value.
+        let resp = send(&socket, Request::Status {
+            agent_id: root_id.clone(),
+            status: AgentStatus::Idle,
+            message: None,
+            context_pct: None,
+        });
+        assert!(resp.ok);
+
+        let dto = match send(&socket, Request::Agent { agent_id: root_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(dto.status, AgentStatus::Idle);
+        assert_eq!(dto.context_pct, Some(37), "context_pct must survive a push without one");
 
         let _ = std::fs::remove_file(&socket);
     }
@@ -307,6 +349,7 @@ mod tests {
             agent_id: AgentId::new(),
             status: AgentStatus::Done,
             message: None,
+            context_pct: None,
         });
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap_or("").contains("unknown agent"));
