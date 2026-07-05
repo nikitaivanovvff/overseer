@@ -103,12 +103,14 @@ fn status_bar_height(text: &str, area_width: u16) -> u16 {
 }
 
 fn render_agent_tree(frame: &mut Frame, cursor: usize, tick: u64, area: Rect, flat: &[FlatNode]) {
+    // `List`'s border consumes 2 columns; the row text itself gets the rest.
+    let inner_width = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = flat
         .iter()
         .enumerate()
         .map(|(i, node)| {
             let selected = i == cursor;
-            let line = tree_row(node, selected, tick);
+            let line = tree_row(node, selected, tick, inner_width);
             if selected {
                 ListItem::new(line).style(Style::default().bg(Color::DarkGray))
             } else {
@@ -125,7 +127,7 @@ fn render_agent_tree(frame: &mut Frame, cursor: usize, tick: u64, area: Rect, fl
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn tree_row(node: &FlatNode, selected: bool, tick: u64) -> Line<'static> {
+fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'static> {
     let name_style = if selected {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
@@ -139,12 +141,69 @@ fn tree_row(node: &FlatNode, selected: bool, tick: u64) -> Line<'static> {
         node.status.badge().to_string()
     };
 
+    // prefix + badge (always 1 column wide) + the space separating badge from name.
+    let left_fixed = node.prefix.chars().count() + 1 + 1;
+    let row_width = width.saturating_sub(left_fixed);
+    let layout = format_tree_row(&node.name, node.status.label(), node.context_pct, row_width);
+    let gap = row_width
+        .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
+        .max(1);
+
+    let status_style = if node.status == AgentStatus::Blocked {
+        node.status.style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
         Span::styled(badge, node.status.style()),
         Span::raw(" "),
-        Span::styled(node.name.clone(), name_style),
+        Span::styled(layout.name, name_style),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(layout.status_word, status_style),
+        Span::styled(layout.pct_suffix, Style::default().fg(Color::DarkGray)),
     ])
+}
+
+/// Pure. Lays out one tree row's text: the name (truncated with `…` if it would
+/// otherwise overflow `width`) and a right-aligned `<status> <pct>%` block —
+/// `pct_suffix` is empty while the context % is unknown. Kept free of styling so
+/// `tree_row` can color the status word specially when blocked; this function
+/// only owns the width arithmetic.
+struct TreeRowLayout {
+    name: String,
+    status_word: String,
+    pct_suffix: String,
+}
+
+fn format_tree_row(name: &str, status_label: &str, pct: Option<u8>, width: usize) -> TreeRowLayout {
+    let status_word = status_label.to_string();
+    let pct_suffix = pct.map(|p| format!(" {p}%")).unwrap_or_default();
+    let right_len = status_word.chars().count() + pct_suffix.chars().count();
+    // Reserve at least 1 column of gap between name and the right block; if the
+    // row is too narrow even for the right block alone, let the name collapse to
+    // nothing rather than underflow — render() just clips an over-length line,
+    // same as any other ratatui `Line`.
+    let name_budget = width.saturating_sub(right_len + 1);
+    let name = truncate_with_ellipsis(name, name_budget);
+    TreeRowLayout { name, status_word, pct_suffix }
+}
+
+/// Truncates `s` to at most `max` characters, replacing the last character with
+/// `…` when it doesn't fit — never panics, even for `max` of 0 or 1.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else if max == 1 {
+        "…".to_string()
+    } else {
+        let keep: String = s.chars().take(max - 1).collect();
+        format!("{keep}…")
+    }
 }
 
 fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>) {
@@ -343,6 +402,65 @@ fn focused_border(focused: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
+
+    #[test]
+    fn format_tree_row_fits_without_truncation_in_a_roomy_width() {
+        let layout = format_tree_row("auth-module", "idle", Some(62), 40);
+        assert_eq!(layout.name, "auth-module");
+        assert_eq!(layout.status_word, "idle");
+        assert_eq!(layout.pct_suffix, " 62%");
+    }
+
+    #[test]
+    fn format_tree_row_omits_pct_when_unknown() {
+        let layout = format_tree_row("write-tests", "running", None, 40);
+        assert_eq!(layout.pct_suffix, "");
+        assert_eq!(layout.status_word, "running");
+    }
+
+    #[test]
+    fn format_tree_row_truncates_long_name_with_ellipsis() {
+        let layout = format_tree_row("a-very-long-task-description-here", "blocked", Some(91), 20);
+        assert!(layout.name.ends_with('…'));
+        assert!(layout.name.chars().count() < "a-very-long-task-description-here".chars().count());
+    }
+
+    #[test]
+    fn format_tree_row_narrow_width_does_not_panic() {
+        for width in 0..6 {
+            let layout = format_tree_row("some-task", "blocked", Some(5), width);
+            // Right block (status + pct) always survives intact even if the name collapses.
+            assert_eq!(layout.status_word, "blocked");
+            assert_eq!(layout.pct_suffix, " 5%");
+        }
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_fits_unchanged() {
+        assert_eq!(truncate_with_ellipsis("short", 10), "short");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_exact_fit_unchanged() {
+        assert_eq!(truncate_with_ellipsis("exact", 5), "exact");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_overflow_gets_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_max_zero_is_empty() {
+        assert_eq!(truncate_with_ellipsis("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_max_one_is_just_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("hello", 1), "…");
+    }
 
     #[test]
     fn centered_rect_centers_within_a_roomy_area() {
