@@ -35,8 +35,8 @@ pub fn render(
     pane_focused: bool,
 ) -> Rect {
     let area = frame.area();
-    let (running, total) = tree.agent_counts();
-    let status_line = build_status_line(running, total, prompt);
+    let (running, blocked, total) = tree.agent_counts();
+    let status_line = build_status_line(running, blocked, total, prompt);
     let status_text: String = status_line.spans.iter().map(|s| s.content.as_ref()).collect();
     let status_height = status_bar_height(&status_text, area.width);
 
@@ -202,7 +202,7 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
 
 /// Pure — builds the status line's content so `render()` can measure its
 /// wrapped height before laying out the rest of the frame.
-fn build_status_line(running: usize, total: usize, prompt: Option<&str>) -> Line<'static> {
+fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Option<&str>) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             " OVERSEER ",
@@ -234,10 +234,17 @@ fn build_status_line(running: usize, total: usize, prompt: Option<&str>) -> Line
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::styled(quit_hint, Style::default().fg(Color::DarkGray)),
         ];
-        spans.push(Span::styled(
-            format!("{running}/{total} running"),
-            Style::default().fg(Color::DarkGray),
-        ));
+        let counts_text = if blocked > 0 {
+            format!("{running}/{total} running · {blocked} blocked")
+        } else {
+            format!("{running}/{total} running")
+        };
+        let counts_style = if blocked > 0 {
+            AgentStatus::Blocked.style()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(counts_text, counts_style));
         spans.push(Span::raw("   "));
         spans.extend(hints);
     }
@@ -404,7 +411,7 @@ mod tests {
 
     #[test]
     fn build_status_line_with_prompt_uses_prompt_text_not_hints() {
-        let line = build_status_line(1, 2, Some("drop 'agent'? (y/n)"));
+        let line = build_status_line(1, 0, 2, Some("drop 'agent'? (y/n)"));
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("drop 'agent'? (y/n)"));
         assert!(!text.contains("jump in"));
@@ -412,9 +419,24 @@ mod tests {
 
     #[test]
     fn build_status_line_without_prompt_shows_hints_and_counts() {
-        let line = build_status_line(1, 2, None);
+        let line = build_status_line(1, 0, 2, None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/2 running"));
         assert!(text.contains("jump in"));
+    }
+
+    #[test]
+    fn build_status_line_with_blocked_shows_blocked_count() {
+        let line = build_status_line(1, 2, 4, None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1/4 running"));
+        assert!(text.contains("2 blocked"));
+    }
+
+    #[test]
+    fn build_status_line_without_blocked_omits_blocked_text() {
+        let line = build_status_line(1, 0, 2, None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("blocked"));
     }
 }

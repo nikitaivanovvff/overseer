@@ -43,20 +43,23 @@ impl AgentTree {
         result
     }
 
-    /// Returns (running, total) counts across ALL agents, ignoring expand/collapse state.
-    pub fn agent_counts(&self) -> (usize, usize) {
-        fn count(nodes: &[AgentNode], running: &mut usize, total: &mut usize) {
+    /// Returns (running, blocked, total) counts across ALL agents, ignoring
+    /// expand/collapse state.
+    pub fn agent_counts(&self) -> (usize, usize, usize) {
+        fn count(nodes: &[AgentNode], running: &mut usize, blocked: &mut usize, total: &mut usize) {
             for node in nodes {
                 *total += 1;
-                if node.status == AgentStatus::Running {
-                    *running += 1;
+                match node.status {
+                    AgentStatus::Running => *running += 1,
+                    AgentStatus::Blocked => *blocked += 1,
+                    _ => {}
                 }
-                count(&node.children, running, total);
+                count(&node.children, running, blocked, total);
             }
         }
-        let (mut running, mut total) = (0, 0);
-        count(&self.roots, &mut running, &mut total);
-        (running, total)
+        let (mut running, mut blocked, mut total) = (0, 0, 0);
+        count(&self.roots, &mut running, &mut blocked, &mut total);
+        (running, blocked, total)
     }
 
     pub fn move_down(&mut self) {
@@ -144,7 +147,7 @@ impl AgentTree {
         child_b.context_pct = Some(87);
 
         let mut child_c = AgentNode::new_child("update-docs", "overseer");
-        child_c.status = AgentStatus::Waiting;
+        child_c.status = AgentStatus::Blocked;
         child_c.context_pct = Some(5);
 
         root1.children.push(child_a);
@@ -152,7 +155,7 @@ impl AgentTree {
         root1.children.push(child_c);
 
         let mut root2 = AgentNode::new_root("refactor-api", "overseer");
-        root2.status = AgentStatus::Waiting;
+        root2.status = AgentStatus::Blocked;
 
         let mut root3 = AgentNode::new_root("fix-login-bug", "overseer");
         root3.status = AgentStatus::Error;
@@ -695,9 +698,26 @@ mod tests {
         root.expanded = false; // collapsed — child hidden from flatten()
         tree.add_root(root);
 
-        let (running, total) = tree.agent_counts();
+        let (running, blocked, total) = tree.agent_counts();
         assert_eq!(total, 2);
         assert_eq!(running, 2);
+        assert_eq!(blocked, 0);
         assert_eq!(tree.flatten().len(), 1); // only root visible
+    }
+
+    #[test]
+    fn test_agent_counts_counts_blocked() {
+        let mut tree = AgentTree::new();
+        let mut root = AgentNode::new_root("root", "repo");
+        root.status = AgentStatus::Blocked;
+        let mut child = AgentNode::new_child("child", "repo");
+        child.status = AgentStatus::Running;
+        root.children.push(child);
+        tree.add_root(root);
+
+        let (running, blocked, total) = tree.agent_counts();
+        assert_eq!(total, 2);
+        assert_eq!(running, 1);
+        assert_eq!(blocked, 1);
     }
 }

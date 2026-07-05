@@ -2,7 +2,7 @@
 //!
 //! One request line → one response line. Examples:
 //!   register: {"cmd":"register","id":null,"name":"my-task","role":"root","parent_id":null,"adapter":"claude","repo":"overseer"}
-//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"waiting","message":null}
+//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null}
 //!   list:     {"cmd":"list"}
 //!   agent:    {"cmd":"agent","agent_id":"<uuid>"}
 //!
@@ -111,7 +111,8 @@ mod tests {
     #[test]
     fn status_serializes_snake_case() {
         assert_eq!(serde_json::to_string(&AgentStatus::Running).unwrap(), "\"running\"");
-        assert_eq!(serde_json::to_string(&AgentStatus::Waiting).unwrap(), "\"waiting\"");
+        assert_eq!(serde_json::to_string(&AgentStatus::Blocked).unwrap(), "\"blocked\"");
+        assert_eq!(serde_json::to_string(&AgentStatus::Idle).unwrap(), "\"idle\"");
         assert_eq!(serde_json::to_string(&AgentStatus::Spawning).unwrap(), "\"spawning\"");
         assert_eq!(serde_json::to_string(&AgentStatus::Done).unwrap(), "\"done\"");
         assert_eq!(serde_json::to_string(&AgentStatus::Error).unwrap(), "\"error\"");

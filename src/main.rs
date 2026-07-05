@@ -65,6 +65,12 @@ enum Command {
         status: StatusArg,
         #[arg(long)]
         message: Option<String>,
+        /// Read the Claude Code hook payload JSON from stdin: classifies a
+        /// `blocked` push as the idle nag vs. a real permission request, and
+        /// (once a transcript is available) attaches context %. Never fails the
+        /// hook — malformed/missing stdin just means less context on the push.
+        #[arg(long)]
+        from_hook: bool,
     },
     List,
     Agent {
@@ -114,11 +120,13 @@ enum RoleArg {
     Child,
 }
 
+/// Pushable statuses only — `Spawning` is set at registration time, never
+/// pushed by a hook or agent.
 #[derive(Clone, clap::ValueEnum)]
 enum StatusArg {
-    Spawning,
     Running,
-    Waiting,
+    Idle,
+    Blocked,
     Done,
     Error,
 }
@@ -135,9 +143,9 @@ impl From<RoleArg> for AgentRole {
 impl From<StatusArg> for AgentStatus {
     fn from(s: StatusArg) -> Self {
         match s {
-            StatusArg::Spawning => AgentStatus::Spawning,
             StatusArg::Running => AgentStatus::Running,
-            StatusArg::Waiting => AgentStatus::Waiting,
+            StatusArg::Idle => AgentStatus::Idle,
+            StatusArg::Blocked => AgentStatus::Blocked,
             StatusArg::Done => AgentStatus::Done,
             StatusArg::Error => AgentStatus::Error,
         }
@@ -323,6 +331,29 @@ fn run_client(socket: PathBuf, cmd: Command) -> Result<()> {
     }
 }
 
+/// Reads and parses the hook payload JSON from stdin. `None` on any I/O or parse
+/// failure — `--from-hook` must never fail the hook over malformed stdin.
+fn read_hook_payload() -> Option<agent::hook::HookPayload> {
+    use std::io::Read;
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok()?;
+    agent::hook::parse_hook_payload(&raw)
+}
+
+/// Pure. Only a `blocked` push needs classification — every other status
+/// already means what it says. `Notification` fires for both a real permission
+/// request and the ~60s idle nag; a missing/unparsed payload leaves `blocked`
+/// as-is (the safer default — a permission prompt actually pending).
+fn classify_hook_status(status: AgentStatus, payload: Option<&agent::hook::HookPayload>) -> AgentStatus {
+    if status != AgentStatus::Blocked {
+        return status;
+    }
+    match payload.and_then(|p| p.message.as_deref()) {
+        Some(msg) if agent::hook::is_idle_nag(msg) => AgentStatus::Idle,
+        _ => AgentStatus::Blocked,
+    }
+}
+
 /// Returns `Ok(None)` for the Status command when `$OVERSEER_AGENT_ID` is unset,
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 fn build_request(cmd: Command) -> Result<Option<Request>> {
@@ -344,7 +375,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 repo: Some(repo),
             }))
         }
-        Command::Status { status, message } => {
+        Command::Status { status, message, from_hook } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
                 Ok(s) => s,
                 // Not in an Overseer session — hook must be a silent no-op.
@@ -353,7 +384,13 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
             let agent_id = agent_id_str
                 .parse::<AgentId>()
                 .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
-            Ok(Some(Request::Status { agent_id, status: status.into(), message }))
+
+            let mut status: AgentStatus = status.into();
+            if from_hook {
+                status = classify_hook_status(status, read_hook_payload().as_ref());
+            }
+
+            Ok(Some(Request::Status { agent_id, status, message }))
         }
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
@@ -740,7 +777,7 @@ mod tests {
     fn build_request_status_no_env_var_returns_none() {
         // Ensure $OVERSEER_AGENT_ID is unset for this test.
         std::env::remove_var("OVERSEER_AGENT_ID");
-        let cmd = Command::Status { status: StatusArg::Running, message: None };
+        let cmd = Command::Status { status: StatusArg::Running, message: None, from_hook: false };
         let result = build_request(cmd).unwrap();
         assert!(result.is_none(), "Status without OVERSEER_AGENT_ID should be a silent no-op");
     }
@@ -749,7 +786,7 @@ mod tests {
     fn build_request_status_with_env_var_returns_request() {
         let id = AgentId::new();
         std::env::set_var("OVERSEER_AGENT_ID", id.0.to_string());
-        let cmd = Command::Status { status: StatusArg::Done, message: None };
+        let cmd = Command::Status { status: StatusArg::Done, message: None, from_hook: false };
         let result = build_request(cmd).unwrap();
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Request::Status { .. }));
@@ -805,6 +842,37 @@ mod tests {
     fn mock_mode_never_gets_a_real_session_manager() {
         assert!(session_manager_for(true).is_dry_run());
         assert!(!session_manager_for(false).is_dry_run());
+    }
+
+    // ── classify_hook_status ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_hook_status_leaves_non_blocked_untouched() {
+        assert_eq!(classify_hook_status(AgentStatus::Running, None), AgentStatus::Running);
+        assert_eq!(classify_hook_status(AgentStatus::Idle, None), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn classify_hook_status_no_payload_stays_blocked() {
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, None), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn classify_hook_status_permission_request_stays_blocked() {
+        let payload = agent::hook::HookPayload {
+            transcript_path: None,
+            message: Some("Claude needs your permission to use Bash".to_string()),
+        };
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, Some(&payload)), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn classify_hook_status_idle_nag_downgrades_to_idle() {
+        let payload = agent::hook::HookPayload {
+            transcript_path: None,
+            message: Some("Claude is waiting for your input".to_string()),
+        };
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, Some(&payload)), AgentStatus::Idle);
     }
 
     // ── display_path_from_home ───────────────────────────────────────────────

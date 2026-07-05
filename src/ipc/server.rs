@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -81,10 +81,10 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
 /// periodically applies that to the registry. Runs only when
 /// `ctx.watch_sessions` is true.
 ///
-/// `AgentTree::remove` deletes a node's whole subtree in one call, so an exited
-/// agent with children is never auto-removed here — that would silently orphan
-/// any of its children whose own session is still alive. It's marked `Error`
-/// instead, leaving the user to `drop --recursive` deliberately.
+/// Never removes anything — an exited agent's row stays visible (as `done` or
+/// `error`) so the user can review it before an explicit `drop`. That also
+/// sidesteps any orphaning concern for an exited parent with live children:
+/// nothing is deleted, so nothing can be silently taken out from under them.
 async fn session_watcher(ctx: Arc<AppCtx>) {
     let interval = Duration::from_secs(5);
     loop {
@@ -96,30 +96,18 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
     }
 }
 
-/// One watcher tick: reap leaf agents whose PTY child has exited, and flag
-/// (rather than remove) exited agents that still have children — see
-/// `session_watcher` above for why removal would be unsafe there. Synchronous
-/// and side-effect-only against `registry`/`sessions`, so it's directly
-/// unit-testable without a tokio runtime.
+/// One watcher tick: map each exited PTY's exit status onto `done` (clean exit,
+/// code 0 — including a root shell where the user typed `exit`) or `error`
+/// (non-zero/signal). Synchronous and side-effect-only against
+/// `registry`/`sessions`, so it's directly unit-testable without a tokio runtime.
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
-    let exited = sessions.drain_exits();
-    if exited.is_empty() {
-        return;
-    }
-
-    let ids_with_children: HashSet<_> =
-        registry.snapshot().iter().filter_map(|a| a.parent_id.clone()).collect();
-
-    for id in exited {
-        if ids_with_children.contains(&id) {
-            let _ = registry.set_status(
-                &id,
-                AgentStatus::Error,
-                Some("agent process exited".to_string()),
-            );
+    for (id, success) in sessions.drain_exits() {
+        let (status, message) = if success {
+            (AgentStatus::Done, None)
         } else {
-            registry.remove(&id);
-        }
+            (AgentStatus::Error, Some("agent process exited".to_string()))
+        };
+        let _ = registry.set_status(&id, status, message);
     }
 }
 
@@ -157,32 +145,45 @@ mod tests {
     }
 
     #[test]
-    fn sweep_flags_an_exited_parent_instead_of_removing_it_with_its_live_children() {
+    fn sweep_marks_clean_exit_done() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+
+        sessions.simulate_exit(root_id.clone(), true);
+        sweep_exited_sessions(&registry, &sessions);
+
+        let root = registry.get(&root_id).expect("exited agent must stay visible, not be removed");
+        assert_eq!(root.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn sweep_marks_nonzero_exit_error() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+
+        sessions.simulate_exit(root_id.clone(), false);
+        sweep_exited_sessions(&registry, &sessions);
+
+        let root = registry.get(&root_id).unwrap();
+        assert_eq!(root.status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn sweep_exit_of_parent_does_not_touch_live_childs_status() {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
         let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
 
-        // Only the root's PTY exited — the scenario that used to get the child
-        // silently orphaned by a wholesale subtree removal.
-        sessions.simulate_exit(root_id.clone());
+        // Only the root's PTY exited — the child's own session is untouched.
+        sessions.simulate_exit(root_id.clone(), false);
         sweep_exited_sessions(&registry, &sessions);
 
         let root = registry.get(&root_id).expect("root with a live child must not be removed");
         assert_eq!(root.status, AgentStatus::Error);
         let child = registry.get(&child_id).expect("live child must survive the parent's sweep");
-        assert_eq!(child.status, AgentStatus::Running, "live child must be untouched");
-    }
-
-    #[test]
-    fn sweep_removes_an_exited_leaf_root() {
-        let registry = AgentRegistry::new();
-        let sessions = SessionManager::dry_run();
-        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
-
-        sessions.simulate_exit(root_id.clone());
-        sweep_exited_sessions(&registry, &sessions);
-
-        assert!(registry.get(&root_id).is_none());
+        assert_eq!(child.status, AgentStatus::Spawning, "live child's own status must be untouched");
     }
 }

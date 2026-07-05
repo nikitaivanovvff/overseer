@@ -157,10 +157,10 @@ mod tests {
         };
         assert!(agents.iter().all(|a| a.status == AgentStatus::Running));
 
-        // Child moves to Waiting.
+        // Child moves to Blocked.
         let resp = send(&socket, Request::Status {
             agent_id: child_id.clone(),
-            status: AgentStatus::Waiting,
+            status: AgentStatus::Blocked,
             message: None,
         });
         assert!(resp.ok, "set child status failed");
@@ -179,7 +179,7 @@ mod tests {
             Some(OkBody::Agent { agent }) => agent,
             other => panic!("expected Agent, got {other:?}"),
         };
-        assert_eq!(child_dto.status, AgentStatus::Waiting);
+        assert_eq!(child_dto.status, AgentStatus::Blocked);
 
         let root_dto = match send(&socket, Request::Agent { agent_id: root_id.clone() }).data {
             Some(OkBody::Agent { agent }) => agent,
@@ -193,7 +193,7 @@ mod tests {
             _ => panic!(),
         };
         let child_in_list = agents.iter().find(|a| a.id == child_id).unwrap();
-        assert_eq!(child_in_list.status, AgentStatus::Waiting);
+        assert_eq!(child_in_list.status, AgentStatus::Blocked);
 
         let _ = std::fs::remove_file(&socket);
     }

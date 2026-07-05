@@ -215,7 +215,7 @@ mod tests {
 
         let status_req = Request::Status {
             agent_id,
-            status: AgentStatus::Waiting,
+            status: AgentStatus::Blocked,
             message: None,
         };
         let resp = dispatch(&ctx, status_req);

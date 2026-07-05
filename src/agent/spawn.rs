@@ -136,7 +136,9 @@ fn spawn_child_agent(
         repo: req.repo.clone(),
         cwd: req.cwd.clone(),
         branch: req.branch,
-        initial_status: AgentStatus::Running,
+        // Not Running: the PTY is launching but the agent hasn't reported activity
+        // yet. SessionStart flips it to Running moments later (Claude adapter hook).
+        initial_status: AgentStatus::Spawning,
     };
     let result = registry.register(args)?;
 

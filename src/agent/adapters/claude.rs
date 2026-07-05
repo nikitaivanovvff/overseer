@@ -30,31 +30,48 @@ impl ClaudeAdapter {
     }
 
     fn settings_content(&self) -> String {
-        let post_tool_cmd = self.hook_command("status running");
-        let stop_cmd = self.hook_command("status done");
+        let running_cmd = self.hook_command("status running --from-hook");
+        let idle_cmd = self.hook_command("status idle --from-hook");
+        let blocked_cmd = self.hook_command("status blocked --from-hook");
         // Also pushes `running` immediately at session start (not just at the first
         // tool call) — closes the gap between "user runs claude" and "first tool
         // use" for a bare-shell root that started `Idle`. Still pure push, no polling.
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE"; {post_tool_cmd}; }} || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE"; {running_cmd}; }} || true"#
         );
 
         serde_json::json!({
             "hooks": {
-                "PostToolUse": [{
-                    "matcher": "",
-                    "_overseer": true,
-                    "hooks": [{"type": "command", "command": post_tool_cmd}]
-                }],
-                "Stop": [{
-                    "matcher": "",
-                    "_overseer": true,
-                    "hooks": [{"type": "command", "command": stop_cmd}]
-                }],
                 "SessionStart": [{
                     "matcher": "",
                     "_overseer": true,
                     "hooks": [{"type": "command", "command": session_start_cmd}]
+                }],
+                "UserPromptSubmit": [{
+                    "matcher": "",
+                    "_overseer": true,
+                    "hooks": [{"type": "command", "command": running_cmd.clone()}]
+                }],
+                "PostToolUse": [{
+                    "matcher": "",
+                    "_overseer": true,
+                    "hooks": [{"type": "command", "command": running_cmd}]
+                }],
+                // Not `done` — the agent finished responding, not necessarily the
+                // task. `done` is only reachable via an explicit push from the
+                // agent itself (AGENTS.md "Status is push, not pull").
+                "Stop": [{
+                    "matcher": "",
+                    "_overseer": true,
+                    "hooks": [{"type": "command", "command": idle_cmd}]
+                }],
+                // Notification also fires for the 60s idle nag, which is not a
+                // permission request — main.rs's --from-hook classification
+                // downgrades that case back to `idle` so this doesn't lie.
+                "Notification": [{
+                    "matcher": "",
+                    "_overseer": true,
+                    "hooks": [{"type": "command", "command": blocked_cmd}]
                 }]
             }
         })
@@ -195,12 +212,31 @@ mod tests {
     }
 
     #[test]
-    fn settings_contains_stop_hook() {
+    fn settings_contains_user_prompt_submit_hook_pushing_running() {
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        assert!(v["hooks"]["UserPromptSubmit"].is_array());
+        let cmd = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("status running"));
+    }
+
+    #[test]
+    fn settings_stop_hook_pushes_idle_not_done() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
         assert!(v["hooks"]["Stop"].is_array());
         let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("status done"));
+        assert!(cmd.contains("status idle"), "Stop must push idle, not done: {cmd}");
+        assert!(!cmd.contains("status done"));
+    }
+
+    #[test]
+    fn settings_contains_notification_hook_pushing_blocked() {
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        assert!(v["hooks"]["Notification"].is_array());
+        let cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("status blocked"));
     }
 
     #[test]
@@ -216,9 +252,19 @@ mod tests {
     fn settings_hook_commands_use_absolute_path() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
-        for event in ["PostToolUse", "Stop"] {
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.starts_with('/'), "{event} hook must be absolute path, got: {cmd}");
+        }
+    }
+
+    #[test]
+    fn settings_hook_commands_pass_from_hook_flag() {
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
+            let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(cmd.contains("--from-hook"), "{event} hook must pass --from-hook, got: {cmd}");
         }
     }
 
@@ -226,7 +272,7 @@ mod tests {
     fn settings_entries_are_marked_overseer_managed() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
-        for event in ["PostToolUse", "Stop", "SessionStart"] {
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification", "SessionStart"] {
             assert_eq!(
                 v["hooks"][event][0]["_overseer"].as_bool(),
                 Some(true),

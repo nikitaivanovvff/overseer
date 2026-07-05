@@ -56,7 +56,7 @@ pub struct EventProxy {
     id: AgentId,
     sender: Arc<OnceLock<EventLoopSender>>,
     alive: Arc<AtomicBool>,
-    exits: Arc<Mutex<Vec<AgentId>>>,
+    exits: Arc<Mutex<Vec<(AgentId, bool)>>>,
 }
 
 impl EventListener for EventProxy {
@@ -67,9 +67,12 @@ impl EventListener for EventProxy {
                     Notifier(sender.clone()).notify(text.into_bytes());
                 }
             }
-            Event::ChildExit(_) => {
+            Event::ChildExit(status) => {
                 self.alive.store(false, Ordering::Relaxed);
-                self.exits.lock().unwrap_or_else(|e| e.into_inner()).push(self.id.clone());
+                self.exits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((self.id.clone(), status.success()));
             }
             _ => {}
         }
@@ -103,7 +106,7 @@ enum Mode {
 pub struct SessionManager {
     mode: Mode,
     sessions: Mutex<HashMap<AgentId, PtySession>>,
-    exits: Arc<Mutex<Vec<AgentId>>>,
+    exits: Arc<Mutex<Vec<(AgentId, bool)>>>,
     current_size: Mutex<GridSize>,
 }
 
@@ -293,17 +296,19 @@ impl SessionManager {
         Some(f(&term))
     }
 
-    /// Drains the set of agents whose PTY child has exited since the last
-    /// call — consumed by the dead-session watcher in place of polling.
-    pub fn drain_exits(&self) -> Vec<AgentId> {
+    /// Drains the set of agents whose PTY child has exited since the last call
+    /// — consumed by the dead-session watcher in place of polling. Each entry is
+    /// `(id, success)`, `success` being the child's exit status (`true` for a
+    /// clean exit code 0).
+    pub fn drain_exits(&self) -> Vec<(AgentId, bool)> {
         std::mem::take(&mut *self.exits.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Test-only: pretend `id`'s PTY child exited, for exercising
-    /// `drain_exits()` consumers without spawning a real process.
+    /// Test-only: pretend `id`'s PTY child exited with the given exit status,
+    /// for exercising `drain_exits()` consumers without spawning a real process.
     #[cfg(test)]
-    pub fn simulate_exit(&self, id: AgentId) {
-        self.exits.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+    pub fn simulate_exit(&self, id: AgentId, success: bool) {
+        self.exits.lock().unwrap_or_else(|e| e.into_inner()).push((id, success));
     }
 }
 
