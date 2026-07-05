@@ -149,6 +149,7 @@ fn spawn_child_agent(
         repo: req.repo,
         command: adapter_config.command.clone(),
         extra_args: adapter_config.extra_args.clone(),
+        task: req.task,
     };
 
     if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
@@ -181,6 +182,7 @@ mod tests {
             repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec![],
+            task: String::new(),
         };
         launch(&ctx, &adapter, &sessions).unwrap();
     }

@@ -100,11 +100,22 @@ impl AgentAdapter for ClaudeAdapter {
         for arg in &ctx.extra_args {
             cmd.arg(arg);
         }
+        // A non-empty task is the child's initial prompt: `std::process::Command`
+        // passes it as one argv entry with no shell involved, so no quoting is
+        // needed. Claude Code treats a positional arg as the starting prompt and
+        // stays interactive — the session remains a normal steerable PTY.
+        if !ctx.task.is_empty() {
+            cmd.arg(&ctx.task);
+        }
         cmd
     }
 
     fn env_inject(&self, ctx: &LaunchContext) -> HashMap<String, String> {
-        super::identity_env(&ctx.identity())
+        let mut env = super::identity_env(&ctx.identity());
+        if !ctx.task.is_empty() {
+            env.insert("OVERSEER_TASK".to_string(), ctx.task.clone());
+        }
+        env
     }
 }
 
@@ -128,6 +139,7 @@ mod tests {
             repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec!["--some-flag".to_string()],
+            task: String::new(),
         }
     }
 
@@ -141,6 +153,7 @@ mod tests {
             repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec![],
+            task: "write unit tests for the login flow".to_string(),
         }
     }
 
@@ -281,5 +294,42 @@ mod tests {
         let cmd = a.spawn_command(&ctx);
         assert_eq!(cmd.get_program(), "claude");
         assert_eq!(cmd.get_args().count(), 0);
+    }
+
+    #[test]
+    fn spawn_command_appends_task_as_final_positional_arg() {
+        let a = make_adapter();
+        let ctx = make_child_ctx(AgentId::new());
+        let cmd = a.spawn_command(&ctx);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(*args.last().unwrap(), "write unit tests for the login flow");
+    }
+
+    #[test]
+    fn spawn_command_empty_task_appends_nothing() {
+        let a = make_adapter();
+        let ctx = make_root_ctx(); // root ctx always has an empty task
+        let cmd = a.spawn_command(&ctx);
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args, vec!["--some-flag".to_string()]);
+    }
+
+    #[test]
+    fn env_inject_child_includes_overseer_task() {
+        let a = make_adapter();
+        let ctx = make_child_ctx(AgentId::new());
+        let env = a.env_inject(&ctx);
+        assert_eq!(
+            env.get("OVERSEER_TASK").map(String::as_str),
+            Some("write unit tests for the login flow")
+        );
+    }
+
+    #[test]
+    fn env_inject_root_has_no_overseer_task() {
+        let a = make_adapter();
+        let ctx = make_root_ctx(); // root ctx always has an empty task
+        let env = a.env_inject(&ctx);
+        assert!(!env.contains_key("OVERSEER_TASK"));
     }
 }

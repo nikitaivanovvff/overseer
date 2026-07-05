@@ -19,6 +19,10 @@ pub struct LaunchContext {
     /// Adapter binary name, e.g. "claude". Sourced from config, not hardcoded.
     pub command: String,
     pub extra_args: Vec<String>,
+    /// The child's initial prompt, verbatim (empty for a root — it has no task).
+    /// The adapter appends this as the final positional arg to `spawn_command`
+    /// and `env_inject` re-exposes it as `$OVERSEER_TASK` for the running agent.
+    pub task: String,
 }
 
 impl LaunchContext {
@@ -158,6 +162,7 @@ mod tests {
             repo: "myrepo".to_string(),
             command: "claude".to_string(),
             extra_args: vec![],
+            task: String::new(),
         };
         let env = identity_env(&ctx.identity());
         assert_eq!(env.get("OVERSEER_AGENT_ID"), Some(&ctx.agent_id.0.to_string()));
