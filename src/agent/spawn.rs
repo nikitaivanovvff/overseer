@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::agent::adapters::{adapter_for, identity_env, AgentAdapter, AgentIdentity, LaunchContext};
 use crate::agent::registry::{RegisterArgs, RegisterResult, RegistryError};
 use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+use crate::config::Config;
 use crate::session::SessionManager;
 
 /// Launches `ctx` in a new PTY session using the given adapter.
@@ -52,11 +53,12 @@ pub fn spawn_agent(
     registry: &AgentRegistry,
     sessions: &SessionManager,
     socket: &Path,
+    config: &Config,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
     match req.role.clone() {
         AgentRole::Root => spawn_root_shell(registry, sessions, socket, req),
-        AgentRole::Child => spawn_child_agent(registry, sessions, socket, req),
+        AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req),
     }
 }
 
@@ -106,15 +108,23 @@ fn resolve_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-/// Child path — unchanged from before the root/child split: adapter-driven,
-/// registers `Running` since it auto-launches immediately.
+/// Child path — adapter-driven, registers `Running` since it auto-launches
+/// immediately. `command`/`extra_args` come from the resolved config entry for
+/// `req.adapter_name`, not the adapter name itself — a user can point "claude" at
+/// a custom binary/wrapper. An adapter name absent from `config.adapters` is
+/// `UnknownAdapter`, the same error a name with no `AgentAdapter` impl gets.
 fn spawn_child_agent(
     registry: &AgentRegistry,
     sessions: &SessionManager,
     socket: &Path,
+    config: &Config,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
     let adapter = adapter_for(&req.adapter_name)
+        .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
+    let adapter_config = config
+        .adapters
+        .get(&req.adapter_name)
         .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
 
     let args = RegisterArgs {
@@ -137,8 +147,8 @@ fn spawn_child_agent(
         socket: socket.to_path_buf(),
         cwd: req.cwd,
         repo: req.repo,
-        command: req.adapter_name,
-        extra_args: vec![],
+        command: adapter_config.command.clone(),
+        extra_args: adapter_config.extra_args.clone(),
     };
 
     if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
@@ -155,6 +165,7 @@ mod tests {
     use crate::agent::{AgentId, AgentRole};
     use crate::agent::adapters::claude::ClaudeAdapter;
     use crate::agent::adapters::LaunchContext;
+    use crate::config::Config;
     use std::path::PathBuf;
 
     #[test]
@@ -193,10 +204,12 @@ mod tests {
     #[test]
     fn spawn_agent_root_succeeds() {
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let result = spawn_agent(
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Root, None),
         )
         .unwrap();
@@ -207,10 +220,12 @@ mod tests {
     #[test]
     fn spawn_agent_root_registers_idle_with_shell_adapter_label() {
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let result = spawn_agent(
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Root, None),
         )
         .unwrap();
@@ -222,10 +237,11 @@ mod tests {
     #[test]
     fn spawn_agent_root_names_node_after_repo_ignoring_task() {
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let mut req = base_request(AgentRole::Root, None);
         req.task = "this text should never become the name".to_string();
         req.repo = "distinct-repo-name".to_string();
-        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), req)
+        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
             .unwrap();
         let dto = registry.get(&result.id).unwrap();
         assert_eq!(dto.name, "distinct-repo-name");
@@ -247,10 +263,12 @@ mod tests {
     #[test]
     fn spawn_agent_child_succeeds_under_known_parent() {
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let root = spawn_agent(
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Root, None),
         )
         .unwrap();
@@ -259,6 +277,7 @@ mod tests {
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Child, Some(root.id)),
         )
         .unwrap();
@@ -271,28 +290,89 @@ mod tests {
         // Root no longer validates any adapter (it's always a bare shell), so this
         // now has to go through a child spawn — the only path that still consults one.
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let root = spawn_agent(
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Root, None),
         )
         .unwrap();
 
         let mut req = base_request(AgentRole::Child, Some(root.id));
         req.adapter_name = "nonexistent".to_string();
-        let err = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), req)
+        let err = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
             .unwrap_err();
         assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "nonexistent"));
     }
 
     #[test]
+    fn spawn_agent_child_errors_when_adapter_missing_from_config() {
+        // "claude" has an AgentAdapter impl, but if it's absent from the config's
+        // adapters map, that's the *other* UnknownAdapter path (Task 3) — same
+        // error variant, different lookup.
+        let (registry, sessions) = make_registry_and_sessions();
+        let empty_config = Config { defaults: Default::default(), adapters: Default::default() };
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &empty_config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        let req = base_request(AgentRole::Child, Some(root.id));
+        let err = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &empty_config, req)
+            .unwrap_err();
+        assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "claude"));
+    }
+
+    #[test]
+    fn spawn_agent_child_uses_configured_command_and_extra_args() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let mut config = Config::default();
+        config.adapters.insert(
+            "claude".to_string(),
+            crate::config::AdapterConfig {
+                command: "/usr/local/bin/claude-wrapper".to_string(),
+                extra_args: vec!["--dangerously-skip-permissions".to_string()],
+            },
+        );
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        // spawn_child_agent's launch goes through a dry-run SessionManager, so we
+        // can't observe the built Command directly here — this test exercises the
+        // resolution path end-to-end (no error means the config lookup + launch
+        // succeeded); ClaudeAdapter's own tests cover the resulting Command shape.
+        let child = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Child, Some(root.id)),
+        )
+        .unwrap();
+        assert!(registry.get(&child.id).is_some());
+    }
+
+    #[test]
     fn spawn_agent_unknown_parent_errors() {
         let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
         let err = spawn_agent(
             &registry,
             &sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Child, Some(AgentId::new())),
         )
         .unwrap_err();
@@ -303,10 +383,12 @@ mod tests {
     fn spawn_agent_rolls_back_registration_on_launch_failure() {
         let registry = AgentRegistry::new();
         let failing_sessions = SessionManager::dry_run_failing_launch();
+        let config = Config::default();
         let err = spawn_agent(
             &registry,
             &failing_sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &config,
             base_request(AgentRole::Root, None),
         )
         .unwrap_err();

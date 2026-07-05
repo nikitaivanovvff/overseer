@@ -54,6 +54,7 @@ pub fn drop_agent(
 mod tests {
     use super::*;
     use crate::agent::spawn::{spawn_agent, SpawnRequest};
+    use crate::config::Config;
     use std::path::PathBuf;
 
     fn make_registry_and_sessions() -> (AgentRegistry, SessionManager) {
@@ -70,6 +71,7 @@ mod tests {
             registry,
             sessions,
             &PathBuf::from("/tmp/overseer.sock"),
+            &Config::default(),
             SpawnRequest {
                 role,
                 parent_id,

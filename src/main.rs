@@ -17,6 +17,7 @@ use std::{
 
 mod agent;
 mod app;
+mod config;
 mod git;
 mod ipc;
 mod session;
@@ -27,6 +28,7 @@ use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, MergeStrategy};
 use agent::drop::drop_agent;
 use app::{App, ConfirmAction, ConfirmState, Focus, InputState, PendingAction};
+use config::Config;
 use git::GitClient;
 use ipc::handlers::dispatch;
 use ipc::protocol::Request;
@@ -184,6 +186,7 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         sessions: Arc::new(session_manager_for(mock)),
         socket: socket.clone(),
         git: Arc::new(GitClient::new()),
+        config: Arc::new(Config::load()),
         watch_sessions: !mock,
     });
 
@@ -465,7 +468,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
             app.status_message = None;
             let default_cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
+                .map(|p| display_path_from_home(&p))
                 .unwrap_or_default();
             app.input = Some(InputState {
                 action: PendingAction::SpawnRoot,
@@ -672,6 +675,22 @@ fn dispatch_and_report(app: &mut App, req: Request) {
     };
 }
 
+/// Renders `path` relative to `$HOME` (e.g. `~/projects/overseer`) for display in
+/// the spawn-root modal — the inverse of `expand_repo_path`. Falls back to the
+/// absolute path unchanged when `path` isn't under home (or home can't be resolved).
+fn display_path_from_home(path: &std::path::Path) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.display().to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Expands a leading `~/` using `$HOME`, since `PathBuf` does no shell expansion
 /// on its own and the repo-path prompt is otherwise typed like a shell argument.
 fn expand_repo_path(text: &str) -> PathBuf {
@@ -788,6 +807,27 @@ mod tests {
         assert!(!session_manager_for(false).is_dry_run());
     }
 
+    // ── display_path_from_home ───────────────────────────────────────────────
+
+    #[test]
+    fn display_path_from_home_under_home_uses_tilde() {
+        let home = dirs::home_dir().expect("test requires resolvable $HOME");
+        let path = home.join("projects/overseer");
+        assert_eq!(display_path_from_home(&path), "~/projects/overseer");
+    }
+
+    #[test]
+    fn display_path_from_home_outside_home_is_unchanged() {
+        let path = PathBuf::from("/opt/other/repo");
+        assert_eq!(display_path_from_home(&path), "/opt/other/repo");
+    }
+
+    #[test]
+    fn display_path_from_home_home_itself_is_tilde() {
+        let home = dirs::home_dir().expect("test requires resolvable $HOME");
+        assert_eq!(display_path_from_home(&home), "~");
+    }
+
     // ── quit guard ────────────────────────────────────────────────────────────
 
     fn register_agent(app: &App, id: Option<AgentId>) -> AgentId {
@@ -815,6 +855,7 @@ mod tests {
             sessions: Arc::new(sessions),
             socket: PathBuf::from("/tmp/overseer-quit-test.sock"),
             git: Arc::new(GitClient::new()),
+            config: Arc::new(Config::default()),
             watch_sessions: false,
         });
         App::new(ctx)

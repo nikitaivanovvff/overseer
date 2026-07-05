@@ -82,6 +82,7 @@ mod tests {
             sessions: Arc::new(SessionManager::dry_run()),
             socket: PathBuf::from("/tmp/overseer-test.sock"),
             git: Arc::new(GitClient::new()),
+            config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
         });
         App::new(ctx)

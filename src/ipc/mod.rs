@@ -41,6 +41,7 @@ mod tests {
             sessions: Arc::new(SessionManager::dry_run()),
             socket: socket.clone(),
             git: Arc::new(GitClient::dry_run()),
+            config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
         });
         let socket_clone = socket.clone();

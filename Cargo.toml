@@ -21,3 +21,4 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 dirs = "5"
 alacritty_terminal = "0.26"
+toml = "0.8"

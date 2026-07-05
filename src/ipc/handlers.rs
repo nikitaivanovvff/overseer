@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::agent::drop::drop_agent;
 use crate::agent::spawn::{spawn_agent, SpawnRequest};
 use crate::agent::{AgentRegistry, AgentRole, AgentStatus, RegisterArgs};
+use crate::config::Config;
 use crate::git::GitClient;
 use crate::ipc::protocol::{OkBody, Request, Response};
 use crate::session::SessionManager;
@@ -15,6 +16,7 @@ pub struct AppCtx {
     pub sessions: Arc<SessionManager>,
     pub socket: PathBuf,
     pub git: Arc<GitClient>,
+    pub config: Arc<Config>,
     /// When true, the server spawns a background task that drains agent PTY
     /// exits and marks them Error. Set false in mock/test mode.
     pub watch_sessions: bool,
@@ -81,7 +83,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 branch: Some(branch),
             };
 
-            match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, req) {
+            match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
                 Ok(result) => Response::ok(Some(OkBody::Registered {
                     agent_id: result.id,
                     branch: result.branch,
@@ -91,7 +93,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         }
 
         Request::Spawn { parent_id, task, adapter, cwd } => {
-            let adapter_name = adapter.unwrap_or_else(|| "claude".to_string());
+            let adapter_name = adapter.unwrap_or_else(|| ctx.config.defaults.adapter.clone());
 
             let Some(parent) = ctx.registry.get(&parent_id) else {
                 return Response::err(format!("unknown agent: {}", parent_id.short()));
@@ -112,7 +114,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 branch: None,
             };
 
-            match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, req) {
+            match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
                 Ok(result) => Response::ok(Some(OkBody::Registered {
                     agent_id: result.id,
                     branch: result.branch,
@@ -145,6 +147,7 @@ mod tests {
             sessions: Arc::new(SessionManager::dry_run()),
             socket: PathBuf::from("/tmp/test.sock"),
             git: Arc::new(GitClient::dry_run()),
+            config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
         }
     }
