@@ -69,8 +69,8 @@ pub fn identity_env(id: &AgentIdentity) -> HashMap<String, String> {
     env
 }
 
-/// A file written at the user level by `overseer teach`.
-/// `path` is relative to the adapter's user config dir (e.g. "skills/overseer/SKILL.md").
+/// A file written at the user level by `overseer install`.
+/// `path` is relative to the adapter's user config dir (e.g. "skills/overseer-root/SKILL.md").
 pub struct InstalledFile {
     pub path: PathBuf,
     pub content: String,
@@ -88,13 +88,21 @@ pub trait AgentAdapter: Send + Sync {
     #[allow(dead_code)]
     fn name(&self) -> &str;
 
-    // --- teach (install-time, pure) ---
+    // --- install (install-time, pure) ---
 
     /// User config dir for this agent (e.g. `~/.claude`). Resolved at call time.
     fn user_config_dir(&self) -> Option<PathBuf>;
 
     /// Files to install at the user level. Pure — no I/O.
-    fn teach_files(&self) -> Vec<InstalledFile>;
+    fn install_files(&self) -> Vec<InstalledFile>;
+
+    /// Paths (relative to `user_config_dir()`) from a previous install layout
+    /// that `overseer install`/`--uninstall` should delete outright. Empty by
+    /// default — only an adapter that has actually renamed/restructured its
+    /// installed files needs to override this.
+    fn legacy_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 
     // --- launch (runtime, pure) ---
 

@@ -4,10 +4,17 @@ use std::process::Command;
 
 use super::{AgentAdapter, InstalledFile, LaunchContext, MergeStrategy};
 
-const SKILL_PATH: &str = "skills/overseer/SKILL.md";
+const ROOT_SKILL_PATH: &str = "skills/overseer-root/SKILL.md";
+const CHILD_SKILL_PATH: &str = "skills/overseer-child/SKILL.md";
 const SETTINGS_PATH: &str = "settings.json";
 
-const SKILL_CONTENT: &str = include_str!("overseer_skill.md");
+/// The old single-skill layout, superseded by the root/child split above —
+/// deleted on install/uninstall so a stale copy doesn't keep pointing agents
+/// at content that no longer matches the (now role-specific) hook behavior.
+const LEGACY_SKILL_DIR: &str = "skills/overseer";
+
+const ROOT_SKILL_CONTENT: &str = include_str!("overseer_root_skill.md");
+const CHILD_SKILL_CONTENT: &str = include_str!("overseer_child_skill.md");
 
 pub struct ClaudeAdapter {
     overseer_bin: PathBuf,
@@ -37,7 +44,7 @@ impl ClaudeAdapter {
         // tool call) — closes the gap between "user runs claude" and "first tool
         // use" for a bare-shell root that started `Idle`. Still pure push, no polling.
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE"; {running_cmd}; }} || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer-%s skill.\n' "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {running_cmd}; }} || true"#
         );
 
         serde_json::json!({
@@ -97,11 +104,16 @@ impl AgentAdapter for ClaudeAdapter {
         dirs::home_dir().map(|h| h.join(".claude"))
     }
 
-    fn teach_files(&self) -> Vec<InstalledFile> {
+    fn install_files(&self) -> Vec<InstalledFile> {
         vec![
             InstalledFile {
-                path: PathBuf::from(SKILL_PATH),
-                content: SKILL_CONTENT.to_string(),
+                path: PathBuf::from(ROOT_SKILL_PATH),
+                content: ROOT_SKILL_CONTENT.to_string(),
+                merge: MergeStrategy::Overwrite,
+            },
+            InstalledFile {
+                path: PathBuf::from(CHILD_SKILL_PATH),
+                content: CHILD_SKILL_CONTENT.to_string(),
                 merge: MergeStrategy::Overwrite,
             },
             InstalledFile {
@@ -110,6 +122,10 @@ impl AgentAdapter for ClaudeAdapter {
                 merge: MergeStrategy::JsonMerge,
             },
         ]
+    }
+
+    fn legacy_paths(&self) -> Vec<PathBuf> {
+        vec![PathBuf::from(LEGACY_SKILL_DIR)]
     }
 
     fn spawn_command(&self, ctx: &LaunchContext) -> Command {
@@ -175,37 +191,55 @@ mod tests {
     }
 
     #[test]
-    fn teach_files_returns_skill_and_settings() {
+    fn install_files_returns_two_skills_and_settings() {
         let a = make_adapter();
-        let files = a.teach_files();
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].path, Path::new(SKILL_PATH));
+        let files = a.install_files();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, Path::new(ROOT_SKILL_PATH));
         assert!(matches!(files[0].merge, MergeStrategy::Overwrite));
-        assert_eq!(files[1].path, Path::new(SETTINGS_PATH));
-        assert!(matches!(files[1].merge, MergeStrategy::JsonMerge));
+        assert_eq!(files[1].path, Path::new(CHILD_SKILL_PATH));
+        assert!(matches!(files[1].merge, MergeStrategy::Overwrite));
+        assert_eq!(files[2].path, Path::new(SETTINGS_PATH));
+        assert!(matches!(files[2].merge, MergeStrategy::JsonMerge));
     }
 
     #[test]
-    fn skill_content_is_not_empty() {
-        assert!(!SKILL_CONTENT.is_empty(), "overseer_skill.md must not be empty");
+    fn legacy_paths_targets_the_old_single_skill_dir() {
+        let a = make_adapter();
+        assert_eq!(a.legacy_paths(), vec![PathBuf::from("skills/overseer")]);
     }
 
     #[test]
-    fn skill_has_required_frontmatter() {
-        assert!(SKILL_CONTENT.contains("name: overseer"), "missing name frontmatter");
-        assert!(SKILL_CONTENT.contains("description:"), "missing description frontmatter");
+    fn root_skill_content_is_not_empty_and_has_frontmatter() {
+        assert!(!ROOT_SKILL_CONTENT.is_empty());
+        assert!(ROOT_SKILL_CONTENT.contains("name: overseer-root"), "missing name frontmatter");
+        assert!(ROOT_SKILL_CONTENT.contains("description:"), "missing description frontmatter");
     }
 
     #[test]
-    fn skill_mentions_root_and_child_roles() {
-        assert!(SKILL_CONTENT.contains("root"), "skill should describe root role");
-        assert!(SKILL_CONTENT.contains("child"), "skill should describe child role");
+    fn child_skill_content_is_not_empty_and_has_frontmatter() {
+        assert!(!CHILD_SKILL_CONTENT.is_empty());
+        assert!(CHILD_SKILL_CONTENT.contains("name: overseer-child"), "missing name frontmatter");
+        assert!(CHILD_SKILL_CONTENT.contains("description:"), "missing description frontmatter");
+    }
+
+    #[test]
+    fn root_skill_documents_spawn_and_forbids_nesting() {
+        assert!(ROOT_SKILL_CONTENT.contains("overseer spawn"));
+        assert!(ROOT_SKILL_CONTENT.to_lowercase().contains("not spawn further")
+            || ROOT_SKILL_CONTENT.contains("may not spawn further"));
+    }
+
+    #[test]
+    fn child_skill_documents_overseer_task_and_done_status() {
+        assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
+        assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));
     }
 
     #[test]
     fn settings_contains_post_tool_use_hook() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         assert!(v["hooks"]["PostToolUse"].is_array());
         let cmd = v["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"));
@@ -214,7 +248,7 @@ mod tests {
     #[test]
     fn settings_contains_user_prompt_submit_hook_pushing_running() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         assert!(v["hooks"]["UserPromptSubmit"].is_array());
         let cmd = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"));
@@ -223,7 +257,7 @@ mod tests {
     #[test]
     fn settings_stop_hook_pushes_idle_not_done() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         assert!(v["hooks"]["Stop"].is_array());
         let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status idle"), "Stop must push idle, not done: {cmd}");
@@ -233,7 +267,7 @@ mod tests {
     #[test]
     fn settings_contains_notification_hook_pushing_blocked() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         assert!(v["hooks"]["Notification"].is_array());
         let cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status blocked"));
@@ -242,7 +276,7 @@ mod tests {
     #[test]
     fn settings_session_start_also_pushes_running() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"), "SessionStart should also push running: {cmd}");
         assert!(cmd.contains("OVERSEER_AGENT_ID"), "must stay guarded, no-op outside Overseer");
@@ -251,7 +285,7 @@ mod tests {
     #[test]
     fn settings_hook_commands_use_absolute_path() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.starts_with('/'), "{event} hook must be absolute path, got: {cmd}");
@@ -261,7 +295,7 @@ mod tests {
     #[test]
     fn settings_hook_commands_pass_from_hook_flag() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.contains("--from-hook"), "{event} hook must pass --from-hook, got: {cmd}");
@@ -271,7 +305,7 @@ mod tests {
     #[test]
     fn settings_entries_are_marked_overseer_managed() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.teach_files()[1].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification", "SessionStart"] {
             assert_eq!(
                 v["hooks"][event][0]["_overseer"].as_bool(),

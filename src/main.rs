@@ -25,7 +25,7 @@ mod settings;
 mod ui;
 
 use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
-use agent::adapters::{adapter_for, MergeStrategy};
+use agent::adapters::{adapter_for, AgentAdapter, MergeStrategy};
 use agent::drop::drop_agent;
 use app::{App, ConfirmAction, ConfirmState, Focus, InputState, PendingAction};
 use config::Config;
@@ -76,9 +76,11 @@ enum Command {
     Agent {
         id: String,
     },
-    /// Install the adapter skill + hooks at the user level (runs once, no socket needed).
-    Teach {
-        /// Adapter name to teach (e.g. "claude").
+    /// Install the adapter skill(s) + hooks at the user level (runs once, no
+    /// socket needed). `teach` is kept as a hidden alias for muscle memory.
+    #[command(alias = "teach")]
+    Install {
+        /// Adapter name to install (e.g. "claude").
         agent: String,
         /// Remove only the Overseer-managed entries instead of installing them.
         #[arg(long)]
@@ -165,7 +167,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         None => run_tui(socket, cli.mock),
-        Some(Command::Teach { agent, uninstall }) => run_teach(&agent, uninstall),
+        Some(Command::Install { agent, uninstall }) => run_install(&agent, uninstall),
         Some(cmd) => run_client(socket, cmd),
     }
 }
@@ -231,9 +233,9 @@ fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     res
 }
 
-// ── teach ─────────────────────────────────────────────────────────────────────
+// ── install ───────────────────────────────────────────────────────────────────
 
-fn run_teach(agent_name: &str, uninstall: bool) -> Result<()> {
+fn run_install(agent_name: &str, uninstall: bool) -> Result<()> {
     let adapter = adapter_for(agent_name)
         .ok_or_else(|| anyhow::anyhow!("unknown adapter: '{agent_name}'"))?;
 
@@ -242,7 +244,7 @@ fn run_teach(agent_name: &str, uninstall: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("could not resolve user config dir for '{agent_name}'"))?;
 
     if uninstall {
-        for file in adapter.teach_files() {
+        for file in adapter.install_files() {
             let full_path = config_dir.join(&file.path);
             match file.merge {
                 MergeStrategy::Overwrite => {
@@ -267,9 +269,10 @@ fn run_teach(agent_name: &str, uninstall: bool) -> Result<()> {
                 }
             }
         }
+        remove_legacy_paths(adapter.as_ref(), &config_dir)?;
         println!("uninstalled '{agent_name}' adapter");
     } else {
-        for file in adapter.teach_files() {
+        for file in adapter.install_files() {
             let full_path = config_dir.join(&file.path);
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -300,9 +303,31 @@ fn run_teach(agent_name: &str, uninstall: bool) -> Result<()> {
                 }
             }
         }
+        // A fresh install must not leave a superseded layout (e.g. the old
+        // single skills/overseer/) sitting alongside the new one.
+        remove_legacy_paths(adapter.as_ref(), &config_dir)?;
         println!("installed '{agent_name}' adapter → config dir: {}", config_dir.display());
     }
 
+    Ok(())
+}
+
+/// Deletes each of the adapter's `legacy_paths()` under `config_dir`, if present.
+/// A path may be a file or a directory — either is removed outright (deletion is
+/// the documented preference over leaving a stale "superseded" pointer behind).
+fn remove_legacy_paths(adapter: &dyn AgentAdapter, config_dir: &std::path::Path) -> Result<()> {
+    for path in adapter.legacy_paths() {
+        let full_path = config_dir.join(&path);
+        if full_path.is_dir() {
+            std::fs::remove_dir_all(&full_path)
+                .with_context(|| format!("failed to remove legacy {}", full_path.display()))?;
+            println!("removed  {} (legacy)", full_path.display());
+        } else if full_path.exists() {
+            std::fs::remove_file(&full_path)
+                .with_context(|| format!("failed to remove legacy {}", full_path.display()))?;
+            println!("removed  {} (legacy)", full_path.display());
+        }
+    }
     Ok(())
 }
 
@@ -431,7 +456,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             Ok(Some(Request::Drop { agent_id, recursive }))
         }
-        Command::Teach { .. } => unreachable!("Teach is handled before run_client"),
+        Command::Install { .. } => unreachable!("Install is handled before run_client"),
     }
 }
 
