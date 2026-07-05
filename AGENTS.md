@@ -22,7 +22,7 @@ You (the user)
 
 You spawn the root, run your own agent inside it, and talk to it directly; the agent then fans out children on your behalf. Each agent is a PTY Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
 
-Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer teach <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens consumed, nothing written into your repo.
+Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>` (`overseer teach` still works as a hidden alias). Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens consumed, nothing written into your repo.
 
 ---
 
@@ -39,21 +39,23 @@ overseer (binary)
 ├── agent/            Agent model and lifecycle
 │   ├── model         AgentNode, AgentStatus, AgentRole, AgentTree
 │   ├── registry      AgentRegistry: in-memory tree of registered agents + their metadata
+│   ├── hook          Pure Claude Code hook-payload parsing: blocked-vs-idle-nag
+│   │                 classification, context % from transcript JSONL
 │   ├── adapters/     Pluggable per-agent-type behaviour
-│   │   ├── mod       AgentAdapter trait (teach_files, spawn_command, env_inject)
-│   │   ├── claude    Claude Code adapter (user-level skill + hooks, launch cmd)
+│   │   ├── mod       AgentAdapter trait (install_files, spawn_command, env_inject)
+│   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
 │   │   └── generic   Fallback: raw shell command, env vars only (Phase 5)
 │   ├── spawn         Orchestrates session launch + env injection + register
 │   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it
 ├── git/              Read-only git info via CLI (repo name, current branch) — no worktrees
 ├── ipc/              Unix socket server (tokio, newline-delimited JSON)
-│   ├── server        Binds to $OVERSEER_SOCKET, accepts connections
+│   ├── server        Binds to $OVERSEER_SOCKET, accepts connections; session-exit watcher
 │   ├── handlers      dispatch: register, status, list, agent, start, spawn
 │   ├── protocol      Request / Response / AgentDto wire types (serde)
 │   └── client        One-shot sync client used by CLI subcommands
-└── config/           TOML config (~/.config/overseer/config.toml)
-    ├── schema        Config struct (adapters, keybinds, theme, defaults)
-    └── loader        Load + merge with CLI flags
+└── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters}.
+                      Missing/invalid file falls back to a built-in default. Keybindings/theme
+                      are not implemented yet (Phase 5b).
 ```
 
 ---
@@ -66,11 +68,11 @@ Unix domain socket at `/tmp/overseer-<session-id>.sock`. The only channel agents
 
 | Command | Args | Description |
 |---------|------|-------------|
-| `overseer teach` | `<agent> --uninstall?` | Install (or remove) the user-level skill + status hooks for an agent type. Run once at setup, not per launch. |
+| `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. `teach` is a hidden alias. |
 | `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
 | `overseer register` | `--role --parent-id? --adapter` | Called once on agent startup (usually wired via env, not by hand) |
-| `overseer status` | `<status> --message?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. |
-| `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. |
+| `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context %. |
+| `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. The task text becomes the child's initial prompt, not just its tree-row name. |
 | `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. |
 | `overseer list` | — | List all agents |
 | `overseer agent` | `<id>` | Get agent detail |
@@ -79,15 +81,16 @@ Identity (`OVERSEER_AGENT_ID`, socket path) comes from injected env, so commands
 
 ### Agent Adapter Trait
 
-Two surfaces: **teach** (install-time, user-level artifacts) and **launch** (runtime command + env). Both pure — they return data; the `teach` / `start` handlers do the I/O.
+Two surfaces: **install** (install-time, user-level artifacts) and **launch** (runtime command + env). Both pure — they return data; the `install` / `start` handlers do the I/O.
 
 ```rust
 pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &str;
 
-    // teach (install-time): files written at the USER level, once
+    // install (install-time): files written at the USER level, once
     fn user_config_dir(&self) -> Option<PathBuf>;      // e.g. ~/.claude
-    fn teach_files(&self) -> Vec<InstalledFile>;       // skill + status hooks
+    fn install_files(&self) -> Vec<InstalledFile>;     // skill(s) + status hooks
+    fn legacy_paths(&self) -> Vec<PathBuf> { vec![] }  // superseded layout to delete
 
     // launch (runtime): how to start one agent session
     fn spawn_command(&self, ctx: &LaunchContext) -> Command;
@@ -95,7 +98,7 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir. The Claude Code adapter produces a user-level **skill** (`~/.claude/skills/overseer/SKILL.md`, how to operate inside Overseer) and merges status **hooks** into `~/.claude/settings.json`. Nothing is ever written into the user's repo.
+`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir. The Claude Code adapter produces two user-level **skills** — `~/.claude/skills/overseer-root/SKILL.md` and `~/.claude/skills/overseer-child/SKILL.md`, each scoped to what that role actually needs to do — and merges status **hooks** into `~/.claude/settings.json`. `legacy_paths()` names any previous install layout (e.g. the old single `skills/overseer/`) that install/uninstall should delete outright rather than leave to rot alongside the current one. Nothing is ever written into the user's repo.
 
 ### Agent Awareness (Claude Code Adapter)
 
@@ -105,15 +108,23 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_ROLE` — `root` | `child`
 - `OVERSEER_PARENT_ID` — parent UUID (absent for root)
 - `OVERSEER_REPO` — repository name
+- `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for root). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
 
-Role behavior lives in the **user-level skill** installed by `overseer teach`, not in a per-launch file:
-- Root agents: may spawn children via `overseer spawn --task "<...>"`.
-- Child agents: spawning is not permitted; the agent sets up its own branch/worktree for isolation, does the task, and reports done.
+Role behavior lives in the **user-level skill** installed by `overseer install` — `overseer-root` or `overseer-child`, matched to `$OVERSEER_ROLE` — not in a per-launch file:
+- Root agents: may spawn children via `overseer spawn --task "<full, self-contained task description>"`.
+- Child agents: spawning is not permitted; the agent sets up its own branch/worktree for isolation, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
 
-User-level `~/.claude/settings.json` hooks (installed by `overseer teach`, shared across all sessions, no-op outside Overseer):
-- `PostToolUse` → push status `running`
-- `Stop` → push status `done`
-- `SessionStart` → when `$OVERSEER_AGENT_ID` is set, point the agent at the Overseer skill; otherwise do nothing
+User-level `~/.claude/settings.json` hooks (installed by `overseer install`, shared across all sessions, no-op outside Overseer, all passing `--from-hook`):
+
+| Hook | Pushes | Why |
+|------|--------|-----|
+| `SessionStart` | `running` | Closes the gap between "user runs claude" and the first tool call; also prints a pointer at the role-specific skill. |
+| `UserPromptSubmit` | `running` | Covers the user prompting inside a pane after the agent had gone `idle`. |
+| `PostToolUse` | `running` | Actively working. |
+| `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
+| `Notification` | `blocked`, downgraded to `idle` for the ~60s idle nag | Fires for both a real permission prompt and the nag; `--from-hook` classifies which via the payload's message text. |
+
+Status meanings: `spawning` (registered, session launching) → `running` (working) → `idle` (finished responding, awaiting more input) / `blocked` (needs you — permission pending) → `done` or `error` (see Cleanup for how these two are reached).
 
 ### Workspace
 
@@ -123,30 +134,35 @@ Overseer does **not** manage workspaces. A parent runs in the repo's existing ch
 
 Dropping an agent kills its PTY and deregisters it — that's all. Overseer does not delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent, so no session is orphaned. Root agents cannot be dropped via IPC — only via the TUI.
 
+A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0 — including a root shell where the user typed `exit`) or `error` (non-zero/signal), and the agent stays visible for you to review before an explicit `drop`.
+
 **v1 has no persistence.** Agents are child processes of the Overseer process itself — quitting (`q`, with anything registered) kills every one of them, no reattach, no daemon. That's an accepted regression versus the old tmux backend (which survived a TUI restart); a daemon split reusing the same `SessionManager` is the planned path back to persistence, not yet built. `q`/`Ctrl-C` confirm first whenever any agent is still registered, so this is never silent.
 
 ### TUI Layout
 
 ```
-┌─────────────────┬──────────────────────────────────────────────────┐
-│ AGENTS          │                                                  │
-│ ◌ overseer      │                                                  │
-│   ├ ● auth-mod  │     the selected agent's live grid, painted      │
-│   ├ ○ tests     │     directly into this same ratatui frame by     │
-│   └ ✓ docs      │     ui/term_pane — real color, real interaction  │
-│ ○ refactor-api  │     once focused (Ctrl-l)                        │
-├─────────────────┤                                                  │
-│ task:   auth-mod│                                                  │
-│ repo:   overseer│                                                  │
-│ branch: ovsr/a  │                                                  │
-│ status: running │                                                  │
-└─────────────────┴──────────────────────────────────────────────────┘
- OVERSEER   3/6 running   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  q quit
+┌───────────────────────────┬─────────────────────────────────────────┐
+│ AGENTS                    │                                         │
+│ ◌ overseer            idle│   the selected agent's live grid,       │
+│   ├ ⠸ auth-module 8%      │   painted directly into this same       │
+│   ├ ! tests    blocked 91%│   ratatui frame by ui/term_pane —       │
+│   └ ✓ docs             62%│   real color, real interaction          │
+│ ! refactor-api     blocked│   once focused (Ctrl-l)                 │
+├───────────────────────────┤                                         │
+│ task:   auth-module       │                                         │
+│ repo:   overseer          │                                         │
+│ branch: ovsr/a            │                                         │
+│ status: running           │                                         │
+│ ctx:    8%  █░░░░░░░      │                                         │
+└───────────────────────────┴─────────────────────────────────────────┘
+ OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  q quit
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; there is no second pane, no multiplexer, nothing external compositing the right side. `ui::term_pane` locks the selected agent's `alacritty_terminal::Term` (owned by `SessionManager`) and paints its grid cell-by-cell into that half of the buffer.
 
-Status badges: `●` running · `○` waiting · `◌` idle (spawned, nothing running there yet) · `✓` done · `✗` error · `…` spawning
+Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`, matching its badge); the name truncates with `…` to whatever width remains, computed by the pure `format_tree_row`/`truncate_with_ellipsis` helpers. The status bar shows "`N running`" normally, or "`N running · M blocked`" once any agent needs attention.
+
+Status badges: `●` running · `!` blocked (needs you — permission pending) · `◌` idle (finished responding / a not-yet-started root) · `✓` done (explicit push, or a clean PTY exit) · `✗` error (unexpected process exit) · `…` spawning
 
 **Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while a pane is focused (real Backspace still works: terminals send `DEL`, not `^H`).
 
@@ -167,14 +183,20 @@ Status badges: `●` running · `○` waiting · `◌` idle (spawned, nothing ru
 Root agent runs: overseer spawn --task "write tests" --adapter claude
 
 IPC server (spawn_blocking):
-  → AgentRegistry::register(child, parent=caller)   // rejects if caller is a child
-  → adapter = adapter_for(name)
+  → AgentRegistry::register(child, parent=caller, status=Spawning) // rejects if caller is a child
+  → adapter = adapter_for(name); command/extra_args resolved from config.adapters[name]
+  → LaunchContext.task = "write tests"
   → SessionManager::launch(agent_id, cwd=repo, adapter.spawn_command(ctx),
                            adapter.env_inject(ctx))
+      spawn_command: <command> <extra_args...> "write tests"   // task is the final positional arg
+      env_inject:    ...identity vars..., OVERSEER_TASK="write tests"
   → replies: {"agent_id": "..."}
 
-TUI re-renders with the new child visible under the parent. The child sets up its own
-branch/worktree on startup, per the Overseer skill.
+TUI re-renders with the new child visible under the parent, and the task text is
+already the child's initial prompt — it starts working immediately instead of
+sitting at a bare prompt. The child sets up its own branch/worktree on startup,
+per the overseer-child skill, and its own SessionStart hook flips it from
+Spawning to Running moments later.
 ```
 
 `overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it.
@@ -183,12 +205,11 @@ branch/worktree on startup, per the Overseer skill.
 
 ## Config
 
-`~/.config/overseer/config.toml`
+`~/.config/overseer/config.toml`. **Implemented:** `[defaults]` and `[adapters.*]` below — loaded once at TUI startup; a missing or invalid file silently falls back to the built-in default (`defaults.adapter = "claude"`, `adapters.claude = { command = "claude", extra_args = [] }`), never blocking startup. **Not implemented yet** (Phase 5b): `spawn_policy`, `[keybindings]`, theme.
 
 ```toml
 [defaults]
 adapter = "claude"
-spawn_policy = "auto"       # "auto" | "confirm"
 
 [adapters.claude]
 command = "claude"
@@ -197,12 +218,9 @@ extra_args = ["--dangerously-skip-permissions"]
 [adapters.aider]
 command = "aider"
 extra_args = []
-
-[keybindings]
-spawn_child = "s"
-spawn_root = "n"
-drop = "d"
 ```
+
+A child spawn resolves its `command`/`extra_args` from `config.adapters[name]`, not from the adapter name itself — this is what lets `--dangerously-skip-permissions`-style flags actually reach the launched process, and lets a user point "claude" at a custom binary or wrapper. An adapter name with no entry in `config.adapters` is the same `UnknownAdapter` error as a name with no `AgentAdapter` impl at all.
 
 ---
 
@@ -252,7 +270,7 @@ Implementation plans (`PHASE*.md`) and research notes live in **`.specs/`**, whi
 - **No MCP transport.** The choice of Unix socket + hooks is intentional — no token overhead, no plugin registry approval, works locally out of the box.
 - **Don't let children spawn children.** It's a hard server-side constraint, not a UI hint. A child calling `spawn` is rejected, full stop. The tree is exactly two levels: roots and their children.
 - **Don't hardcode adapter binary paths.** Always resolve through the adapter config so users can point to a custom binary or wrapper.
-- **Don't add agent status polling.** If hooks aren't firing, the fix is in `overseer teach` (the installed hooks), not in adding a background poller.
+- **Don't add agent status polling.** If hooks aren't firing, the fix is in `overseer install` (the installed hooks), not in adding a background poller.
 - **Don't reimplement git.** No worktree creation, no branching, no merging, no `git worktree` anywhere. Agents own their isolation. Overseer's only git use is read-only display info (repo name, current branch).
-- **Don't write into the user's repo.** All agent config (skill, hooks) is installed at the user level by `overseer teach`. Launch injects env only.
+- **Don't write into the user's repo.** All agent config (skill, hooks) is installed at the user level by `overseer install`. Launch injects env only.
 - **Don't skip the confirm prompt for `d`/`D`, or for quitting with agents registered.** Killing a running agent's session interrupts in-flight work — confirm first. v1 has no persistence, so quitting is exactly as destructive as a drop.
