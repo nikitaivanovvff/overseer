@@ -381,7 +381,7 @@ fn submit_input(app: &mut App, input: InputState) {
                 app.status_message = Some("spawn failed: parent no longer exists".to_string());
                 return;
             };
-            dispatch_and_report(app, Request::Spawn { parent_id, task, adapter: None, cwd: parent_cwd });
+            dispatch_and_report(app, Request::Spawn { parent_id, task, name: None, adapter: None, cwd: parent_cwd });
         }
     }
 }

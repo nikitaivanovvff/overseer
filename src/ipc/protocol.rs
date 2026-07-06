@@ -42,6 +42,13 @@ pub enum Request {
     Spawn {
         parent_id: AgentId,
         task: String,
+        /// Short tree-row label, distinct from `task` (which can be a whole
+        /// paragraph as the child's initial prompt). Absent or blank falls
+        /// back to using `task` verbatim as the name, same as before this
+        /// field existed. Display-only — never validated or truncated
+        /// server-side (the tree already truncates for rendering).
+        #[serde(default)]
+        name: Option<String>,
         adapter: Option<String>,
         cwd: std::path::PathBuf,
     },
@@ -379,14 +386,28 @@ mod tests {
         let req = Request::Spawn {
             parent_id: parent_id.clone(),
             task: "write tests".to_string(),
+            name: Some("write-tests".to_string()),
             adapter: Some("claude".to_string()),
             cwd: std::path::PathBuf::from("/repo"),
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"cmd\":\"spawn\""), "should serialize as 'spawn'");
         let back: Request = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Request::Spawn { task, parent_id: p, .. }
-            if task == "write tests" && p == parent_id));
+        assert!(matches!(back, Request::Spawn { task, parent_id: p, name: Some(n), .. }
+            if task == "write tests" && p == parent_id && n == "write-tests"));
+    }
+
+    #[test]
+    fn request_spawn_name_defaults_to_none_when_absent() {
+        // Older callers (or a hand-written request) may omit `name` entirely —
+        // it must deserialize as `None`, not fail to parse.
+        let parent_id = AgentId::new();
+        let raw = format!(
+            r#"{{"cmd":"spawn","parent_id":"{}","task":"write tests","adapter":null,"cwd":"/repo"}}"#,
+            parent_id.0
+        );
+        let req: Request = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(req, Request::Spawn { name: None, .. }));
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub struct SpawnRequest {
     pub role: AgentRole,
     pub parent_id: Option<AgentId>,
     pub task: String,
+    /// Child-only tree-row label, distinct from `task`. Ignored for a root
+    /// (still named after the repo — see `spawn_root_shell`). Absent or
+    /// blank falls back to `task` verbatim (`spawn_child_agent`).
+    pub name: Option<String>,
     pub adapter_name: String,
     pub cwd: PathBuf,
     pub repo: String,
@@ -127,9 +131,14 @@ fn spawn_child_agent(
         .get(&req.adapter_name)
         .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
 
+    let name = req
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| req.task.clone());
     let args = RegisterArgs {
         id: None,
-        name: req.task.clone(),
+        name,
         role: AgentRole::Child,
         parent_id: req.parent_id.clone(),
         adapter: req.adapter_name.clone(),
@@ -198,6 +207,7 @@ mod tests {
             role,
             parent_id,
             task: "do stuff".to_string(),
+            name: None,
             adapter_name: "claude".to_string(),
             cwd: PathBuf::from("/tmp"),
             repo: "overseer".to_string(),
@@ -249,6 +259,90 @@ mod tests {
             .unwrap();
         let dto = registry.get(&result.id).unwrap();
         assert_eq!(dto.name, "distinct-repo-name");
+    }
+
+    #[test]
+    fn spawn_agent_root_ignores_a_supplied_name_too() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let mut req = base_request(AgentRole::Root, None);
+        req.name = Some("should-be-ignored".to_string());
+        req.repo = "distinct-repo-name".to_string();
+        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
+            .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        assert_eq!(dto.name, "distinct-repo-name");
+    }
+
+    #[test]
+    fn spawn_agent_child_with_name_registers_that_name_not_the_task() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        let mut req = base_request(AgentRole::Child, Some(root.id));
+        req.task = "write unit tests for the login flow".to_string();
+        req.name = Some("login-tests".to_string());
+        let child = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
+            .unwrap();
+        let dto = registry.get(&child.id).unwrap();
+        assert_eq!(dto.name, "login-tests");
+    }
+
+    #[test]
+    fn spawn_agent_child_blank_name_falls_back_to_task() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        let mut req = base_request(AgentRole::Child, Some(root.id));
+        req.task = "fallback task text".to_string();
+        req.name = Some("   ".to_string());
+        let child = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
+            .unwrap();
+        let dto = registry.get(&child.id).unwrap();
+        assert_eq!(dto.name, "fallback task text");
+    }
+
+    #[test]
+    fn spawn_agent_child_absent_name_falls_back_to_task() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        // base_request already sets name: None — this documents that as the
+        // default fallback path, not just an implementation detail of the helper.
+        let child = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Child, Some(root.id)),
+        )
+        .unwrap();
+        let dto = registry.get(&child.id).unwrap();
+        assert_eq!(dto.name, "do stuff"); // base_request's task text
     }
 
     #[test]

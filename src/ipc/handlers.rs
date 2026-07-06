@@ -60,6 +60,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 role: AgentRole::Root,
                 parent_id: None,
                 task: String::new(),         // ignored for Root — no adapter is launched
+                name: None,                  // ignored for Root — always named after the repo
                 adapter_name: String::new(), // ignored for Root — always a bare shell
                 cwd,
                 repo,
@@ -75,7 +76,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             }
         }
 
-        Request::Spawn { parent_id, task, adapter, cwd } => {
+        Request::Spawn { parent_id, task, name, adapter, cwd } => {
             let adapter_name = adapter.unwrap_or_else(|| ctx.config.defaults.adapter.clone());
 
             let Some(parent) = ctx.registry.get(&parent_id) else {
@@ -91,6 +92,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 role: AgentRole::Child,
                 parent_id: Some(parent_id),
                 task,
+                name,
                 adapter_name,
                 cwd,
                 repo: parent.repo,
@@ -230,6 +232,7 @@ mod tests {
         let spawn_resp = dispatch(&ctx, Request::Spawn {
             parent_id: root_id,
             task: "my-agent".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -286,6 +289,7 @@ mod tests {
         let resp = dispatch(&ctx, Request::Spawn {
             parent_id: root_id.clone(),
             task: "write tests".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -301,6 +305,66 @@ mod tests {
         assert_eq!(agents.len(), 2);
     }
 
+    // ── child --name ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_spawn_with_name_registers_that_name_not_the_task() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "write unit tests for the login flow".to_string(),
+            name: Some("login-tests".to_string()),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        let agent_id = match resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        let dto = match dispatch(&ctx, Request::Agent { agent_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(dto.name, "login-tests");
+    }
+
+    #[test]
+    fn dispatch_spawn_with_blank_name_falls_back_to_task() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "fallback task".to_string(),
+            name: Some("   ".to_string()),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        let agent_id = match resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        let dto = match dispatch(&ctx, Request::Agent { agent_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(dto.name, "fallback task");
+    }
+
+    #[test]
+    fn dispatch_start_ignores_any_supplied_name_and_uses_the_repo() {
+        // Request::Start has no `name` field at all — this asserts the
+        // invariant a different way: the root is always named after the
+        // repo, never influenced by anything spawn-shaped.
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let dto = match dispatch(&ctx, Request::Agent { agent_id: root_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(dto.name, "test-repo"); // GitClient::dry_run
+    }
+
     #[test]
     fn dispatch_spawn_under_child_is_rejected() {
         let ctx = make_ctx();
@@ -308,6 +372,7 @@ mod tests {
         let spawn_resp = dispatch(&ctx, Request::Spawn {
             parent_id: root_id,
             task: "child task".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -320,6 +385,7 @@ mod tests {
         let resp = dispatch(&ctx, Request::Spawn {
             parent_id: child_id,
             task: "grandchild task".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -333,6 +399,7 @@ mod tests {
         let resp = dispatch(&ctx, Request::Spawn {
             parent_id: AgentId::new(),
             task: "task".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -358,6 +425,7 @@ mod tests {
         let spawn_resp = dispatch(&ctx, Request::Spawn {
             parent_id: root_id,
             task: "child task".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -400,6 +468,7 @@ mod tests {
         dispatch(&ctx, Request::Spawn {
             parent_id: root_a.clone(),
             task: "child-a".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });

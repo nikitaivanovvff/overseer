@@ -69,9 +69,13 @@ pub enum Command {
     /// Request a child agent. Caller identity comes from $OVERSEER_AGENT_ID — rejected
     /// if the caller is itself a child (flat tree: roots + children only).
     Spawn {
-        /// Task description — becomes the child's name in the TUI.
+        /// The child's entire initial prompt — as long as it needs to be.
         #[arg(long)]
         task: String,
+        /// Short tree-row label (1-3 words, kebab-case), distinct from
+        /// `--task`. Falls back to `--task` verbatim if omitted or blank.
+        #[arg(long)]
+        name: Option<String>,
         /// Adapter to use (default: claude).
         #[arg(long, default_value = "claude")]
         adapter: String,
@@ -195,7 +199,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
             Ok(Some(Request::Agent { agent_id }))
         }
         Command::Start { cwd } => Ok(Some(Request::Start { cwd })),
-        Command::Spawn { task, adapter } => {
+        Command::Spawn { task, name, adapter } => {
             let parent_id_str = std::env::var("OVERSEER_AGENT_ID").map_err(|_| {
                 anyhow::anyhow!("overseer spawn must be run from an agent session (missing $OVERSEER_AGENT_ID)")
             })?;
@@ -204,7 +208,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
             let cwd = std::env::current_dir()
                 .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
-            Ok(Some(Request::Spawn { parent_id, task, adapter: Some(adapter), cwd }))
+            Ok(Some(Request::Spawn { parent_id, task, name, adapter: Some(adapter), cwd }))
         }
         Command::Drop { id, recursive } => {
             let agent_id = id
@@ -263,7 +267,7 @@ mod tests {
     #[test]
     fn build_request_spawn_without_env_var_is_error() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
-        let cmd = Command::Spawn { task: "write tests".to_string(), adapter: "claude".to_string() };
+        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: "claude".to_string() };
         assert!(build_request(cmd).is_err());
     }
 
@@ -271,10 +275,23 @@ mod tests {
     fn build_request_spawn_with_env_var_returns_spawn() {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
-        let cmd = Command::Spawn { task: "write tests".to_string(), adapter: "claude".to_string() };
+        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: "claude".to_string() };
         let req = build_request(cmd).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { parent_id, task, .. }
             if parent_id == id && task == "write tests"));
+    }
+
+    #[test]
+    fn build_request_spawn_with_name_threads_it_through() {
+        let id = AgentId::new();
+        let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
+        let cmd = Command::Spawn {
+            task: "write unit tests for the login flow".to_string(),
+            name: Some("login-tests".to_string()),
+            adapter: "claude".to_string(),
+        };
+        let req = build_request(cmd).unwrap().unwrap();
+        assert!(matches!(req, Request::Spawn { name: Some(n), .. } if n == "login-tests"));
     }
 
     #[test]

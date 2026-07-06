@@ -70,12 +70,14 @@ mod tests {
         }
     }
 
-    /// Spawns a child via the real `Spawn` path — a child's name is its task
-    /// text, so this is how tests still get a recognizable, chosen name.
+    /// Spawns a child via the real `Spawn` path with no explicit `name` — a
+    /// child's name falls back to its task text, so this is how tests still
+    /// get a recognizable, chosen name.
     fn spawn_child(socket: &Path, parent_id: &AgentId, task: &str) -> (AgentId, String) {
         let resp = send(socket, Request::Spawn {
             parent_id: parent_id.clone(),
             task: task.to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });
@@ -322,6 +324,7 @@ mod tests {
         let resp = send(&socket, Request::Spawn {
             parent_id: AgentId::new(),
             task: "orphan".to_string(),
+            name: None,
             adapter: Some("claude".to_string()),
             cwd: PathBuf::from("/tmp"),
         });

@@ -326,6 +326,7 @@ mod tests {
                 role,
                 parent_id,
                 task: "task".to_string(),
+                name: None,
                 adapter_name: "claude".to_string(),
                 cwd: PathBuf::from("/tmp"),
                 repo: "overseer".to_string(),
