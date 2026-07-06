@@ -1,7 +1,6 @@
 //! Newline-delimited JSON wire protocol.
 //!
 //! One request line → one response line. Examples:
-//!   register: {"cmd":"register","id":null,"name":"my-task","role":"root","parent_id":null,"adapter":"claude","repo":"overseer"}
 //!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null,"context_pct":62}
 //!   list:     {"cmd":"list"}
 //!   agent:    {"cmd":"agent","agent_id":"<uuid>"}
@@ -17,14 +16,6 @@ use crate::agent::{AgentId, AgentRole, AgentStatus};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    Register {
-        id: Option<AgentId>,
-        name: String,
-        role: AgentRole,
-        parent_id: Option<AgentId>,
-        adapter: Option<String>,
-        repo: Option<String>,
-    },
     Status {
         agent_id: AgentId,
         status: AgentStatus,
@@ -135,21 +126,6 @@ mod tests {
         assert_eq!(s, r#"{"cmd":"list"}"#);
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::List));
-    }
-
-    #[test]
-    fn request_register_round_trip() {
-        let req = Request::Register {
-            id: None,
-            name: "my-task".to_string(),
-            role: AgentRole::Root,
-            parent_id: None,
-            adapter: Some("claude".to_string()),
-            repo: Some("overseer".to_string()),
-        };
-        let s = serde_json::to_string(&req).unwrap();
-        let back: Request = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Request::Register { name, .. } if name == "my-task"));
     }
 
     #[test]

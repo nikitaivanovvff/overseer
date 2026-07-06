@@ -24,7 +24,7 @@ mod session;
 mod settings;
 mod ui;
 
-use agent::{AgentId, AgentRegistry, AgentRole, AgentStatus, AgentTree};
+use agent::{AgentId, AgentRegistry, AgentStatus, AgentTree};
 use agent::adapters::{adapter_for, AgentAdapter, MergeStrategy};
 use agent::drop::drop_agent;
 use app::{App, ConfirmAction, ConfirmState, Focus, InputState, PendingAction};
@@ -47,18 +47,6 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    Register {
-        #[arg(long)]
-        role: RoleArg,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        parent_id: Option<String>,
-        #[arg(long, default_value = "claude")]
-        adapter: String,
-        #[arg(long, default_value = "overseer")]
-        repo: String,
-    },
     /// Push a status update. Agent identity comes from $OVERSEER_AGENT_ID.
     /// When $OVERSEER_AGENT_ID is unset (non-Overseer session), exits 0 silently.
     Status {
@@ -116,12 +104,6 @@ enum Command {
     },
 }
 
-#[derive(Clone, clap::ValueEnum)]
-enum RoleArg {
-    Root,
-    Child,
-}
-
 /// Pushable statuses only — `Spawning` is set at registration time, never
 /// pushed by a hook or agent.
 #[derive(Clone, clap::ValueEnum)]
@@ -131,15 +113,6 @@ enum StatusArg {
     Blocked,
     Done,
     Error,
-}
-
-impl From<RoleArg> for AgentRole {
-    fn from(r: RoleArg) -> Self {
-        match r {
-            RoleArg::Root => AgentRole::Root,
-            RoleArg::Child => AgentRole::Child,
-        }
-    }
 }
 
 impl From<StatusArg> for AgentStatus {
@@ -391,23 +364,6 @@ fn classify_hook_status(status: AgentStatus, payload: Option<&agent::hook::HookP
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 fn build_request(cmd: Command) -> Result<Option<Request>> {
     match cmd {
-        Command::Register { role, name, parent_id, adapter, repo } => {
-            let parent_id = match parent_id {
-                Some(s) => Some(
-                    s.parse::<AgentId>()
-                        .map_err(|e| anyhow::anyhow!("invalid --parent-id: {e}"))?,
-                ),
-                None => None,
-            };
-            Ok(Some(Request::Register {
-                id: None,
-                name,
-                role: role.into(),
-                parent_id,
-                adapter: Some(adapter),
-                repo: Some(repo),
-            }))
-        }
         Command::Status { status, message, from_hook } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
                 Ok(s) => s,
@@ -782,7 +738,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentId;
+    use crate::agent::{AgentId, AgentRole};
 
     #[test]
     fn build_request_status_no_env_var_returns_none() {

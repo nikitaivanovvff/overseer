@@ -50,7 +50,7 @@ overseer (binary)
 ├── git/              Read-only git info via CLI (repo name, current branch) — no worktrees
 ├── ipc/              Unix socket server (tokio, newline-delimited JSON)
 │   ├── server        Binds to $OVERSEER_SOCKET, accepts connections; session-exit watcher
-│   ├── handlers      dispatch: register, status, list, agent, start, spawn
+│   ├── handlers      dispatch: status, list, agent, start, spawn, drop
 │   ├── protocol      Request / Response / AgentDto wire types (serde)
 │   └── client        One-shot sync client used by CLI subcommands
 └── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters}.
@@ -70,7 +70,6 @@ Unix domain socket at `/tmp/overseer-<session-id>.sock`. The only channel agents
 |---------|------|-------------|
 | `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. `teach` is a hidden alias. |
 | `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
-| `overseer register` | `--role --parent-id? --adapter` | Called once on agent startup (usually wired via env, not by hand) |
 | `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context %. |
 | `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. The task text becomes the child's initial prompt, not just its tree-row name. |
 | `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. |

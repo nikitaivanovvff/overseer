@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::agent::drop::drop_agent;
 use crate::agent::spawn::{spawn_agent, SpawnRequest};
-use crate::agent::{AgentRegistry, AgentRole, AgentStatus, RegisterArgs};
+use crate::agent::{AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::GitClient;
 use crate::ipc::protocol::{OkBody, Request, Response};
@@ -27,30 +27,6 @@ pub struct AppCtx {
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
 pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     match req {
-        Request::Register { id, name, role, parent_id, adapter, repo } => {
-            let args = RegisterArgs {
-                id,
-                name,
-                role,
-                parent_id,
-                adapter: adapter.unwrap_or_else(|| "claude".to_string()),
-                repo: repo.unwrap_or_else(|| "overseer".to_string()),
-                cwd: PathBuf::from("."),
-                branch: None,
-                // Request::Register is a defined-but-currently-unused primitive
-                // (no hook or caller invokes it today) — Running matches the
-                // pre-existing hardcoded behavior it's replacing.
-                initial_status: AgentStatus::Running,
-            };
-            match ctx.registry.register(args) {
-                Ok(result) => Response::ok(Some(OkBody::Registered {
-                    agent_id: result.id,
-                    branch: result.branch,
-                })),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
-
         Request::Status { agent_id, status, message, context_pct } => {
             match ctx.registry.set_status(&agent_id, status, message, context_pct) {
                 Ok(()) => Response::ok(None),
@@ -135,7 +111,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRole, AgentStatus};
+    use crate::agent::{AgentId, AgentStatus};
     use crate::git::GitClient;
     use crate::ipc::protocol::{OkBody, Request};
     use crate::session::SessionManager;
@@ -150,38 +126,6 @@ mod tests {
             config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
         }
-    }
-
-    #[test]
-    fn dispatch_register_root_succeeds() {
-        let ctx = make_ctx();
-        let req = Request::Register {
-            id: None,
-            name: "my-task".to_string(),
-            role: AgentRole::Root,
-            parent_id: None,
-            adapter: None,
-            repo: None,
-        };
-        let resp = dispatch(&ctx, req);
-        assert!(resp.ok);
-        assert!(matches!(resp.data, Some(OkBody::Registered { branch, .. }) if branch == "main"));
-    }
-
-    #[test]
-    fn dispatch_register_child_unknown_parent_is_error() {
-        let ctx = make_ctx();
-        let req = Request::Register {
-            id: None,
-            name: "child".to_string(),
-            role: AgentRole::Child,
-            parent_id: Some(AgentId::new()),
-            adapter: None,
-            repo: None,
-        };
-        let resp = dispatch(&ctx, req);
-        assert!(!resp.ok);
-        assert!(resp.error.is_some());
     }
 
     #[test]
@@ -200,19 +144,7 @@ mod tests {
     #[test]
     fn dispatch_status_known_agent_succeeds() {
         let ctx = make_ctx();
-        let register_req = Request::Register {
-            id: None,
-            name: "agent".to_string(),
-            role: AgentRole::Root,
-            parent_id: None,
-            adapter: None,
-            repo: None,
-        };
-        let register_resp = dispatch(&ctx, register_req);
-        let agent_id = match register_resp.data {
-            Some(OkBody::Registered { agent_id, .. }) => agent_id,
-            _ => panic!("expected Registered"),
-        };
+        let agent_id = start_root(&ctx);
 
         let status_req = Request::Status {
             agent_id: agent_id.clone(),
@@ -229,10 +161,7 @@ mod tests {
     #[test]
     fn dispatch_list_returns_agents() {
         let ctx = make_ctx();
-        dispatch(&ctx, Request::Register {
-            id: None, name: "a".to_string(), role: AgentRole::Root,
-            parent_id: None, adapter: None, repo: None,
-        });
+        start_root(&ctx);
         let resp = dispatch(&ctx, Request::List);
         assert!(resp.ok);
         assert!(matches!(resp.data, Some(OkBody::Agents { agents }) if agents.len() == 1));
@@ -248,13 +177,18 @@ mod tests {
     #[test]
     fn dispatch_agent_known_id_returns_dto() {
         let ctx = make_ctx();
-        let register_resp = dispatch(&ctx, Request::Register {
-            id: None, name: "my-agent".to_string(), role: AgentRole::Root,
-            parent_id: None, adapter: None, repo: None,
+        let root_id = start_root(&ctx);
+        // Children are named after their task text, so spawn one to control
+        // the name (Start's dry-run GitClient always names the root "test-repo").
+        let spawn_resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "my-agent".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
         });
-        let agent_id = match register_resp.data {
+        let agent_id = match spawn_resp.data {
             Some(OkBody::Registered { agent_id, .. }) => agent_id,
-            _ => panic!("expected Registered"),
+            other => panic!("expected Registered, got {other:?}"),
         };
 
         let resp = dispatch(&ctx, Request::Agent { agent_id });

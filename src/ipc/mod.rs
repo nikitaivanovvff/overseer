@@ -23,11 +23,11 @@ pub fn serve_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+    use crate::agent::{AgentId, AgentRegistry, AgentStatus};
     use crate::git::GitClient;
     use crate::ipc::protocol::{OkBody, Request, Response};
     use crate::session::SessionManager;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -57,32 +57,28 @@ mod tests {
         client::send(socket, &req).expect("IPC send failed")
     }
 
-    fn register_root(socket: &Path, name: &str) -> AgentId {
-        let resp = send(socket, Request::Register {
-            id: None,
-            name: name.to_string(),
-            role: AgentRole::Root,
-            parent_id: None,
-            adapter: Some("claude".to_string()),
-            repo: Some("overseer".to_string()),
-        });
-        assert!(resp.ok, "register root failed: {:?}", resp.error);
+    /// Registers a root via the real `Start` path (`GitClient::dry_run` always
+    /// names it "test-repo" — there's no `Register` primitive left to pick an
+    /// arbitrary root name).
+    fn start_root(socket: &Path) -> AgentId {
+        let resp = send(socket, Request::Start { cwd: None });
+        assert!(resp.ok, "start root failed: {:?}", resp.error);
         match resp.data {
             Some(OkBody::Registered { agent_id, .. }) => agent_id,
             other => panic!("expected Registered, got {other:?}"),
         }
     }
 
-    fn register_child(socket: &Path, name: &str, parent_id: &AgentId) -> (AgentId, String) {
-        let resp = send(socket, Request::Register {
-            id: None,
-            name: name.to_string(),
-            role: AgentRole::Child,
-            parent_id: Some(parent_id.clone()),
+    /// Spawns a child via the real `Spawn` path — a child's name is its task
+    /// text, so this is how tests still get a recognizable, chosen name.
+    fn spawn_child(socket: &Path, parent_id: &AgentId, task: &str) -> (AgentId, String) {
+        let resp = send(socket, Request::Spawn {
+            parent_id: parent_id.clone(),
+            task: task.to_string(),
             adapter: Some("claude".to_string()),
-            repo: Some("overseer".to_string()),
+            cwd: PathBuf::from("/tmp"),
         });
-        assert!(resp.ok, "register child failed: {:?}", resp.error);
+        assert!(resp.ok, "spawn child failed: {:?}", resp.error);
         match resp.data {
             Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
             other => panic!("expected Registered, got {other:?}"),
@@ -92,10 +88,10 @@ mod tests {
     // ── smoke test ────────────────────────────────────────────────────────────
 
     #[test]
-    fn integration_register_and_list() {
+    fn integration_start_and_list() {
         let socket = start_server();
 
-        let root_id = register_root(&socket, "integration-agent");
+        let root_id = start_root(&socket);
 
         let list_resp = send(&socket, Request::List);
         assert!(list_resp.ok);
@@ -103,7 +99,7 @@ mod tests {
             Some(OkBody::Agents { agents }) => {
                 assert_eq!(agents.len(), 1);
                 assert_eq!(agents[0].id, root_id);
-                assert_eq!(agents[0].name, "integration-agent");
+                assert_eq!(agents[0].name, "test-repo"); // GitClient::dry_run
             }
             other => panic!("expected Agents, got {other:?}"),
         }
@@ -118,8 +114,8 @@ mod tests {
     fn lifecycle_root_and_child_hierarchy() {
         let socket = start_server();
 
-        let root_id = register_root(&socket, "implement-auth");
-        let (child_id, child_branch) = register_child(&socket, "auth-module", &root_id);
+        let root_id = start_root(&socket);
+        let (child_id, child_branch) = spawn_child(&socket, &root_id, "auth-module");
 
         assert!(child_branch.starts_with("overseer/"), "child branch should be overseer/<id>");
 
@@ -133,7 +129,7 @@ mod tests {
         assert_eq!(agents.len(), 2);
 
         let root_dto = agents.iter().find(|a| a.id == root_id).expect("root missing from list");
-        assert_eq!(root_dto.branch, "main");
+        assert_eq!(root_dto.branch, "test-branch"); // GitClient::dry_run
         assert!(root_dto.parent_id.is_none(), "root should have no parent");
 
         let child_dto = agents.iter().find(|a| a.id == child_id).expect("child missing from list");
@@ -147,15 +143,19 @@ mod tests {
     fn lifecycle_status_updates_visible() {
         let socket = start_server();
 
-        let root_id = register_root(&socket, "refactor-api");
-        let (child_id, _) = register_child(&socket, "update-tests", &root_id);
+        let root_id = start_root(&socket);
+        let (child_id, _) = spawn_child(&socket, &root_id, "update-tests");
 
-        // Both start as Running (default).
+        // Root starts Idle (bare shell, nothing run yet); child starts Spawning
+        // (session launching, not yet reporting).
         let agents = match send(&socket, Request::List).data {
             Some(OkBody::Agents { agents }) => agents,
             _ => panic!(),
         };
-        assert!(agents.iter().all(|a| a.status == AgentStatus::Running));
+        let root = agents.iter().find(|a| a.id == root_id).unwrap();
+        assert_eq!(root.status, AgentStatus::Idle);
+        let child = agents.iter().find(|a| a.id == child_id).unwrap();
+        assert_eq!(child.status, AgentStatus::Spawning);
 
         // Child moves to Blocked.
         let resp = send(&socket, Request::Status {
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn lifecycle_context_pct_persists_across_updates_without_it() {
         let socket = start_server();
-        let root_id = register_root(&socket, "long-task");
+        let root_id = start_root(&socket);
 
         let resp = send(&socket, Request::Status {
             agent_id: root_id.clone(),
@@ -245,10 +245,10 @@ mod tests {
     fn lifecycle_multiple_children() {
         let socket = start_server();
 
-        let root_id = register_root(&socket, "big-feature");
-        let (child_a, _) = register_child(&socket, "task-a", &root_id);
-        let (child_b, _) = register_child(&socket, "task-b", &root_id);
-        let (child_c, _) = register_child(&socket, "task-c", &root_id);
+        let root_id = start_root(&socket);
+        let (child_a, _) = spawn_child(&socket, &root_id, "task-a");
+        let (child_b, _) = spawn_child(&socket, &root_id, "task-b");
+        let (child_c, _) = spawn_child(&socket, &root_id, "task-c");
 
         let agents = match send(&socket, Request::List).data {
             Some(OkBody::Agents { agents }) => agents,
@@ -264,33 +264,24 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
-    /// get returns the right agent and carries correct adapter/repo/branch.
+    /// get returns the right agent and carries correct name/adapter/repo/branch.
     #[test]
     fn lifecycle_get_returns_full_detail() {
         let socket = start_server();
 
-        let resp = send(&socket, Request::Register {
-            id: None,
-            name: "my-task".to_string(),
-            role: AgentRole::Root,
-            parent_id: None,
-            adapter: Some("aider".to_string()),
-            repo: Some("my-repo".to_string()),
-        });
-        let root_id = match resp.data {
-            Some(OkBody::Registered { agent_id, .. }) => agent_id,
-            _ => panic!(),
-        };
+        let root_id = start_root(&socket);
+        let (child_id, child_branch) = spawn_child(&socket, &root_id, "my-task");
 
-        let dto = match send(&socket, Request::Agent { agent_id: root_id }).data {
+        let dto = match send(&socket, Request::Agent { agent_id: child_id }).data {
             Some(OkBody::Agent { agent }) => agent,
             other => panic!("expected Agent, got {other:?}"),
         };
         assert_eq!(dto.name, "my-task");
-        assert_eq!(dto.adapter, "aider");
-        assert_eq!(dto.repo, "my-repo");
-        assert_eq!(dto.branch, "main");
-        assert_eq!(dto.status, AgentStatus::Running);
+        assert_eq!(dto.adapter, "claude");
+        assert_eq!(dto.repo, "test-repo"); // inherited from the parent root (GitClient::dry_run)
+        assert_eq!(dto.branch, child_branch);
+        assert!(dto.branch.starts_with("overseer/"));
+        assert_eq!(dto.status, AgentStatus::Spawning);
 
         let _ = std::fs::remove_file(&socket);
     }
@@ -327,16 +318,14 @@ mod tests {
     fn lifecycle_error_child_with_unknown_parent() {
         let socket = start_server();
 
-        let resp = send(&socket, Request::Register {
-            id: None,
-            name: "orphan".to_string(),
-            role: AgentRole::Child,
-            parent_id: Some(AgentId::new()),
-            adapter: None,
-            repo: None,
+        let resp = send(&socket, Request::Spawn {
+            parent_id: AgentId::new(),
+            task: "orphan".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
         });
         assert!(!resp.ok);
-        assert!(resp.error.as_deref().unwrap_or("").contains("unknown parent"));
+        assert!(resp.error.as_deref().unwrap_or("").contains("unknown agent"));
 
         let _ = std::fs::remove_file(&socket);
     }
