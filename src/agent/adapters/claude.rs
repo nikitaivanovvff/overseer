@@ -227,6 +227,12 @@ mod tests {
     }
 
     #[test]
+    fn root_skill_documents_the_name_flag_for_short_kebab_labels() {
+        assert!(ROOT_SKILL_CONTENT.contains("--name"));
+        assert!(ROOT_SKILL_CONTENT.contains("kebab-case"));
+    }
+
+    #[test]
     fn child_skill_documents_overseer_task_and_done_status() {
         assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
         assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));

@@ -10,13 +10,23 @@ You are the root agent for this repository, running inside Overseer.
 Delegate a parallelizable sub-task by running:
 
 ```
-overseer spawn --task "<full, self-contained task description>" [--adapter claude]
+overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude]
 ```
 
-The task text **is the child's entire initial prompt** — it must carry all the
-context the child needs to work independently, since there is no back-and-forth
-before it starts. It also becomes the child's row name in the tree, so keep it
-short enough to recognize at a glance while still being complete.
+`--name` and `--task` serve two different audiences, so keep their lengths
+different too:
+
+- `--name` is the tree label **you** scan when checking on the fleet — 1-3
+  words, kebab-case, derived from the task (`auth-module`, `login-tests`,
+  `fix-flaky-ci`). Pick it yourself; Overseer never generates one.
+- `--task` **is the child's entire initial prompt** — it must carry all the
+  context the child needs to work independently, since there is no
+  back-and-forth before it starts. Write it as long as it needs to be; it no
+  longer doubles as the display name.
+
+If you omit `--name`, the tree falls back to showing the task text itself —
+fine for a short task, unreadable for a paragraph-length one. Always pass
+`--name` for anything non-trivial.
 
 ## Monitoring children
 
