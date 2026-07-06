@@ -170,18 +170,7 @@ fn collect_dtos(
     parent_id: Option<AgentId>,
     result: &mut Vec<crate::ipc::protocol::AgentDto>,
 ) {
-    result.push(crate::ipc::protocol::AgentDto {
-        id: node.id.clone(),
-        name: node.name.clone(),
-        status: node.status.clone(),
-        role: node.role.clone(),
-        parent_id: parent_id.clone(),
-        adapter: node.adapter.clone(),
-        repo: node.repo.clone(),
-        branch: node.branch.clone(),
-        cwd: node.cwd.clone(),
-        context_pct: node.context_pct,
-    });
+    result.push(crate::ipc::protocol::AgentDto::from_node(node, parent_id));
     for child in &node.children {
         collect_dtos(child, Some(node.id.clone()), result);
     }
@@ -194,18 +183,7 @@ fn find_dto(
 ) -> Option<crate::ipc::protocol::AgentDto> {
     for node in nodes {
         if node.id == *target {
-            return Some(crate::ipc::protocol::AgentDto {
-                id: node.id.clone(),
-                name: node.name.clone(),
-                status: node.status.clone(),
-                role: node.role.clone(),
-                parent_id: parent_id.cloned(),
-                adapter: node.adapter.clone(),
-                repo: node.repo.clone(),
-                branch: node.branch.clone(),
-                cwd: node.cwd.clone(),
-                context_pct: node.context_pct,
-            });
+            return Some(crate::ipc::protocol::AgentDto::from_node(node, parent_id.cloned()));
         }
         if let Some(found) = find_dto(&node.children, target, Some(&node.id)) {
             return Some(found);

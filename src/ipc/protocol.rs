@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentId, AgentRole, AgentStatus};
+use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -65,6 +65,23 @@ pub struct AgentDto {
     pub branch: String,
     pub cwd: std::path::PathBuf,
     pub context_pct: Option<u8>,
+}
+
+impl AgentDto {
+    pub fn from_node(node: &AgentNode, parent_id: Option<AgentId>) -> Self {
+        Self {
+            id: node.id.clone(),
+            name: node.name.clone(),
+            status: node.status.clone(),
+            role: node.role.clone(),
+            parent_id,
+            adapter: node.adapter.clone(),
+            repo: node.repo.clone(),
+            branch: node.branch.clone(),
+            cwd: node.cwd.clone(),
+            context_pct: node.context_pct,
+        }
+    }
 }
 
 /// Response envelope.

@@ -25,39 +25,3 @@ pub struct AgentNode {
     pub children: Vec<AgentNode>,
     pub expanded: bool,
 }
-
-impl AgentNode {
-    pub fn new_root(name: impl Into<String>, repo: impl Into<String>) -> Self {
-        Self {
-            id: AgentId::new(),
-            name: name.into(),
-            status: AgentStatus::Running,
-            role: AgentRole::Root,
-            repo: repo.into(),
-            branch: "main".to_string(),
-            adapter: "claude".to_string(),
-            cwd: PathBuf::from("."),
-            context_pct: None,
-            children: Vec::new(),
-            expanded: true,
-        }
-    }
-
-    pub fn new_child(name: impl Into<String>, repo: impl Into<String>) -> Self {
-        let id = AgentId::new();
-        let branch = format!("overseer/{}", id.short());
-        Self {
-            id,
-            name: name.into(),
-            status: AgentStatus::Running,
-            role: AgentRole::Child,
-            repo: repo.into(),
-            branch,
-            adapter: "claude".to_string(),
-            cwd: PathBuf::from("."),
-            context_pct: None,
-            children: Vec::new(),
-            expanded: true,
-        }
-    }
-}

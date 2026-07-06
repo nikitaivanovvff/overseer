@@ -17,6 +17,31 @@ use crate::session::SessionManager;
 pub use term_pane::render_term_pane;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// One glyph representing `status`, used both as the tree-row badge and (for
+/// non-`Running` statuses) in place of the animated spinner.
+pub(crate) fn status_badge(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Spawning => "…",
+        AgentStatus::Running => "●",
+        AgentStatus::Blocked => "!",
+        AgentStatus::Idle => "◌",
+        AgentStatus::Done => "✓",
+        AgentStatus::Error => "✗",
+    }
+}
+
+/// The color/weight `status` renders with, wherever it appears in the UI.
+pub(crate) fn status_style(status: &AgentStatus) -> Style {
+    match status {
+        AgentStatus::Spawning => Style::default().fg(Color::Cyan),
+        AgentStatus::Running => Style::default().fg(Color::Green),
+        AgentStatus::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        AgentStatus::Idle => Style::default().fg(Color::DarkGray),
+        AgentStatus::Done => Style::default().fg(Color::Blue),
+        AgentStatus::Error => Style::default().fg(Color::Red),
+    }
+}
 /// Width of the tree column as a percentage of the full window — the pane
 /// takes the rest.
 const TREE_COLUMN_PCT: u16 = 25;
@@ -140,7 +165,7 @@ fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'s
         let frame = (tick as usize / 2) % SPINNER_FRAMES.len();
         SPINNER_FRAMES[frame].to_string()
     } else {
-        node.status.badge().to_string()
+        status_badge(&node.status).to_string()
     };
 
     // prefix + badge (always 1 column wide) + the space separating badge from name.
@@ -151,19 +176,19 @@ fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'s
         .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
         .max(1);
 
-    let status_style = if node.status == AgentStatus::Blocked {
-        node.status.style()
+    let row_status_style = if node.status == AgentStatus::Blocked {
+        status_style(&node.status)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
-        Span::styled(badge, node.status.style()),
+        Span::styled(badge, status_style(&node.status)),
         Span::raw(" "),
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
-        Span::styled(layout.status_word, status_style),
+        Span::styled(layout.status_word, row_status_style),
         Span::styled(layout.pct_suffix, Style::default().fg(Color::DarkGray)),
     ])
 }
@@ -227,7 +252,7 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
             ]),
             Line::from(vec![
                 Span::styled("status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.status.label(), node.status.style()),
+                Span::styled(node.status.label(), status_style(&node.status)),
             ]),
             Line::from(vec![
                 Span::styled("repo:   ", Style::default().fg(Color::DarkGray)),
@@ -305,7 +330,7 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
             format!("{running}/{total} running")
         };
         let counts_style = if blocked > 0 {
-            AgentStatus::Blocked.style()
+            status_style(&AgentStatus::Blocked)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -408,6 +433,24 @@ fn focused_border(focused: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── status_badge / status_style ──────────────────────────────────────────
+
+    #[test]
+    fn idle_has_distinct_badge_and_style() {
+        assert_eq!(status_badge(&AgentStatus::Idle), "◌");
+        assert_eq!(status_style(&AgentStatus::Idle), Style::default().fg(Color::DarkGray));
+        assert_ne!(status_badge(&AgentStatus::Idle), status_badge(&AgentStatus::Blocked));
+    }
+
+    #[test]
+    fn blocked_is_red_and_bold() {
+        assert_eq!(status_badge(&AgentStatus::Blocked), "!");
+        assert_eq!(
+            status_style(&AgentStatus::Blocked),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+    }
 
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
 

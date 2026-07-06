@@ -1,4 +1,3 @@
-use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,17 +20,6 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn badge(&self) -> &'static str {
-        match self {
-            Self::Spawning => "…",
-            Self::Running => "●",
-            Self::Blocked => "!",
-            Self::Idle => "◌",
-            Self::Done => "✓",
-            Self::Error => "✗",
-        }
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Self::Spawning => "spawning",
@@ -42,17 +30,6 @@ impl AgentStatus {
             Self::Error => "error",
         }
     }
-
-    pub fn style(&self) -> Style {
-        match self {
-            Self::Spawning => Style::default().fg(Color::Cyan),
-            Self::Running => Style::default().fg(Color::Green),
-            Self::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Self::Idle => Style::default().fg(Color::DarkGray),
-            Self::Done => Style::default().fg(Color::Blue),
-            Self::Error => Style::default().fg(Color::Red),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -60,27 +37,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idle_has_distinct_badge_label_and_style() {
-        assert_eq!(AgentStatus::Idle.badge(), "◌");
+    fn idle_and_blocked_have_distinct_labels() {
         assert_eq!(AgentStatus::Idle.label(), "idle");
-        assert_eq!(AgentStatus::Idle.style(), Style::default().fg(Color::DarkGray));
-        assert_ne!(AgentStatus::Idle.badge(), AgentStatus::Blocked.badge());
+        assert_eq!(AgentStatus::Blocked.label(), "blocked");
         assert_ne!(AgentStatus::Idle.label(), AgentStatus::Blocked.label());
     }
 
     #[test]
     fn idle_serializes_snake_case() {
         assert_eq!(serde_json::to_string(&AgentStatus::Idle).unwrap(), "\"idle\"");
-    }
-
-    #[test]
-    fn blocked_is_red_and_bold() {
-        assert_eq!(AgentStatus::Blocked.badge(), "!");
-        assert_eq!(AgentStatus::Blocked.label(), "blocked");
-        assert_eq!(
-            AgentStatus::Blocked.style(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        );
     }
 
     #[test]

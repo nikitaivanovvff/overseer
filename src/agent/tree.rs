@@ -1,4 +1,44 @@
+use std::path::PathBuf;
+
 use super::{AgentId, AgentNode, AgentRole, AgentStatus};
+
+/// Mock/test-only constructor for a root node. Real registration always goes
+/// through `AgentRegistry::register` — this exists purely for `with_mock_data`
+/// and unit tests that need a node without going through the registry.
+fn mock_root(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
+    AgentNode {
+        id: AgentId::new(),
+        name: name.into(),
+        status: AgentStatus::Running,
+        role: AgentRole::Root,
+        repo: repo.into(),
+        branch: "main".to_string(),
+        adapter: "claude".to_string(),
+        cwd: PathBuf::from("."),
+        context_pct: None,
+        children: Vec::new(),
+        expanded: true,
+    }
+}
+
+/// Mock/test-only constructor for a child node. See `mock_root`.
+fn mock_child(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
+    let id = AgentId::new();
+    let branch = format!("overseer/{}", id.short());
+    AgentNode {
+        id,
+        name: name.into(),
+        status: AgentStatus::Running,
+        role: AgentRole::Child,
+        repo: repo.into(),
+        branch,
+        adapter: "claude".to_string(),
+        cwd: PathBuf::from("."),
+        context_pct: None,
+        children: Vec::new(),
+        expanded: true,
+    }
+}
 
 /// A flattened snapshot of one AgentNode for rendering and navigation.
 /// `prefix` is the pre-computed tree-connector string (e.g. "│ ├ ") — it
@@ -123,7 +163,9 @@ impl AgentTree {
         if let Some(node) = flat.get(self.cursor) {
             if node.has_children {
                 let id = node.id.clone();
-                toggle_expand_by_id(&mut self.roots, &id);
+                if let Some(node) = self.find_mut(&id) {
+                    node.expanded = !node.expanded;
+                }
                 let new_count = self.flatten().len();
                 self.cursor = self.cursor.min(new_count.saturating_sub(1));
             }
@@ -135,17 +177,17 @@ impl AgentTree {
     }
 
     pub fn with_mock_data() -> Self {
-        let mut root1 = AgentNode::new_root("implement-auth", "overseer");
+        let mut root1 = mock_root("implement-auth", "overseer");
         root1.context_pct = Some(45);
 
-        let mut child_a = AgentNode::new_child("auth-module", "overseer");
+        let mut child_a = mock_child("auth-module", "overseer");
         child_a.context_pct = Some(23);
 
-        let mut child_b = AgentNode::new_child("write-tests", "overseer");
+        let mut child_b = mock_child("write-tests", "overseer");
         child_b.status = AgentStatus::Done;
         child_b.context_pct = Some(87);
 
-        let mut child_c = AgentNode::new_child("update-docs", "overseer");
+        let mut child_c = mock_child("update-docs", "overseer");
         child_c.status = AgentStatus::Blocked;
         child_c.context_pct = Some(5);
 
@@ -153,10 +195,10 @@ impl AgentTree {
         root1.children.push(child_b);
         root1.children.push(child_c);
 
-        let mut root2 = AgentNode::new_root("refactor-api", "overseer");
+        let mut root2 = mock_root("refactor-api", "overseer");
         root2.status = AgentStatus::Blocked;
 
-        let mut root3 = AgentNode::new_root("fix-login-bug", "overseer");
+        let mut root3 = mock_root("fix-login-bug", "overseer");
         root3.status = AgentStatus::Error;
         root3.context_pct = Some(62);
 
@@ -262,19 +304,6 @@ fn remove_descendant(nodes: &mut Vec<AgentNode>, id: &AgentId) -> bool {
     false
 }
 
-fn toggle_expand_by_id(nodes: &mut [AgentNode], target: &AgentId) -> bool {
-    for node in nodes.iter_mut() {
-        if &node.id == target {
-            node.expanded = !node.expanded;
-            return true;
-        }
-        if toggle_expand_by_id(&mut node.children, target) {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,11 +312,11 @@ mod tests {
     // depth > 1. The two-level constraint is enforced in the Phase 4 `spawn` handler,
     // not at the model level, so this fixture is valid for testing the traversal.
     fn make_tree() -> AgentTree {
-        let mut root = AgentNode::new_root("root", "repo");
-        let mut child_a = AgentNode::new_child("child-a", "repo");
-        let grandchild = AgentNode::new_child("grandchild", "repo");
+        let mut root = mock_root("root", "repo");
+        let mut child_a = mock_child("child-a", "repo");
+        let grandchild = mock_child("grandchild", "repo");
         child_a.children.push(grandchild);
-        let child_b = AgentNode::new_child("child-b", "repo");
+        let child_b = mock_child("child-b", "repo");
         root.children.push(child_a);
         root.children.push(child_b);
         let mut tree = AgentTree::new();
@@ -304,7 +333,7 @@ mod tests {
     #[test]
     fn test_flatten_single_root_no_prefix() {
         let mut tree = AgentTree::new();
-        tree.add_root(AgentNode::new_root("root", "repo"));
+        tree.add_root(mock_root("root", "repo"));
         let flat = tree.flatten();
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].prefix, "");
@@ -342,15 +371,15 @@ mod tests {
         // Regression for child_indent depth==0 bug: children of a non-last root
         // must receive "│ " child_indent so their subtrees show the continuation bar.
         let mut tree = AgentTree::new();
-        let mut root1 = AgentNode::new_root("root1", "repo");
-        let child = AgentNode::new_child("child", "repo");
-        let mut child_with_kids = AgentNode::new_child("child-with-kids", "repo");
+        let mut root1 = mock_root("root1", "repo");
+        let child = mock_child("child", "repo");
+        let mut child_with_kids = mock_child("child-with-kids", "repo");
         // Give child-with-kids its own child so we can check grand-indent.
-        let grandchild = AgentNode::new_child("grandchild", "repo");
+        let grandchild = mock_child("grandchild", "repo");
         child_with_kids.children.push(grandchild);
         root1.children.push(child);
         root1.children.push(child_with_kids);
-        let root2 = AgentNode::new_root("root2", "repo");
+        let root2 = mock_root("root2", "repo");
         tree.add_root(root1);
         tree.add_root(root2);
 
@@ -365,7 +394,7 @@ mod tests {
     fn test_flatten_collapsed_hides_children() {
         let mut tree = make_tree();
         let child_a_id = tree.flatten()[1].id.clone();
-        toggle_expand_by_id(&mut tree.roots, &child_a_id);
+        tree.find_mut(&child_a_id).unwrap().expanded = false;
         let flat = tree.flatten();
         assert_eq!(flat.len(), 3);
         assert_eq!(flat[0].name, "root");
@@ -376,8 +405,8 @@ mod tests {
     #[test]
     fn test_flatten_multiple_roots() {
         let mut tree = AgentTree::new();
-        tree.add_root(AgentNode::new_root("root1", "repo"));
-        tree.add_root(AgentNode::new_root("root2", "repo"));
+        tree.add_root(mock_root("root1", "repo"));
+        tree.add_root(mock_root("root2", "repo"));
         let flat = tree.flatten();
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].name, "root1");
@@ -468,7 +497,7 @@ mod tests {
         let mut tree = make_tree();
         tree.cursor = 2;
         let child_a_id = tree.flatten()[1].id.clone();
-        toggle_expand_by_id(&mut tree.roots, &child_a_id);
+        tree.find_mut(&child_a_id).unwrap().expanded = false;
         let new_count = tree.flatten().len();
         tree.cursor = tree.cursor.min(new_count.saturating_sub(1));
         assert!(tree.cursor < tree.flatten().len());
@@ -538,11 +567,11 @@ mod tests {
     #[test]
     fn test_insert_child_under_existing_parent() {
         let mut tree = AgentTree::new();
-        let root = AgentNode::new_root("root", "repo");
+        let root = mock_root("root", "repo");
         let root_id = root.id.clone();
         tree.add_root(root);
 
-        let child = AgentNode::new_child("child", "repo");
+        let child = mock_child("child", "repo");
         let inserted = tree.insert_child(&root_id, child);
 
         assert!(inserted);
@@ -553,17 +582,17 @@ mod tests {
     #[test]
     fn test_insert_child_unknown_parent_returns_false() {
         let mut tree = AgentTree::new();
-        tree.add_root(AgentNode::new_root("root", "repo"));
+        tree.add_root(mock_root("root", "repo"));
         let unknown = AgentId::new();
-        let child = AgentNode::new_child("orphan", "repo");
+        let child = mock_child("orphan", "repo");
         assert!(!tree.insert_child(&unknown, child));
     }
 
     #[test]
     fn remove_root_shrinks_tree() {
         let mut tree = AgentTree::new();
-        let r1 = AgentNode::new_root("r1", "repo");
-        let r2 = AgentNode::new_root("r2", "repo");
+        let r1 = mock_root("r1", "repo");
+        let r2 = mock_root("r2", "repo");
         let id1 = r1.id.clone();
         tree.add_root(r1);
         tree.add_root(r2);
@@ -615,7 +644,7 @@ mod tests {
     #[test]
     fn remove_clamps_cursor() {
         let mut tree = AgentTree::new();
-        let r1 = AgentNode::new_root("r1", "repo");
+        let r1 = mock_root("r1", "repo");
         let id1 = r1.id.clone();
         tree.add_root(r1);
         tree.cursor = 0;
@@ -665,9 +694,9 @@ mod tests {
     #[test]
     fn test_agent_counts_includes_collapsed() {
         let mut tree = AgentTree::new();
-        let mut root = AgentNode::new_root("root", "repo");
+        let mut root = mock_root("root", "repo");
         root.status = AgentStatus::Running;
-        let mut child = AgentNode::new_child("child", "repo");
+        let mut child = mock_child("child", "repo");
         child.status = AgentStatus::Running;
         root.children.push(child);
         root.expanded = false; // collapsed — child hidden from flatten()
@@ -683,9 +712,9 @@ mod tests {
     #[test]
     fn test_agent_counts_counts_blocked() {
         let mut tree = AgentTree::new();
-        let mut root = AgentNode::new_root("root", "repo");
+        let mut root = mock_root("root", "repo");
         root.status = AgentStatus::Blocked;
-        let mut child = AgentNode::new_child("child", "repo");
+        let mut child = mock_child("child", "repo");
         child.status = AgentStatus::Running;
         root.children.push(child);
         tree.add_root(root);

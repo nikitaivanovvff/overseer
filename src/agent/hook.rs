@@ -4,6 +4,8 @@
 
 use serde::Deserialize;
 
+use super::AgentStatus;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct HookPayload {
     #[serde(default)]
@@ -25,6 +27,20 @@ pub fn parse_hook_payload(raw: &str) -> Option<HookPayload> {
 /// changes upstream don't silently break the classification.
 pub fn is_idle_nag(message: &str) -> bool {
     message.to_lowercase().contains("waiting for your input")
+}
+
+/// Pure. Only a `blocked` push needs classification — every other status
+/// already means what it says. `Notification` fires for both a real permission
+/// request and the ~60s idle nag; a missing/unparsed payload leaves `blocked`
+/// as-is (the safer default — a permission prompt actually pending).
+pub fn classify_hook_status(status: AgentStatus, payload: Option<&HookPayload>) -> AgentStatus {
+    if status != AgentStatus::Blocked {
+        return status;
+    }
+    match payload.and_then(|p| p.message.as_deref()) {
+        Some(msg) if is_idle_nag(msg) => AgentStatus::Idle,
+        _ => AgentStatus::Blocked,
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,6 +121,37 @@ mod tests {
     fn is_idle_nag_false_for_permission_request() {
         assert!(!is_idle_nag("Claude needs your permission to use Bash"));
         assert!(!is_idle_nag("Claude needs your permission to edit files"));
+    }
+
+    // ── classify_hook_status ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_hook_status_leaves_non_blocked_untouched() {
+        assert_eq!(classify_hook_status(AgentStatus::Running, None), AgentStatus::Running);
+        assert_eq!(classify_hook_status(AgentStatus::Idle, None), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn classify_hook_status_no_payload_stays_blocked() {
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, None), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn classify_hook_status_permission_request_stays_blocked() {
+        let payload = HookPayload {
+            transcript_path: None,
+            message: Some("Claude needs your permission to use Bash".to_string()),
+        };
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, Some(&payload)), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn classify_hook_status_idle_nag_downgrades_to_idle() {
+        let payload = HookPayload {
+            transcript_path: None,
+            message: Some("Claude is waiting for your input".to_string()),
+        };
+        assert_eq!(classify_hook_status(AgentStatus::Blocked, Some(&payload)), AgentStatus::Idle);
     }
 
     // ── context_pct_from_transcript ───────────────────────────────────────────
