@@ -93,10 +93,6 @@ impl Default for ClaudeAdapter {
 }
 
 impl AgentAdapter for ClaudeAdapter {
-    fn name(&self) -> &str {
-        "claude"
-    }
-
     fn user_config_dir(&self) -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
             return Some(PathBuf::from(dir));

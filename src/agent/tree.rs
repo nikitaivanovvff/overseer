@@ -1,7 +1,9 @@
 use super::{AgentId, AgentNode, AgentRole, AgentStatus};
 
 /// A flattened snapshot of one AgentNode for rendering and navigation.
-/// `prefix` is the pre-computed tree-connector string (e.g. "│ ├ ").
+/// `prefix` is the pre-computed tree-connector string (e.g. "│ ├ ") — it
+/// already encodes depth/last-sibling for the renderer, so those aren't
+/// carried as separate fields.
 #[derive(Debug, Clone)]
 pub struct FlatNode {
     pub id: AgentId,
@@ -11,10 +13,7 @@ pub struct FlatNode {
     pub repo: String,
     pub branch: String,
     pub context_pct: Option<u8>,
-    pub depth: usize,
     pub has_children: bool,
-    pub expanded: bool,
-    pub is_last_sibling: bool,
     pub prefix: String,
 }
 
@@ -194,10 +193,7 @@ fn flatten_node(
         repo: node.repo.clone(),
         branch: node.branch.clone(),
         context_pct: node.context_pct,
-        depth,
         has_children: !node.children.is_empty(),
-        expanded: node.expanded,
-        is_last_sibling: is_last,
         prefix: format!("{indent}{connector}"),
     });
 
@@ -312,7 +308,6 @@ mod tests {
         let flat = tree.flatten();
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].prefix, "");
-        assert_eq!(flat[0].depth, 0);
     }
 
     #[test]
@@ -330,16 +325,6 @@ mod tests {
         assert_eq!(flat[1].name, "child-a");
         assert_eq!(flat[2].name, "grandchild");
         assert_eq!(flat[3].name, "child-b");
-    }
-
-    #[test]
-    fn test_flatten_depths() {
-        let tree = make_tree();
-        let flat = tree.flatten();
-        assert_eq!(flat[0].depth, 0);
-        assert_eq!(flat[1].depth, 1);
-        assert_eq!(flat[2].depth, 2);
-        assert_eq!(flat[3].depth, 1);
     }
 
     #[test]
@@ -377,16 +362,6 @@ mod tests {
     }
 
     #[test]
-    fn test_flatten_last_sibling_flags() {
-        let tree = make_tree();
-        let flat = tree.flatten();
-        assert!(flat[0].is_last_sibling);
-        assert!(!flat[1].is_last_sibling);
-        assert!(flat[2].is_last_sibling);
-        assert!(flat[3].is_last_sibling);
-    }
-
-    #[test]
     fn test_flatten_collapsed_hides_children() {
         let mut tree = make_tree();
         let child_a_id = tree.flatten()[1].id.clone();
@@ -405,8 +380,8 @@ mod tests {
         tree.add_root(AgentNode::new_root("root2", "repo"));
         let flat = tree.flatten();
         assert_eq!(flat.len(), 2);
-        assert!(!flat[0].is_last_sibling);
-        assert!(flat[1].is_last_sibling);
+        assert_eq!(flat[0].name, "root1");
+        assert_eq!(flat[1].name, "root2");
     }
 
     #[test]

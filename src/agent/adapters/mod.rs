@@ -85,9 +85,6 @@ pub enum MergeStrategy {
 }
 
 pub trait AgentAdapter: Send + Sync {
-    #[allow(dead_code)]
-    fn name(&self) -> &str;
-
     // --- install (install-time, pure) ---
 
     /// User config dir for this agent (e.g. `~/.claude`). Resolved at call time.
