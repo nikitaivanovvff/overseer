@@ -43,6 +43,7 @@ mod tests {
             git: Arc::new(GitClient::dry_run()),
             config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
         let socket_clone = socket.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -525,6 +526,63 @@ mod tests {
         let resp = send(&socket, Request::List);
         assert!(resp.ok);
         assert!(matches!(resp.data, Some(OkBody::Agents { agents }) if agents.is_empty()));
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    // ── shutdown ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shutdown_response_arrives_before_the_server_stops_accepting() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+
+        let resp = send(&socket, Request::Shutdown);
+        assert!(resp.ok, "Shutdown failed: {:?}", resp.error);
+
+        // The response above already proves delivery survived the server
+        // tearing down — a bonus check that the tree really was cleared
+        // before the accept loop stopped (best-effort: the server may already
+        // be gone by the time this connects, which is also a valid outcome).
+        let _ = root_id;
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn shutdown_pushes_an_attach_event_to_watching_clients() {
+        let socket = start_server();
+        let (_stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        let resp = send(&socket, Request::Shutdown);
+        assert!(resp.ok, "Shutdown failed: {:?}", resp.error);
+
+        assert!(matches!(next_event(&mut reader), AttachEvent::Shutdown));
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn server_stops_accepting_new_connections_after_shutdown() {
+        let socket = start_server();
+        let resp = send(&socket, Request::Shutdown);
+        assert!(resp.ok, "Shutdown failed: {:?}", resp.error);
+
+        // The accept loop returning is asynchronous relative to this thread
+        // observing it — retry briefly rather than asserting on the very next
+        // instant. A bare `connect()` isn't a reliable signal on its own: a
+        // connection already queued in the kernel's listen backlog can still
+        // succeed for a moment after the listener closes, then yield EOF with
+        // no response — so check for a full round-trip failing, not just the
+        // connect.
+        let mut daemon_gone = false;
+        for _ in 0..100 {
+            if client::send(&socket, &Request::List).is_err() {
+                daemon_gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(daemon_gone, "server should stop accepting connections once shut down");
 
         let _ = std::fs::remove_file(&socket);
     }

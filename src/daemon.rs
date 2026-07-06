@@ -95,6 +95,7 @@ pub fn run_daemon(socket: PathBuf) -> Result<()> {
         git: Arc::new(GitClient::new()),
         config: Arc::new(Config::load()),
         watch_sessions: true,
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     ipc::serve_blocking(ctx, socket, None)?;
@@ -240,6 +241,7 @@ mod tests {
             git: Arc::new(GitClient::dry_run()),
             config: Arc::new(Config::default()),
             watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
         let socket_clone = socket.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);

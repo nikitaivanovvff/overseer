@@ -193,6 +193,7 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
             RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
                 AttachEvent::StatusChanged { agent_id, status, message, context_pct }
             }
+            RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
     }
 }

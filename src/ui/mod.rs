@@ -307,8 +307,9 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
         // Quitting never kills agents (they outlive the TUI, tmux-detach
-        // style) — `d`/`D` is the only path that kills a session, and that's
-        // the one that still confirms.
+        // style) — `d`/`D` kills one session (still confirms); `Q` is the
+        // one command that also confirms, since it reaches every agent plus
+        // the daemon itself.
         let hints: Vec<Span> = vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
@@ -321,7 +322,9 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
             Span::styled("d/D", Style::default().fg(Color::Yellow)),
             Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Q", Style::default().fg(Color::Yellow)),
+            Span::styled(" shutdown", Style::default().fg(Color::DarkGray)),
         ];
         let counts_text = if blocked > 0 {
             format!("{running}/{total} running · {blocked} blocked")

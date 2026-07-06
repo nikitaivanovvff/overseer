@@ -81,6 +81,7 @@ fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
         git: Arc::new(GitClient::new()),
         config: Arc::new(Config::load()),
         watch_sessions: false,
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     let ipc_ctx = ctx.clone();
@@ -219,6 +220,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
             start_drop_confirm(app, false);
         }
         KeyCode::Char('D') => start_drop_confirm(app, true),
+        KeyCode::Char('Q') => start_shutdown_confirm(app),
         _ => {}
     }
     true
@@ -285,6 +287,10 @@ fn build_prompt(app: &App) -> Option<String> {
                 };
                 format!("drop '{name}'{suffix}? (y/n)")
             }
+            ConfirmAction::Shutdown { agent_count } => {
+                let plural = if *agent_count == 1 { "" } else { "s" };
+                format!("kill {agent_count} agent{plural} and the daemon? (y/n)")
+            }
         });
     }
 
@@ -310,6 +316,15 @@ fn start_drop_confirm(app: &mut App, recursive: bool) {
         app.status_message = None;
         app.confirm = Some(ConfirmState { action: ConfirmAction::Drop { agent_id: node.id, recursive } });
     }
+}
+
+/// `Q`: the kill switch — recursive-drops every agent and exits the daemon
+/// (`Request::Shutdown`), confirmed since it's the one action that reaches
+/// past agents the user isn't even looking at right now.
+fn start_shutdown_confirm(app: &mut App) {
+    let agent_count = app.with_tree(|t| t.agent_counts().2);
+    app.status_message = None;
+    app.confirm = Some(ConfirmState { action: ConfirmAction::Shutdown { agent_count } });
 }
 
 fn handle_input_key(app: &mut App, key: KeyEvent) {
@@ -423,6 +438,19 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
                 };
                 true
             }
+            ConfirmAction::Shutdown { .. } => {
+                let resp = app.dispatch(Request::Shutdown);
+                if resp.ok {
+                    // The daemon (or, in mock mode, everything this process
+                    // owns) is gone — nothing left to show, so exit like a
+                    // quit rather than sit in front of a dead tree.
+                    false
+                } else {
+                    app.status_message =
+                        Some(format!("shutdown failed: {}", resp.error.unwrap_or_else(|| "unknown error".to_string())));
+                    true
+                }
+            }
         },
         KeyCode::Char('n') | KeyCode::Esc => {
             app.status_message = None;
@@ -499,6 +527,7 @@ mod tests {
             git: Arc::new(GitClient::new()),
             config: Arc::new(Config::default()),
             watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
         (App::new(ctx.clone()), ctx)
     }

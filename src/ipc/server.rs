@@ -40,18 +40,30 @@ pub async fn run(
     }
 
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                use std::io::ErrorKind::*;
-                match e.kind() {
-                    ConnectionAborted | ConnectionReset | Interrupted => continue,
-                    _ => return Err(e),
-                }
+        tokio::select! {
+            conn = listener.accept() => {
+                let (stream, _) = match conn {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        use std::io::ErrorKind::*;
+                        match e.kind() {
+                            ConnectionAborted | ConnectionReset | Interrupted => continue,
+                            _ => return Err(e),
+                        }
+                    }
+                };
+                let ctx = ctx.clone();
+                tokio::spawn(handle_conn(stream, ctx));
             }
-        };
-        let ctx = ctx.clone();
-        tokio::spawn(handle_conn(stream, ctx));
+            // `overseer shutdown`'s handler notifies this only after its own
+            // response has already been written back to its caller — see
+            // `handle_conn`. Stopping the accept loop and letting `run`
+            // return is the entire "exit the daemon": `main` returning ends
+            // the process with no `std::process::exit` needed.
+            _ = ctx.shutdown_notify.notified() => {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -74,13 +86,36 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
                         return;
                     }
                     Ok(req) => {
+                        let is_shutdown = matches!(req, Request::Shutdown);
                         // Blocking I/O (git, PTY launch) must not block the tokio thread.
-                        let ctx = ctx.clone();
-                        let resp = tokio::task::spawn_blocking(move || dispatch(&ctx, req))
+                        let ctx_clone = ctx.clone();
+                        let resp = tokio::task::spawn_blocking(move || dispatch(&ctx_clone, req))
                             .await
                             .unwrap_or_else(|_| Response::err("handler panicked"));
+                        let ok = resp.ok;
                         if !write_response(&mut write_half, &resp).await {
                             break;
+                        }
+                        if is_shutdown && ok {
+                            // The response bytes are already handed to the
+                            // kernel's socket buffer at this point — safe to
+                            // ask the accept loop to stop even though this
+                            // task (and the runtime under it) may tear down
+                            // before the caller has actually read them.
+                            //
+                            // `notify_one`, not `notify_waiters`: the accept
+                            // loop's `select!` re-creates its `.notified()`
+                            // future every iteration, so there's a real
+                            // window where nothing is polling it yet when
+                            // this fires. `notify_waiters` only wakes
+                            // *currently* registered waiters and drops the
+                            // notification otherwise; `notify_one` stores a
+                            // permit so the next `.notified()` call (even one
+                            // created after this line runs) completes
+                            // immediately. Confirmed by reproducing the lost
+                            // wake with `notify_waiters` under test.
+                            ctx.shutdown_notify.notify_one();
+                            return;
                         }
                     }
                     Err(e) => {

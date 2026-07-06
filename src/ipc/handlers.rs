@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::agent::drop::drop_agent;
 use crate::agent::spawn::{spawn_agent, SpawnRequest};
-use crate::agent::{AgentRegistry, AgentRole};
+use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::GitClient;
 use crate::ipc::protocol::{OkBody, Request, Response};
@@ -20,6 +20,13 @@ pub struct AppCtx {
     /// When true, the server spawns a background task that drains agent PTY
     /// exits and marks them Error. Set false in mock/test mode.
     pub watch_sessions: bool,
+    /// Notified once by `Request::Shutdown`'s handler, after its response has
+    /// already been written back to the caller. `ipc::server::run`'s accept
+    /// loop selects on this to stop accepting connections and return, letting
+    /// the daemon process exit by simply reaching the end of `main` — no
+    /// `std::process::exit` needed, so a still-in-flight response (this
+    /// request's own) is never raced against the runtime tearing down.
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Dispatches a parsed request to the registry and returns a wire response.
@@ -125,11 +132,25 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             Response::err("this request requires an attach connection (Request::Attach first)")
         }
 
-        // `overseer shutdown` (DAEMON.md Task 4): a one-shot request like any
-        // other — recursive-drops every root, then the daemon exits. Wired up
-        // in Task 4; a placeholder here keeps this match exhaustive in the
-        // meantime.
-        Request::Shutdown => Response::err("shutdown not yet implemented"),
+        // `overseer shutdown` (DAEMON.md Task 4): recursive-drops every root
+        // (children first, via `drop_agent`'s existing postorder), announces
+        // the shutdown to attached clients, then asks `ipc::server::run`'s
+        // accept loop to stop. The process itself exits by `main` simply
+        // returning once that loop does — no `std::process::exit` — so this
+        // request's own response (written by the caller *after* `dispatch`
+        // returns) is never raced against the runtime tearing down.
+        Request::Shutdown => {
+            let root_ids: Vec<AgentId> =
+                ctx.registry.with_tree(|t| t.roots.iter().map(|r| r.id.clone()).collect());
+            for root_id in root_ids {
+                // Best-effort: a root could in principle already be gone by
+                // the time we get to it (e.g. a racing `drop` from another
+                // connection) — that's not a shutdown failure.
+                let _ = drop_agent(&ctx.registry, &ctx.sessions, &root_id, true, true);
+            }
+            ctx.registry.announce_shutdown();
+            Response::ok(None)
+        }
     }
 }
 
@@ -150,6 +171,7 @@ mod tests {
             git: Arc::new(GitClient::dry_run()),
             config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -366,6 +388,52 @@ mod tests {
             let resp = dispatch(&ctx, req);
             assert!(!resp.ok, "attach-only request must not succeed over a one-shot connection");
             assert!(resp.error.as_deref().unwrap_or("").contains("attach connection"));
+        }
+    }
+
+    // ── shutdown ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_shutdown_drops_every_root_and_its_children() {
+        let ctx = make_ctx();
+        let root_a = start_root(&ctx);
+        dispatch(&ctx, Request::Spawn {
+            parent_id: root_a.clone(),
+            task: "child-a".to_string(),
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        let _root_b = start_root(&ctx);
+
+        let resp = dispatch(&ctx, Request::Shutdown);
+        assert!(resp.ok, "Shutdown failed: {:?}", resp.error);
+
+        let list_resp = dispatch(&ctx, Request::List);
+        assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.is_empty()));
+    }
+
+    #[test]
+    fn dispatch_shutdown_on_an_empty_registry_still_succeeds() {
+        let ctx = make_ctx();
+        let resp = dispatch(&ctx, Request::Shutdown);
+        assert!(resp.ok, "Shutdown on an empty tree must still succeed: {:?}", resp.error);
+    }
+
+    #[test]
+    fn dispatch_shutdown_broadcasts_removed_for_each_agent_then_shutdown() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let mut rx = ctx.registry.subscribe();
+
+        dispatch(&ctx, Request::Shutdown);
+
+        match rx.try_recv().unwrap() {
+            crate::agent::RegistryEvent::Removed { agent_id } => assert_eq!(agent_id, root_id),
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            crate::agent::RegistryEvent::Shutdown => {}
+            other => panic!("expected Shutdown, got {other:?}"),
         }
     }
 }

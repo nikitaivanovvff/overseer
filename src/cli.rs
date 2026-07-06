@@ -85,6 +85,10 @@ pub enum Command {
         #[arg(long)]
         recursive: bool,
     },
+    /// The kill switch: recursive-drops every agent, then exits the daemon.
+    /// The TUI's own `Q` keybind confirms and sends this same request — this
+    /// is the CLI path for scripting it or when the TUI isn't running.
+    Shutdown,
 }
 
 /// Pushable statuses only — `Spawning` is set at registration time, never
@@ -208,6 +212,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             Ok(Some(Request::Drop { agent_id, recursive }))
         }
+        Command::Shutdown => Ok(Some(Request::Shutdown)),
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
         Command::Daemon => unreachable!("Daemon is handled before run_client"),
     }
@@ -247,6 +252,12 @@ mod tests {
     fn build_request_list_returns_list() {
         let req = build_request(Command::List).unwrap().unwrap();
         assert!(matches!(req, Request::List));
+    }
+
+    #[test]
+    fn build_request_shutdown_returns_shutdown() {
+        let req = build_request(Command::Shutdown).unwrap().unwrap();
+        assert!(matches!(req, Request::Shutdown));
     }
 
     #[test]

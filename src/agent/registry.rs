@@ -28,6 +28,10 @@ pub enum RegistryEvent {
         message: Option<String>,
         context_pct: Option<u8>,
     },
+    /// The daemon itself is exiting (`overseer shutdown`) — distinct from any
+    /// per-agent event. Broadcast explicitly via `announce_shutdown`, not a
+    /// side effect of any registry mutation.
+    Shutdown,
 }
 
 pub struct AgentRegistry {
@@ -84,6 +88,15 @@ impl AgentRegistry {
     /// data loss; callers should treat that as "re-sync via a fresh snapshot".
     pub fn subscribe(&self) -> broadcast::Receiver<RegistryEvent> {
         self.events.subscribe()
+    }
+
+    /// Broadcasts that the daemon is exiting (`overseer shutdown`), so every
+    /// attached client's `Backend::Daemon` sees it independently of this
+    /// request's own response — delivery happens on each attach connection's
+    /// own forwarding task, not tied to when *this* caller's response gets
+    /// written.
+    pub fn announce_shutdown(&self) {
+        let _ = self.events.send(RegistryEvent::Shutdown);
     }
 
     pub fn register(&self, args: RegisterArgs) -> Result<RegisterResult, RegistryError> {
@@ -534,5 +547,13 @@ mod tests {
         let result = reg.register(make_register_root("agent")).unwrap();
         assert!(matches!(rx1.try_recv().unwrap(), RegistryEvent::Registered { agent } if agent.id == result.id));
         assert!(matches!(rx2.try_recv().unwrap(), RegistryEvent::Registered { agent } if agent.id == result.id));
+    }
+
+    #[test]
+    fn announce_shutdown_broadcasts_shutdown_event() {
+        let reg = AgentRegistry::new();
+        let mut rx = reg.subscribe();
+        reg.announce_shutdown();
+        assert!(matches!(rx.try_recv().unwrap(), RegistryEvent::Shutdown));
     }
 }

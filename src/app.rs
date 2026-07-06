@@ -28,9 +28,13 @@ pub struct InputState {
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     Drop { agent_id: AgentId, recursive: bool },
+    /// The kill switch (`Q`) — `agent_count` is captured at confirm-open time
+    /// purely for the prompt text; the actual drop-everything happens
+    /// server-side (`Request::Shutdown`), not by iterating this count.
+    Shutdown { agent_count: usize },
 }
 
-/// Active while awaiting y/n confirmation for `d`/`D`.
+/// Active while awaiting y/n confirmation for `d`/`D`/`Q`.
 pub struct ConfirmState {
     pub action: ConfirmAction,
 }
@@ -379,6 +383,7 @@ mod tests {
             git: Arc::new(GitClient::new()),
             config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
         App::new(ctx)
     }
