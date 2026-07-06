@@ -6,7 +6,7 @@ The agents are already smart. Overseer does **not** reimplement what they do —
 
 The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself, in your own time, exactly as you would without Overseer; the row appears in the tree immediately, named after the repo, and its status flips from `idle` to `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own PTY (auto-launched via the configured adapter) and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
 
-The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the **task description** it was spawned with. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, aider, etc.) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
+The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, aider, etc.) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
 
 ---
 
@@ -93,7 +93,7 @@ Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `
 | `overseer daemon` | — | Runs the daemon itself: binds the socket, serves requests, streams attach events, watches session exits. Hidden from `--help` — not a user workflow, the TUI spawns one automatically. |
 | `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
 | `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context %. |
-| `overseer spawn` | `--task --adapter?` | Request a child. Rejected if the caller is already a child. The task text becomes the child's initial prompt, not just its tree-row name. |
+| `overseer spawn` | `--task --name? --adapter?` | Request a child. Rejected if the caller is already a child. `--task` is the child's entire initial prompt; `--name` is a short, distinct tree-row label (falls back to `--task` verbatim if omitted or blank). |
 | `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. Root agents are rejected here — only the TUI's `d`/`D` (a distinct wire request, see below) can drop one. |
 | `overseer shutdown` | — | The kill switch: recursive-drops every root, then the daemon process exits. Same request the TUI's `Q` sends after its confirm. |
 | `overseer list` | — | List all agents |
@@ -154,7 +154,7 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for root). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
 
 Role behavior lives in the **user-level skill** installed by `overseer install` — `overseer-root` or `overseer-child`, matched to `$OVERSEER_ROLE` — not in a per-launch file:
-- Root agents: may spawn children via `overseer spawn --task "<full, self-contained task description>"`.
+- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>"`.
 - Child agents: spawning is not permitted; the agent sets up its own branch/worktree for isolation, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
 
 User-level `~/.claude/settings.json` hooks (installed by `overseer install`, shared across all sessions, no-op outside Overseer, all passing `--from-hook`):
@@ -228,10 +228,11 @@ Status badges: `●` running · `!` blocked (needs you — permission pending) �
 ### Spawn Data Flow
 
 ```
-Root agent runs: overseer spawn --task "write tests" --adapter claude
+Root agent runs: overseer spawn --name "write-tests" --task "write tests" --adapter claude
 
 IPC server (spawn_blocking):
-  → AgentRegistry::register(child, parent=caller, status=Spawning) // rejects if caller is a child
+  → name = name.filter(non-blank).unwrap_or(task) = "write-tests"  // task text is the fallback only
+  → AgentRegistry::register(child, name, parent=caller, status=Spawning) // rejects if caller is a child
   → adapter = adapter_for(name); command/extra_args resolved from config.adapters[name]
   → LaunchContext.task = "write tests"
   → SessionManager::launch(agent_id, cwd=repo, adapter.spawn_command(ctx),
@@ -240,11 +241,12 @@ IPC server (spawn_blocking):
       env_inject:    ...identity vars..., OVERSEER_TASK="write tests"
   → replies: {"agent_id": "..."}
 
-TUI re-renders with the new child visible under the parent, and the task text is
-already the child's initial prompt — it starts working immediately instead of
-sitting at a bare prompt. The child sets up its own branch/worktree on startup,
-per the overseer-child skill, and its own SessionStart hook flips it from
-Spawning to Running moments later.
+TUI re-renders with the new child visible under the parent, labeled "write-tests"
+in the tree — short and recognizable even though the task text (the child's
+actual initial prompt) can run to a full paragraph. It starts working
+immediately instead of sitting at a bare prompt. The child sets up its own
+branch/worktree on startup, per the overseer-child skill, and its own
+SessionStart hook flips it from Spawning to Running moments later.
 ```
 
 `overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it.
