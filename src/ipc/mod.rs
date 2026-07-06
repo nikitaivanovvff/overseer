@@ -378,4 +378,154 @@ mod tests {
 
         let _ = std::fs::remove_file(&socket);
     }
+
+    // ── attach protocol ───────────────────────────────────────────────────────
+
+    use crate::ipc::protocol::AttachEvent;
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    /// Opens a fresh connection and upgrades it via `Request::Attach`.
+    fn attach(socket: &Path) -> (UnixStream, StdBufReader<UnixStream>) {
+        let mut stream = UnixStream::connect(socket).expect("connect for attach");
+        let req = serde_json::to_string(&Request::Attach).unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        let reader = StdBufReader::new(stream.try_clone().unwrap());
+        (stream, reader)
+    }
+
+    fn next_event(reader: &mut StdBufReader<UnixStream>) -> AttachEvent {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("attach connection closed unexpectedly");
+        serde_json::from_str(line.trim()).expect("malformed AttachEvent line")
+    }
+
+    fn send_line(stream: &mut UnixStream, req: &Request) {
+        let json = serde_json::to_string(req).unwrap();
+        stream.write_all(json.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn attach_sends_an_empty_snapshot_first() {
+        let socket = start_server();
+        let (_stream, mut reader) = attach(&socket);
+        let event = next_event(&mut reader);
+        assert!(matches!(event, AttachEvent::Snapshot { agents } if agents.is_empty()));
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn attach_snapshot_reflects_agents_registered_before_it_connected() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+
+        let (_stream, mut reader) = attach(&socket);
+        let event = next_event(&mut reader);
+        match event {
+            AttachEvent::Snapshot { agents } => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].id, root_id);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn attach_streams_registered_and_status_changed_events_live() {
+        let socket = start_server();
+        let (_stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        // A one-shot connection registers a root while we're attached...
+        let root_id = start_root(&socket);
+        match next_event(&mut reader) {
+            AttachEvent::AgentRegistered { agent } => assert_eq!(agent.id, root_id),
+            other => panic!("expected AgentRegistered, got {other:?}"),
+        }
+
+        // ...and pushes a status update...
+        send(&socket, Request::Status {
+            agent_id: root_id.clone(),
+            status: AgentStatus::Blocked,
+            message: Some("needs you".to_string()),
+            context_pct: Some(42),
+        });
+        match next_event(&mut reader) {
+            AttachEvent::StatusChanged { agent_id, status, message, context_pct } => {
+                assert_eq!(agent_id, root_id);
+                assert_eq!(status, AgentStatus::Blocked);
+                assert_eq!(message.as_deref(), Some("needs you"));
+                assert_eq!(context_pct, Some(42));
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+
+        // ...both landing on the same attach connection the whole time, live.
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn attach_streams_removed_event() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+        let (child_id, _) = spawn_child(&socket, &root_id, "doomed-child");
+
+        let (_stream, mut reader) = attach(&socket);
+        match next_event(&mut reader) {
+            AttachEvent::Snapshot { agents } => assert_eq!(agents.len(), 2),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        send(&socket, Request::Drop { agent_id: child_id.clone(), recursive: false });
+        match next_event(&mut reader) {
+            AttachEvent::AgentRemoved { agent_id } => assert_eq!(agent_id, child_id),
+            other => panic!("expected AgentRemoved, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn attach_connection_still_accepts_watch_unwatch_resize_without_crashing() {
+        // Exercises the request-reading half of the attach loop against a
+        // dry-run SessionManager (no real PTY, so no grid ever comes back) —
+        // the point here is that these requests don't desync or kill the
+        // connection, not the rendered content (covered in session::pty's
+        // own unit tests against a real session).
+        let socket = start_server();
+        let root_id = start_root(&socket);
+        let (mut stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        send_line(&mut stream, &Request::Watch { agent_id: root_id.clone() });
+        send_line(&mut stream, &Request::Resize { cols: 100, lines: 40 });
+        send_line(&mut stream, &Request::Unwatch);
+
+        // The connection must still be alive and forwarding registry events
+        // after all three — prove it by registering a child and reading the
+        // event through, instead of asserting on a fixed sleep.
+        let (_child_id, _) = spawn_child(&socket, &root_id, "post-watch-child");
+        assert!(matches!(next_event(&mut reader), AttachEvent::AgentRegistered { .. }));
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn one_shot_connections_keep_working_alongside_an_open_attach_connection() {
+        let socket = start_server();
+        let (_stream, _reader) = attach(&socket);
+
+        // Ordinary one-shot request/response traffic must be unaffected by an
+        // idle attach connection sitting on the same server.
+        let resp = send(&socket, Request::List);
+        assert!(resp.ok);
+        assert!(matches!(resp.data, Some(OkBody::Agents { agents }) if agents.is_empty()));
+
+        let _ = std::fs::remove_file(&socket);
+    }
 }

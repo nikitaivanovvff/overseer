@@ -2,12 +2,24 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixListener,
+    net::{
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+        UnixListener,
+    },
+    sync::Mutex as AsyncMutex,
 };
 
 use crate::agent::{AgentRegistry, AgentStatus};
-use crate::ipc::{handlers::{dispatch, AppCtx}, protocol::{Request, Response}};
+use crate::ipc::{
+    handlers::{dispatch, AppCtx},
+    protocol::{AttachEvent, Request, Response},
+};
 use crate::session::SessionManager;
+
+/// How often the attach connection's output task checks the watched agent's
+/// dirty flag — matches the TUI's own render tick (`tui.rs`'s 100ms poll), so
+/// streamed output feels as responsive as local rendering used to.
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 pub async fn run(
     ctx: Arc<AppCtx>,
@@ -53,26 +65,163 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
         match reader.read_line(&mut line).await {
             Ok(0) => break,
             Ok(_) => {
-                let resp = match serde_json::from_str::<Request>(line.trim()) {
+                match serde_json::from_str::<Request>(line.trim()) {
+                    // `Attach` upgrades this connection for the rest of its
+                    // life — hand off to the dedicated event-stream loop and
+                    // never return to one-shot request/response handling.
+                    Ok(Request::Attach) => {
+                        handle_attach(reader, write_half, ctx).await;
+                        return;
+                    }
                     Ok(req) => {
                         // Blocking I/O (git, PTY launch) must not block the tokio thread.
                         let ctx = ctx.clone();
-                        tokio::task::spawn_blocking(move || dispatch(&ctx, req))
+                        let resp = tokio::task::spawn_blocking(move || dispatch(&ctx, req))
                             .await
-                            .unwrap_or_else(|_| Response::err("handler panicked"))
+                            .unwrap_or_else(|_| Response::err("handler panicked"));
+                        if !write_response(&mut write_half, &resp).await {
+                            break;
+                        }
                     }
-                    Err(e) => Response::err(format!("parse error: {e}")),
-                };
-                let mut bytes = serde_json::to_vec(&resp)
-                    .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"internal serialization error\"}".to_vec());
-                bytes.push(b'\n');
-                if write_half.write_all(&bytes).await.is_err() {
-                    break;
+                    Err(e) => {
+                        let resp = Response::err(format!("parse error: {e}"));
+                        if !write_response(&mut write_half, &resp).await {
+                            break;
+                        }
+                    }
                 }
             }
             Err(_) => break,
         }
     }
+}
+
+async fn write_response(write_half: &mut OwnedWriteHalf, resp: &Response) -> bool {
+    let mut bytes = serde_json::to_vec(resp)
+        .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"internal serialization error\"}".to_vec());
+    bytes.push(b'\n');
+    write_half.write_all(&bytes).await.is_ok()
+}
+
+/// Writes one `AttachEvent` as a newline-delimited JSON line, serializing
+/// concurrent writers (registry-event forwarder, output poller, and the
+/// request loop's immediate on-`Watch` snapshot all share one connection).
+/// Returns `false` on any I/O or serialization failure — callers treat that
+/// as "the client is gone".
+async fn send_event(write_half: &AsyncMutex<OwnedWriteHalf>, event: &AttachEvent) -> bool {
+    let Ok(mut bytes) = serde_json::to_vec(event) else { return false };
+    bytes.push(b'\n');
+    write_half.lock().await.write_all(&bytes).await.is_ok()
+}
+
+/// Runs one attach connection end-to-end: sends the initial snapshot, spawns
+/// the registry-event and terminal-output forwarders, then reads
+/// `Watch`/`Unwatch`/`Write`/`Resize` requests until the client disconnects.
+/// `Request::Attach` itself never reaches `dispatch` — this is the only
+/// handler for an upgraded connection (AGENTS.md "IPC is the only shared
+/// channel", extended here: attach is the *streaming* half of it).
+async fn handle_attach(
+    mut reader: BufReader<OwnedReadHalf>,
+    write_half: OwnedWriteHalf,
+    ctx: Arc<AppCtx>,
+) {
+    let write_half = Arc::new(AsyncMutex::new(write_half));
+
+    let snapshot = AttachEvent::Snapshot { agents: ctx.registry.snapshot() };
+    if !send_event(&write_half, &snapshot).await {
+        return;
+    }
+
+    let mut registry_rx = ctx.registry.subscribe();
+    let watch: Arc<std::sync::Mutex<Option<crate::agent::AgentId>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Forwards registry mutations (register/status/remove) as they happen —
+    // no polling, per AGENTS.md's "status is push, not pull", now extended
+    // to the TUI itself.
+    let registry_task = tokio::spawn({
+        let write_half = write_half.clone();
+        async move {
+            loop {
+                match registry_rx.recv().await {
+                    Ok(event) => {
+                        if !send_event(&write_half, &event.into()).await {
+                            break;
+                        }
+                    }
+                    // A slow client missed some events — nothing to replay
+                    // them from (the registry only broadcasts), so just pick
+                    // up the next one; the client still has its last-known
+                    // snapshot plus whatever it did receive.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+
+    // Streams the watched agent's rendered terminal grid, throttled to a
+    // dirty-flag poll (see `session::pty::EventProxy` — `alacritty_terminal`
+    // 0.26 has no raw-byte tap without reimplementing its event loop, so this
+    // is the "hard part" from DAEMON.md's design, adapted).
+    let output_task = tokio::spawn({
+        let write_half = write_half.clone();
+        let watch = watch.clone();
+        let sessions = ctx.sessions.clone();
+        async move {
+            let mut interval = tokio::time::interval(OUTPUT_POLL_INTERVAL);
+            loop {
+                interval.tick().await;
+                let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let Some(agent_id) = current else { continue };
+                if !sessions.take_dirty(&agent_id) {
+                    continue;
+                }
+                let Some(grid) = sessions.grid_snapshot(&agent_id) else { continue };
+                if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => match serde_json::from_str::<Request>(line.trim()) {
+                Ok(Request::Watch { agent_id }) => {
+                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_id.clone());
+                    // Immediate snapshot so switching the watched agent is
+                    // instant, not gated on the next dirty tick.
+                    if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
+                        if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                            break;
+                        }
+                    }
+                }
+                Ok(Request::Unwatch) => {
+                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                Ok(Request::Write { agent_id, data }) => {
+                    ctx.sessions.write(&agent_id, data.into_bytes());
+                }
+                Ok(Request::Resize { cols, lines }) => {
+                    ctx.sessions.resize_all(cols as usize, lines as usize);
+                }
+                Ok(_) | Err(_) => {
+                    // One-shot requests (or garbage) arriving on an attach
+                    // connection: there's no `Response` channel to answer on
+                    // here, so silently ignore rather than desync the stream.
+                }
+            },
+            Err(_) => break,
+        }
+    }
+
+    registry_task.abort();
+    output_task.abort();
 }
 
 /// Wakes every 5 seconds and drains the set of agents whose PTY child has

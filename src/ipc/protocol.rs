@@ -51,9 +51,134 @@ pub enum Request {
         agent_id: AgentId,
         recursive: bool,
     },
+    /// Upgrades this connection to a long-lived event stream (DAEMON.md "Attach
+    /// protocol") — the daemon replies with an initial `AttachEvent::Snapshot`,
+    /// then pushes registry/output events until the connection closes. Once sent,
+    /// the connection speaks `AttachEvent` outward and only `Watch`/`Unwatch`/
+    /// `Write`/`Resize`/`Shutdown` inward — never a one-shot `Response`.
+    Attach,
+    /// Starts (or switches) streaming `agent_id`'s rendered terminal grid as
+    /// `AttachEvent::Output` on this attach connection. An immediate snapshot is
+    /// sent right away so switching the watched agent feels instant, not gated
+    /// on the next redraw.
+    Watch {
+        agent_id: AgentId,
+    },
+    /// Stops streaming terminal output on this attach connection.
+    Unwatch,
+    /// Forwards `data` (raw PTY input, always valid UTF-8 in practice — see
+    /// AGENTS.md) to `agent_id`'s session. The input-path counterpart to `Watch`.
+    Write {
+        agent_id: AgentId,
+        data: String,
+    },
+    /// Resizes every agent's PTY to `(cols, lines)` — one shared rect (AGENTS.md
+    /// "every agent shares one PTY size"), not per-agent.
+    Resize {
+        cols: u16,
+        lines: u16,
+    },
+    /// Recursively drops every root, then exits the daemon process — the kill
+    /// switch (`overseer shutdown`).
+    Shutdown,
 }
 
+/// Server-pushed events on an attach connection (DAEMON.md "Attach protocol").
+/// Never solicited by a matching one-shot `Response` — `Snapshot` answers
+/// `Request::Attach` itself, everything after is unprompted.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AttachEvent {
+    /// Sent once, immediately after `Attach` is accepted.
+    Snapshot { agents: Vec<AgentDto> },
+    AgentRegistered { agent: AgentDto },
+    AgentRemoved { agent_id: AgentId },
+    StatusChanged {
+        agent_id: AgentId,
+        status: AgentStatus,
+        message: Option<String>,
+        context_pct: Option<u8>,
+    },
+    /// The watched agent's rendered terminal grid. Sent immediately on `Watch`,
+    /// then whenever the terminal has produced new content since the last send
+    /// (a dirty-flag poll, not per-byte — see `session::pty`).
+    Output { agent_id: AgentId, grid: GridSnapshot },
+    /// The daemon is exiting (`overseer shutdown`) — every attached client
+    /// should treat this the same as the connection closing.
+    Shutdown,
+}
+
+/// A rendered terminal color, wire-compatible mirror of `ratatui::style::Color`'s
+/// variants (minus its own `Reset`-adjacent aliasing) so the daemon can convert
+/// from `alacritty_terminal`'s `AnsiColor` without either side depending on the
+/// other's color type. See `session::pty::dto_color` / `ui::term_pane`'s
+/// `impl From<ColorDto> for Color`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorDto {
+    Reset,
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    Gray,
+    DarkGray,
+    LightRed,
+    LightGreen,
+    LightYellow,
+    LightBlue,
+    LightMagenta,
+    LightCyan,
+    White,
+    Rgb(u8, u8, u8),
+    Indexed(u8),
+}
+
+/// One rendered grid cell — the wire counterpart of `ui::term_pane::paint_term`'s
+/// per-cell styling, minus the wide-char-spacer bookkeeping (a spacer cell is
+/// simply `None` in `GridSnapshot::cells`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellDto {
+    pub ch: char,
+    pub fg: ColorDto,
+    pub bg: ColorDto,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+/// A full rendered snapshot of one agent's terminal, streamed in place of raw
+/// PTY bytes (see `session::pty` for why: `alacritty_terminal` 0.26 doesn't
+/// expose raw incoming bytes without reimplementing its mio/signalfd event
+/// loop). The client paints this directly — no local `Term` needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridSnapshot {
+    pub cols: u16,
+    pub lines: u16,
+    /// Row-major, exactly `cols * lines` entries. `None` marks a blank/spacer
+    /// cell.
+    pub cells: Vec<Option<CellDto>>,
+    /// Cursor position as `(line, column)`, `None` if off-screen/hidden.
+    pub cursor: Option<(u16, u16)>,
+}
+
+impl From<crate::agent::RegistryEvent> for AttachEvent {
+    fn from(event: crate::agent::RegistryEvent) -> Self {
+        use crate::agent::RegistryEvent;
+        match event {
+            RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
+            RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
+                AttachEvent::StatusChanged { agent_id, status, message, context_pct }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDto {
     pub id: AgentId,
     pub name: String,

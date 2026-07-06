@@ -2,11 +2,37 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree};
+use crate::ipc::protocol::AgentDto;
+
+/// Capacity of the registry's broadcast channel — generous enough that a slow
+/// attach client only misses events under sustained, unrealistic load; a
+/// lagged receiver just skips ahead rather than blocking a writer (AGENTS.md
+/// "status is push, not pull" — pushes must never back up on the sender).
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Broadcast to every attached client on every mutation (DAEMON.md "Attach
+/// protocol"). Cheap to construct (no runtime needed until a receiver
+/// `.recv().await`s), so `AgentRegistry` can build one unconditionally —
+/// existing sync callers with zero subscribers just get an ignored `Err` back
+/// from `send`.
+#[derive(Debug, Clone)]
+pub enum RegistryEvent {
+    Registered { agent: AgentDto },
+    Removed { agent_id: AgentId },
+    StatusChanged {
+        agent_id: AgentId,
+        status: AgentStatus,
+        message: Option<String>,
+        context_pct: Option<u8>,
+    },
+}
 
 pub struct AgentRegistry {
     tree: Mutex<AgentTree>,
+    events: broadcast::Sender<RegistryEvent>,
 }
 
 #[derive(Debug, Error)]
@@ -43,11 +69,21 @@ pub struct RegisterResult {
 
 impl AgentRegistry {
     pub fn new() -> Self {
-        Self { tree: Mutex::new(AgentTree::new()) }
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self { tree: Mutex::new(AgentTree::new()), events }
     }
 
     pub fn from_tree(tree: AgentTree) -> Self {
-        Self { tree: Mutex::new(tree) }
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self { tree: Mutex::new(tree), events }
+    }
+
+    /// Subscribes to every registration/removal/status-change from this point
+    /// on — the feed an attach connection forwards to its client. A missed
+    /// event (receiver too slow) surfaces as `RecvError::Lagged`, not silent
+    /// data loss; callers should treat that as "re-sync via a fresh snapshot".
+    pub fn subscribe(&self) -> broadcast::Receiver<RegistryEvent> {
+        self.events.subscribe()
     }
 
     pub fn register(&self, args: RegisterArgs) -> Result<RegisterResult, RegistryError> {
@@ -69,7 +105,10 @@ impl AgentRegistry {
                     children: Vec::new(),
                     expanded: true,
                 };
+                let dto = AgentDto::from_node(&node, None);
                 guard.add_root(node);
+                drop(guard);
+                let _ = self.events.send(RegistryEvent::Registered { agent: dto });
                 Ok(RegisterResult { id, branch })
             }
             AgentRole::Child => {
@@ -90,7 +129,10 @@ impl AgentRegistry {
                     children: Vec::new(),
                     expanded: true,
                 };
+                let dto = AgentDto::from_node(&node, Some(parent_id.clone()));
                 if guard.insert_child(&parent_id, node) {
+                    drop(guard);
+                    let _ = self.events.send(RegistryEvent::Registered { agent: dto });
                     Ok(RegisterResult { id, branch })
                 } else {
                     Err(RegistryError::UnknownParent(parent_id))
@@ -99,27 +141,37 @@ impl AgentRegistry {
         }
     }
 
-    /// Updates the status of the agent with the given id. `message` is accepted
-    /// per the protocol but not stored. `context_pct` of `None` leaves the
-    /// node's existing value untouched — most status pushes don't carry one.
+    /// Updates the status of the agent with the given id. `context_pct` of
+    /// `None` leaves the node's existing value untouched — most status pushes
+    /// don't carry one. `message` isn't stored on the node (no field for it),
+    /// but is forwarded verbatim on the broadcast event for attach clients.
     pub fn set_status(
         &self,
         id: &AgentId,
         status: AgentStatus,
-        _message: Option<String>,
+        message: Option<String>,
         context_pct: Option<u8>,
     ) -> Result<(), RegistryError> {
-        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.find_mut(id) {
-            Some(node) => {
-                node.status = status;
-                if let Some(pct) = context_pct {
-                    node.context_pct = Some(pct);
+        let new_context_pct = {
+            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.find_mut(id) {
+                Some(node) => {
+                    node.status = status.clone();
+                    if let Some(pct) = context_pct {
+                        node.context_pct = Some(pct);
+                    }
+                    node.context_pct
                 }
-                Ok(())
+                None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
-            None => Err(RegistryError::UnknownAgent(id.clone())),
-        }
+        };
+        let _ = self.events.send(RegistryEvent::StatusChanged {
+            agent_id: id.clone(),
+            status,
+            message,
+            context_pct: new_context_pct,
+        });
+        Ok(())
     }
 
     /// Returns a flattened snapshot of all agents as wire DTOs, for `list`.
@@ -141,8 +193,14 @@ impl AgentRegistry {
 
     /// Removes an agent from the tree. Returns `true` if found and removed.
     pub fn remove(&self, id: &AgentId) -> bool {
-        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(id)
+        let removed = {
+            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(id)
+        };
+        if removed {
+            let _ = self.events.send(RegistryEvent::Removed { agent_id: id.clone() });
+        }
+        removed
     }
 
     pub fn with_tree_mut<R>(&self, f: impl FnOnce(&mut AgentTree) -> R) -> R {
@@ -352,5 +410,129 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.branch, "feature/auth");
+    }
+
+    // ── broadcast events ──────────────────────────────────────────────────────
+
+    #[test]
+    fn register_root_broadcasts_registered_with_no_parent() {
+        let reg = AgentRegistry::new();
+        let mut rx = reg.subscribe();
+        let result = reg.register(make_register_root("root-agent")).unwrap();
+        match rx.try_recv().unwrap() {
+            RegistryEvent::Registered { agent } => {
+                assert_eq!(agent.id, result.id);
+                assert!(agent.parent_id.is_none());
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_child_broadcasts_registered_with_parent_id() {
+        let reg = AgentRegistry::new();
+        let root = reg.register(make_register_root("root")).unwrap();
+        let mut rx = reg.subscribe();
+        let child = reg
+            .register(RegisterArgs {
+                id: None,
+                name: "child".to_string(),
+                role: AgentRole::Child,
+                parent_id: Some(root.id.clone()),
+                adapter: "claude".to_string(),
+                repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
+                branch: None,
+                initial_status: AgentStatus::Running,
+            })
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            RegistryEvent::Registered { agent } => {
+                assert_eq!(agent.id, child.id);
+                assert_eq!(agent.parent_id, Some(root.id));
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_register_does_not_broadcast() {
+        let reg = AgentRegistry::new();
+        let mut rx = reg.subscribe();
+        let err = reg
+            .register(RegisterArgs {
+                id: None,
+                name: "orphan".to_string(),
+                role: AgentRole::Child,
+                parent_id: Some(AgentId::new()),
+                adapter: "claude".to_string(),
+                repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
+                branch: None,
+                initial_status: AgentStatus::Running,
+            })
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::UnknownParent(_)));
+        assert!(rx.try_recv().is_err(), "a rejected register must not broadcast anything");
+    }
+
+    #[test]
+    fn set_status_broadcasts_status_changed_with_message_and_merged_context_pct() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(10)).unwrap();
+
+        let mut rx = reg.subscribe();
+        reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None).unwrap();
+        match rx.try_recv().unwrap() {
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
+                assert_eq!(agent_id, result.id);
+                assert_eq!(status, AgentStatus::Blocked);
+                assert_eq!(message.as_deref(), Some("waiting"));
+                // Broadcast carries the node's current (merged) value, not the
+                // absent value from this particular push.
+                assert_eq!(context_pct, Some(10));
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_status_unknown_agent_does_not_broadcast() {
+        let reg = AgentRegistry::new();
+        let mut rx = reg.subscribe();
+        let err = reg.set_status(&AgentId::new(), AgentStatus::Done, None, None).unwrap_err();
+        assert!(matches!(err, RegistryError::UnknownAgent(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn remove_broadcasts_removed() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let mut rx = reg.subscribe();
+        assert!(reg.remove(&result.id));
+        match rx.try_recv().unwrap() {
+            RegistryEvent::Removed { agent_id } => assert_eq!(agent_id, result.id),
+            other => panic!("expected Removed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_unknown_agent_does_not_broadcast() {
+        let reg = AgentRegistry::new();
+        let mut rx = reg.subscribe();
+        assert!(!reg.remove(&AgentId::new()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn multiple_subscribers_each_receive_the_same_event() {
+        let reg = AgentRegistry::new();
+        let mut rx1 = reg.subscribe();
+        let mut rx2 = reg.subscribe();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        assert!(matches!(rx1.try_recv().unwrap(), RegistryEvent::Registered { agent } if agent.id == result.id));
+        assert!(matches!(rx2.try_recv().unwrap(), RegistryEvent::Registered { agent } if agent.id == result.id));
     }
 }

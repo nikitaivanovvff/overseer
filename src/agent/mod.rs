@@ -10,7 +10,7 @@ pub mod spawn;
 
 pub use id::AgentId;
 pub use node::{AgentNode, AgentRole};
-pub use registry::AgentRegistry;
+pub use registry::{AgentRegistry, RegistryEvent};
 pub use status::AgentStatus;
 pub use tree::{AgentTree, FlatNode};
 

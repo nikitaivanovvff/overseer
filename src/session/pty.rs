@@ -12,10 +12,13 @@ use alacritty_terminal::event_loop::{
 };
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Pty, Shell};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
 use crate::agent::AgentId;
+use crate::ipc::protocol::{CellDto, ColorDto, GridSnapshot};
 
 /// Scrollback cap — bounds memory for long-running agents.
 const SCROLLBACK_LINES: usize = 10_000;
@@ -49,13 +52,15 @@ impl Dimensions for GridSize {
 pub type AgentTerm = Term<EventProxy>;
 
 /// `EventListener` for one agent's `Term`. Handles the query-reply loop
-/// (`PtyWrite`) and child-exit bookkeeping invisibly to the rest of the app —
-/// callers only ever see `SessionManager::drain_exits`/`is_alive`.
+/// (`PtyWrite`), child-exit bookkeeping, and dirty tracking invisibly to the
+/// rest of the app — callers only ever see `SessionManager::drain_exits`/
+/// `is_alive`/`take_dirty`.
 #[derive(Clone)]
 pub struct EventProxy {
     id: AgentId,
     sender: Arc<OnceLock<EventLoopSender>>,
     alive: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
     exits: Arc<Mutex<Vec<(AgentId, bool)>>>,
 }
 
@@ -74,6 +79,13 @@ impl EventListener for EventProxy {
                     .unwrap_or_else(|e| e.into_inner())
                     .push((self.id.clone(), status.success()));
             }
+            // "New terminal content available" — the daemon's attach
+            // connection polls this flag to decide whether the watched
+            // agent's grid snapshot needs resending (session::pty doesn't
+            // have raw PTY bytes to stream directly; see `GridSnapshot`).
+            Event::Wakeup => {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -85,6 +97,7 @@ struct PtySession {
     term: Arc<FairMutex<AgentTerm>>,
     channel: EventLoopSender,
     alive: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
     reader: Option<JoinHandle<(SessionEventLoop, EventLoopState)>>,
     /// The child's own pid, captured before it moves into the `EventLoop` —
     /// needed because `kill()` must be able to force-terminate it directly
@@ -198,10 +211,15 @@ impl SessionManager {
 
         let sender_slot: Arc<OnceLock<EventLoopSender>> = Arc::new(OnceLock::new());
         let alive = Arc::new(AtomicBool::new(true));
+        // Starts dirty so a `Watch` arriving before the first real Wakeup
+        // still finds something worth sending — harmless either way since
+        // `Watch` also sends an immediate snapshot regardless of this flag.
+        let dirty = Arc::new(AtomicBool::new(true));
         let proxy = EventProxy {
             id: id.clone(),
             sender: sender_slot.clone(),
             alive: alive.clone(),
+            dirty: dirty.clone(),
             exits: self.exits.clone(),
         };
 
@@ -220,7 +238,7 @@ impl SessionManager {
 
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
-            PtySession { term, channel, alive, reader: Some(reader), pid },
+            PtySession { term, channel, alive, dirty, reader: Some(reader), pid },
         );
         Ok(())
     }
@@ -295,6 +313,25 @@ impl SessionManager {
         Some(f(&term))
     }
 
+    /// Consumes (resets to `false`) and returns whether `id`'s terminal has
+    /// produced new content since the last call. The daemon's attach
+    /// connection polls this for the watched agent instead of resending an
+    /// unchanged grid every tick. `false` for an unknown id or in dry-run
+    /// mode — nothing to send either way.
+    pub fn take_dirty(&self, id: &AgentId) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .is_some_and(|s| s.dirty.swap(false, Ordering::Relaxed))
+    }
+
+    /// Renders `id`'s current terminal grid into a wire-ready `GridSnapshot`
+    /// (DAEMON.md "Attach protocol") — `None` if the session isn't live.
+    pub fn grid_snapshot(&self, id: &AgentId) -> Option<GridSnapshot> {
+        self.with_term(id, grid_snapshot_from_term)
+    }
+
     /// Drains the set of agents whose PTY child has exited since the last call
     /// — consumed by the dead-session watcher in place of polling. Each entry is
     /// `(id, success)`, `success` being the child's exit status (`true` for a
@@ -314,6 +351,80 @@ impl SessionManager {
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pure — extracts a full `GridSnapshot` from `term`'s current renderable
+/// content. Mirrors `ui::term_pane::paint_term`'s cell iteration (wide-char
+/// spacers stay `None`, same flag/color handling) but builds a wire DTO
+/// instead of painting into a ratatui buffer, since the daemon can't hand a
+/// live `Term` across the process boundary.
+fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
+    let cols = term.columns();
+    let lines = term.screen_lines();
+    let mut cells: Vec<Option<CellDto>> = vec![None; cols * lines];
+
+    let content = term.renderable_content();
+    for cell in content.display_iter {
+        let point = cell.point;
+        if point.line.0 < 0 {
+            continue;
+        }
+        let row = point.line.0 as usize;
+        let col = point.column.0;
+        if row >= lines || col >= cols || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+        cells[row * cols + col] = Some(CellDto {
+            ch,
+            fg: dto_color(cell.fg),
+            bg: dto_color(cell.bg),
+            bold: cell.flags.contains(Flags::BOLD),
+            italic: cell.flags.contains(Flags::ITALIC),
+            underline: cell.flags.contains(Flags::UNDERLINE),
+            inverse: cell.flags.contains(Flags::INVERSE),
+        });
+    }
+
+    let cursor_point = content.cursor.point;
+    let cursor = if cursor_point.line.0 >= 0 {
+        let row = cursor_point.line.0 as usize;
+        let col = cursor_point.column.0;
+        (row < lines && col < cols).then_some((row as u16, col as u16))
+    } else {
+        None
+    };
+
+    GridSnapshot { cols: cols as u16, lines: lines as u16, cells, cursor }
+}
+
+/// Pure — the wire-side twin of `ui::term_pane::map_color`, targeting
+/// `ColorDto` instead of `ratatui::style::Color` so `session::pty` never
+/// needs a `ratatui` dependency.
+fn dto_color(color: AnsiColor) -> ColorDto {
+    match color {
+        AnsiColor::Spec(rgb) => ColorDto::Rgb(rgb.r, rgb.g, rgb.b),
+        AnsiColor::Indexed(idx) => ColorDto::Indexed(idx),
+        AnsiColor::Named(named) => match named {
+            NamedColor::Black => ColorDto::Black,
+            NamedColor::Red => ColorDto::Red,
+            NamedColor::Green => ColorDto::Green,
+            NamedColor::Yellow => ColorDto::Yellow,
+            NamedColor::Blue => ColorDto::Blue,
+            NamedColor::Magenta => ColorDto::Magenta,
+            NamedColor::Cyan => ColorDto::Cyan,
+            NamedColor::White => ColorDto::White,
+            NamedColor::BrightBlack => ColorDto::DarkGray,
+            NamedColor::BrightRed => ColorDto::LightRed,
+            NamedColor::BrightGreen => ColorDto::LightGreen,
+            NamedColor::BrightYellow => ColorDto::LightYellow,
+            NamedColor::BrightBlue => ColorDto::LightBlue,
+            NamedColor::BrightMagenta => ColorDto::LightMagenta,
+            NamedColor::BrightCyan => ColorDto::LightCyan,
+            NamedColor::BrightWhite => ColorDto::White,
+            _ => ColorDto::Reset,
+        },
     }
 }
 
@@ -412,5 +523,104 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("kill() must not block forever on a child that ignores HUP/TERM");
         assert!(!s.is_alive(&id));
+    }
+
+    // ── take_dirty / grid_snapshot ───────────────────────────────────────────
+
+    #[test]
+    fn take_dirty_is_false_for_an_unknown_id() {
+        let s = SessionManager::dry_run();
+        assert!(!s.take_dirty(&AgentId::new()));
+    }
+
+    #[test]
+    fn grid_snapshot_is_none_for_an_unknown_id() {
+        let s = SessionManager::dry_run();
+        assert!(s.grid_snapshot(&AgentId::new()).is_none());
+    }
+
+    #[test]
+    fn real_session_becomes_dirty_and_yields_a_grid_snapshot() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf hello; sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.take_dirty(&id)
+        });
+        assert!(became_dirty, "a live session that printed output must eventually report dirty");
+
+        let grid = s.grid_snapshot(&id).expect("live session must yield a grid snapshot");
+        let text: String = grid
+            .cells
+            .iter()
+            .filter_map(|c| c.as_ref().map(|c| c.ch))
+            .collect();
+        assert!(text.contains("hello"), "grid should contain the child's printed output, got {text:?}");
+
+        s.kill(&id);
+    }
+
+    // ── grid_snapshot_from_term / dto_color (pure) ───────────────────────────
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::{NamedColor, Processor, Rgb};
+
+    fn term_from(bytes: &[u8], cols: usize, lines: usize) -> Term<VoidListener> {
+        let size = GridSize { cols, lines };
+        let mut term = Term::new(TermConfig::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    #[test]
+    fn grid_snapshot_reports_dimensions_and_plain_text() {
+        let term = term_from(b"hi", 10, 3);
+        let grid = grid_snapshot_from_term(&term);
+        assert_eq!(grid.cols, 10);
+        assert_eq!(grid.lines, 3);
+        assert_eq!(grid.cells[0].as_ref().unwrap().ch, 'h');
+        assert_eq!(grid.cells[1].as_ref().unwrap().ch, 'i');
+        assert_eq!(grid.cells[2].as_ref().unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn grid_snapshot_wide_char_spacer_stays_none() {
+        // U+4F60 ("你") is double-width — the spacer cell after it must not
+        // get a stray second glyph (mirrors term_pane's identical test).
+        let term = term_from("你".as_bytes(), 10, 3);
+        let grid = grid_snapshot_from_term(&term);
+        assert_eq!(grid.cells[0].as_ref().unwrap().ch, '你');
+        assert!(grid.cells[1].is_none());
+    }
+
+    #[test]
+    fn grid_snapshot_captures_bold_and_color_flags() {
+        // \x1b[1;31m = bold + red foreground
+        let term = term_from(b"\x1b[1;31mX", 10, 3);
+        let grid = grid_snapshot_from_term(&term);
+        let cell = grid.cells[0].as_ref().unwrap();
+        assert_eq!(cell.ch, 'X');
+        assert!(cell.bold);
+        assert_eq!(cell.fg, ColorDto::Red);
+    }
+
+    #[test]
+    fn grid_snapshot_cursor_position_reflects_input() {
+        let term = term_from(b"ab", 10, 3);
+        let grid = grid_snapshot_from_term(&term);
+        assert_eq!(grid.cursor, Some((0, 2)));
+    }
+
+    #[test]
+    fn dto_color_maps_named_and_bright_and_rgb() {
+        assert_eq!(dto_color(AnsiColor::Named(NamedColor::Green)), ColorDto::Green);
+        assert_eq!(dto_color(AnsiColor::Named(NamedColor::BrightBlack)), ColorDto::DarkGray);
+        assert_eq!(dto_color(AnsiColor::Indexed(200)), ColorDto::Indexed(200));
+        assert_eq!(dto_color(AnsiColor::Spec(Rgb { r: 1, g: 2, b: 3 })), ColorDto::Rgb(1, 2, 3));
     }
 }

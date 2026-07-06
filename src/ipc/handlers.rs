@@ -105,6 +105,21 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 Err(e) => Response::err(e.to_string()),
             }
         }
+
+        // These only make sense inside a stateful attach connection — the
+        // server's `handle_conn` intercepts `Attach` before a request ever
+        // reaches `dispatch`, and switches to a dedicated event-stream loop
+        // that owns `Watch`/`Unwatch`/`Write`/`Resize` from then on. Reaching
+        // here means one arrived over an ordinary one-shot connection instead.
+        Request::Attach | Request::Watch { .. } | Request::Unwatch | Request::Write { .. } | Request::Resize { .. } => {
+            Response::err("this request requires an attach connection (Request::Attach first)")
+        }
+
+        // `overseer shutdown` (DAEMON.md Task 4): a one-shot request like any
+        // other — recursive-drops every root, then the daemon exits. Wired up
+        // in Task 4; a placeholder here keeps this match exhaustive in the
+        // meantime.
+        Request::Shutdown => Response::err("shutdown not yet implemented"),
     }
 }
 
@@ -324,5 +339,23 @@ mod tests {
 
         let list_resp = dispatch(&ctx, Request::List);
         assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.len() == 1));
+    }
+
+    // ── attach-only requests reaching the one-shot path ──────────────────────
+
+    #[test]
+    fn dispatch_rejects_attach_only_requests_outside_an_attach_connection() {
+        let ctx = make_ctx();
+        for req in [
+            Request::Attach,
+            Request::Watch { agent_id: AgentId::new() },
+            Request::Unwatch,
+            Request::Write { agent_id: AgentId::new(), data: "x".to_string() },
+            Request::Resize { cols: 80, lines: 24 },
+        ] {
+            let resp = dispatch(&ctx, req);
+            assert!(!resp.ok, "attach-only request must not succeed over a one-shot connection");
+            assert!(resp.error.as_deref().unwrap_or("").contains("attach connection"));
+        }
     }
 }
