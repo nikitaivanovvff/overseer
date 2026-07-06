@@ -136,7 +136,7 @@ Dropping an agent kills its PTY and deregisters it — that's all. Overseer does
 
 A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0 — including a root shell where the user typed `exit`) or `error` (non-zero/signal), and the agent stays visible for you to review before an explicit `drop`.
 
-**v1 has no persistence.** Agents are child processes of the Overseer process itself — quitting (`q`, with anything registered) kills every one of them, no reattach, no daemon. That's an accepted regression versus the old tmux backend (which survived a TUI restart); a daemon split reusing the same `SessionManager` is the planned path back to persistence, not yet built. `q`/`Ctrl-C` confirm first whenever any agent is still registered, so this is never silent.
+**Quitting never kills agents.** `q`/`Ctrl-C` exits the TUI immediately, no confirm — Overseer just stops watching. Each agent is an independent child process (a real PTY, not owned by any in-TUI abstraction beyond `SessionManager`'s bookkeeping), so it keeps running after Overseer exits, tmux-detach style. The only way to actually kill a session is `d`/`D` on it directly, which still confirms since that one *is* destructive. Caveat: **v1 has no persistence** — the registry is in-memory only, so a fresh Overseer launch starts with an empty tree and has no way to reattach to agents left running from a previous session (they're still alive as orphaned processes, just no longer tracked). A daemon split reusing the same `SessionManager` across TUI restarts is the planned path to real reattachment, not yet built.
 
 ### TUI Layout
 
@@ -175,7 +175,7 @@ Status badges: `●` running · `!` blocked (needs you — permission pending) �
 | `s` | Spawn child under selected agent (adapter-launched, same as before) |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
-| `q` / `Ctrl-C` | Quit — confirms first if any agent is registered (v1 has no persistence, this kills them) |
+| `q` / `Ctrl-C` | Quit immediately, no confirm — never kills any agent (see Cleanup) |
 
 ### Spawn Data Flow
 
@@ -273,4 +273,5 @@ Implementation plans (`PHASE*.md`) and research notes live in **`.specs/`**, whi
 - **Don't add agent status polling.** If hooks aren't firing, the fix is in `overseer install` (the installed hooks), not in adding a background poller.
 - **Don't reimplement git.** No worktree creation, no branching, no merging, no `git worktree` anywhere. Agents own their isolation. Overseer's only git use is read-only display info (repo name, current branch).
 - **Don't write into the user's repo.** All agent config (skill, hooks) is installed at the user level by `overseer install`. Launch injects env only.
-- **Don't skip the confirm prompt for `d`/`D`, or for quitting with agents registered.** Killing a running agent's session interrupts in-flight work — confirm first. v1 has no persistence, so quitting is exactly as destructive as a drop.
+- **Don't skip the confirm prompt for `d`/`D`.** Killing a running agent's session interrupts in-flight work — confirm first.
+- **Don't make quitting kill agents.** `q`/`Ctrl-C` must exit the TUI without touching any session — agents are independent processes that outlive it. `d`/`D` is the only path that kills one, on purpose, with a confirm.

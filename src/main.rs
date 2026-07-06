@@ -520,8 +520,11 @@ fn run_app<B: ratatui::backend::Backend>(
 /// `false` to request the run loop break (quit).
 fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return start_quit(app),
-        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return start_quit(app),
+        // Quitting never kills agents — they're independent child processes
+        // that outlive the TUI, tmux-detach style (AGENTS.md Cleanup). Use
+        // `d`/`D` on a specific agent first if you want it gone.
+        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return false,
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return false,
         _ => {}
     }
 
@@ -572,30 +575,6 @@ fn jump_in(app: &mut App) {
         app.focus = Focus::Pane;
     } else {
         app.status_message = Some("agent is not running".to_string());
-    }
-}
-
-/// `q`/`Ctrl-C` from the tree: quit immediately if nothing would be lost,
-/// otherwise ask for confirmation first — v1 has no persistence, quitting
-/// kills every live agent. Returns `false` only when it's
-/// safe to quit immediately (the confirm path breaks the loop itself, from
-/// `handle_confirm_key`, once the user answers).
-fn start_quit(app: &mut App) -> bool {
-    if count_live_agents(app) == 0 {
-        return false;
-    }
-    app.status_message = None;
-    app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
-    true
-}
-
-fn count_live_agents(app: &App) -> usize {
-    app.ctx.registry.snapshot().iter().filter(|a| app.ctx.sessions.is_alive(&a.id)).count()
-}
-
-fn quit_all_agents(app: &App) {
-    for agent in app.ctx.registry.snapshot() {
-        app.ctx.sessions.kill(&agent.id);
     }
 }
 
@@ -651,11 +630,6 @@ fn build_prompt(app: &App) -> Option<String> {
                     String::new()
                 };
                 format!("drop '{name}'{suffix}? (y/n)")
-            }
-            ConfirmAction::Quit => {
-                let n = count_live_agents(app);
-                let noun = if n == 1 { "agent" } else { "agents" };
-                format!("{n} {noun} running and will be killed — quit? (y/n)")
             }
         });
     }
@@ -778,7 +752,9 @@ fn expand_repo_path(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-/// Returns `false` to request the run loop break (a confirmed quit).
+/// Returns `false` to request the run loop break. Currently only reached via
+/// `d`/`D` confirmation — quitting no longer goes through here (it never
+/// kills anything, so it never needed a confirm).
 fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
     let Some(confirm) = app.confirm.take() else { return true };
     match key.code {
@@ -789,10 +765,6 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
                     Err(e) => app.status_message = Some(format!("drop failed: {e}")),
                 }
                 true
-            }
-            ConfirmAction::Quit => {
-                quit_all_agents(app);
-                false
             }
         },
         KeyCode::Char('n') | KeyCode::Esc => {
@@ -988,69 +960,45 @@ mod tests {
     }
 
     #[test]
-    fn count_live_agents_reflects_session_liveness_not_registry_size() {
-        let live_id = AgentId::new();
-        let sessions =
-            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
-        let app = app_with_sessions(sessions);
-        register_agent(&app, Some(live_id));
-        register_agent(&app, None); // registered, but its session isn't in the live set
-
-        assert_eq!(count_live_agents(&app), 1);
-    }
-
-    #[test]
-    fn start_quit_returns_false_immediately_when_nothing_is_live() {
-        let mut app = app_with_sessions(SessionManager::dry_run());
-        register_agent(&app, None); // registered but dead — nothing to lose
-
-        assert!(!start_quit(&mut app));
-        assert!(app.confirm.is_none());
-    }
-
-    #[test]
-    fn start_quit_asks_for_confirmation_when_an_agent_is_live() {
+    fn q_quits_immediately_even_with_a_live_agent_registered() {
         let live_id = AgentId::new();
         let sessions =
             SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
         let mut app = app_with_sessions(sessions);
         register_agent(&app, Some(live_id));
 
-        assert!(start_quit(&mut app));
-        assert!(matches!(app.confirm.as_ref().unwrap().action, ConfirmAction::Quit));
+        let should_continue =
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert!(!should_continue, "q must quit immediately, no confirm gate");
+        assert!(app.confirm.is_none());
     }
 
     #[test]
-    fn confirming_quit_breaks_the_loop() {
+    fn ctrl_c_quits_immediately_too() {
         let mut app = app_with_sessions(SessionManager::dry_run());
-        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
-
-        let should_continue = handle_confirm_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-
+        let should_continue =
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!should_continue);
     }
 
     #[test]
-    fn cancelling_quit_keeps_running_and_clears_the_prompt() {
-        let mut app = app_with_sessions(SessionManager::dry_run());
-        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
-
-        let should_continue = handle_confirm_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-
-        assert!(should_continue);
-        assert!(app.confirm.is_none());
-    }
-
-    #[test]
-    fn quit_prompt_text_pluralizes_correctly() {
+    fn quitting_never_kills_live_sessions() {
+        // Quitting must not touch SessionManager at all — agents are independent
+        // child processes that outlive the TUI (tmux-detach style), not something
+        // the quit path kills. `dry_run_with_live_sessions` reports `is_alive`
+        // from a fixed set it was constructed with, so if quitting called
+        // `kill()` on anything, `is_alive` would still report the same value
+        // (dry-run kill is a no-op) — the real guarantee here is behavioral:
+        // `handle_tree_key`'s quit arms never call `app.ctx.sessions.kill`.
         let live_id = AgentId::new();
         let sessions =
             SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
         let mut app = app_with_sessions(sessions);
-        register_agent(&app, Some(live_id));
-        app.confirm = Some(ConfirmState { action: ConfirmAction::Quit });
+        register_agent(&app, Some(live_id.clone()));
 
-        let prompt = build_prompt(&app).unwrap();
-        assert!(prompt.contains("1 agent running and will be killed"), "{prompt}");
+        handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert!(app.ctx.sessions.is_alive(&live_id), "quit must not kill live agents");
     }
 }

@@ -276,9 +276,9 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
-        // v1 has no persistence: quitting with any agents still
-        // registered kills them, so the hint says so rather than a bare "quit".
-        let quit_hint = if total > 0 { " quit (confirms)" } else { " quit" };
+        // Quitting never kills agents (they outlive the TUI, tmux-detach
+        // style) — `d`/`D` is the only path that kills a session, and that's
+        // the one that still confirms.
         let hints: Vec<Span> = vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
@@ -291,7 +291,7 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
             Span::styled("d/D", Style::default().fg(Color::Yellow)),
             Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(quit_hint, Style::default().fg(Color::DarkGray)),
+            Span::styled(" quit", Style::default().fg(Color::DarkGray)),
         ];
         let counts_text = if blocked > 0 {
             format!("{running}/{total} running · {blocked} blocked")
