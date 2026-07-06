@@ -624,6 +624,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "unicode-segmentation",
  "uuid",
 ]
 

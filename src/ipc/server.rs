@@ -100,8 +100,16 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 /// code 0 — including a root shell where the user typed `exit`) or `error`
 /// (non-zero/signal). Synchronous and side-effect-only against
 /// `registry`/`sessions`, so it's directly unit-testable without a tokio runtime.
+///
+/// Skips an agent that already reports `done`: that's an explicit push from
+/// the agent itself declaring the task complete, a stronger signal than this
+/// exit-code inference — its wrapping process exiting non-zero afterward
+/// (e.g. during its own teardown) must not silently downgrade it to `error`.
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     for (id, success) in sessions.drain_exits() {
+        if registry.get(&id).is_some_and(|a| a.status == AgentStatus::Done) {
+            continue;
+        }
         let (status, message) = if success {
             (AgentStatus::Done, None)
         } else {
@@ -168,6 +176,22 @@ mod tests {
 
         let root = registry.get(&root_id).unwrap();
         assert_eq!(root.status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn sweep_does_not_downgrade_an_already_done_agent_to_error() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        registry.set_status(&root_id, AgentStatus::Done, None, None).unwrap();
+
+        // The wrapping process exits non-zero after the agent already
+        // explicitly reported done — that must not clobber it.
+        sessions.simulate_exit(root_id.clone(), false);
+        sweep_exited_sessions(&registry, &sessions);
+
+        let root = registry.get(&root_id).unwrap();
+        assert_eq!(root.status, AgentStatus::Done, "explicit done must survive a later non-zero exit");
     }
 
     #[test]

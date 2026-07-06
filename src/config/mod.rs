@@ -4,14 +4,38 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    #[serde(default)]
     pub defaults: Defaults,
-    #[serde(default = "default_adapters")]
     pub adapters: HashMap<String, AdapterConfig>,
+}
+
+/// Deserializes the raw TOML shape, then merges the user's `[adapters.*]` on
+/// top of the built-in defaults instead of letting it replace the whole map —
+/// a file that only overrides `[adapters.aider]` must not lose the built-in
+/// `claude` entry it never mentioned. This is a property of `Config` itself
+/// (not a post-`load()` patch) so it holds for any caller that deserializes a
+/// `Config`, not just the real `~/.config/overseer/config.toml` load path.
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawConfig {
+            #[serde(default)]
+            defaults: Defaults,
+            #[serde(default)]
+            adapters: HashMap<String, AdapterConfig>,
+        }
+
+        let raw = RawConfig::deserialize(deserializer)?;
+        let mut adapters = default_adapters();
+        adapters.extend(raw.adapters);
+        Ok(Config { defaults: raw.defaults, adapters })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +142,36 @@ mod tests {
         assert_eq!(claude.extra_args, vec!["--dangerously-skip-permissions".to_string()]);
         let aider = cfg.adapters.get("aider").unwrap();
         assert_eq!(aider.command, "/usr/local/bin/aider");
+    }
+
+    #[test]
+    fn partial_adapters_override_keeps_the_built_in_claude_entry() {
+        // A file that only adds a second adapter (the exact AGENTS.md example)
+        // must not lose the built-in "claude" entry it never mentioned.
+        let raw = r#"
+            [adapters.aider]
+            command = "/usr/local/bin/aider"
+            extra_args = []
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.defaults.adapter, "claude"); // untouched default
+        let claude = cfg.adapters.get("claude").expect("claude must survive a partial override");
+        assert_eq!(claude.command, "claude");
+        let aider = cfg.adapters.get("aider").unwrap();
+        assert_eq!(aider.command, "/usr/local/bin/aider");
+    }
+
+    #[test]
+    fn explicit_claude_override_replaces_the_default_entry() {
+        let raw = r#"
+            [adapters.claude]
+            command = "/opt/claude-wrapper"
+            extra_args = ["--foo"]
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let claude = cfg.adapters.get("claude").unwrap();
+        assert_eq!(claude.command, "/opt/claude-wrapper");
+        assert_eq!(claude.extra_args, vec!["--foo".to_string()]);
     }
 
     #[test]

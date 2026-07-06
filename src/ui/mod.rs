@@ -8,6 +8,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::agent::{AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction};
 use crate::session::SessionManager;
@@ -190,18 +192,22 @@ fn format_tree_row(name: &str, status_label: &str, pct: Option<u8>, width: usize
     TreeRowLayout { name, status_word, pct_suffix }
 }
 
-/// Truncates `s` to at most `max` characters, replacing the last character with
-/// `…` when it doesn't fit — never panics, even for `max` of 0 or 1.
+/// Truncates `s` to at most `max` grapheme clusters, replacing the last one
+/// with `…` when it doesn't fit — never panics, even for `max` of 0 or 1.
+/// Cuts on grapheme cluster boundaries (not `char`/Unicode scalar value), so a
+/// base letter + combining accent or a ZWJ emoji sequence at the truncation
+/// point is kept whole instead of split into a dangling combining mark or half
+/// a sequence.
 fn truncate_with_ellipsis(s: &str, max: usize) -> String {
-    let len = s.chars().count();
-    if len <= max {
+    let graphemes: Vec<&str> = s.graphemes(true).collect();
+    if graphemes.len() <= max {
         s.to_string()
     } else if max == 0 {
         String::new()
     } else if max == 1 {
         "…".to_string()
     } else {
-        let keep: String = s.chars().take(max - 1).collect();
+        let keep: String = graphemes[..max - 1].concat();
         format!("{keep}…")
     }
 }
@@ -450,6 +456,32 @@ mod tests {
     #[test]
     fn truncate_with_ellipsis_overflow_gets_ellipsis() {
         assert_eq!(truncate_with_ellipsis("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_a_multi_codepoint_grapheme_whole() {
+        // "é" as base "e" + combining acute accent (U+0301) is 2 chars but one
+        // grapheme cluster — truncating by char would split it and leave a
+        // dangling combining mark; by grapheme it must stay whole or be dropped.
+        let combining_e_acute = "e\u{0301}";
+        let name = format!("caf{combining_e_acute}"); // "café", 4 graphemes, 5 chars
+        let truncated = truncate_with_ellipsis(&name, 4); // fits exactly, no truncation
+        assert_eq!(truncated, name);
+
+        let truncated = truncate_with_ellipsis(&name, 3); // must drop the whole café-accent grapheme, not split it
+        assert_eq!(truncated, "ca…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_a_zwj_emoji_sequence_whole() {
+        // Family emoji: man + ZWJ + woman + ZWJ + girl — one grapheme cluster
+        // made of 5 Unicode scalar values (3 emoji + 2 ZWJ joiners). A
+        // char-based truncation to budget 2 would keep only the first 2
+        // scalar values (man + ZWJ), a dangling broken half-sequence.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let name = format!("{family}extra"); // 6 graphemes: family, e, x, t, r, a
+        let truncated = truncate_with_ellipsis(&name, 2);
+        assert_eq!(truncated, format!("{family}…"), "the ZWJ sequence must survive whole, not be split");
     }
 
     #[test]
