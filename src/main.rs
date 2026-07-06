@@ -4,6 +4,7 @@ mod agent;
 mod app;
 mod cli;
 mod config;
+mod daemon;
 mod git;
 mod install;
 mod ipc;
@@ -24,6 +25,7 @@ fn main() -> Result<()> {
     match parsed.cmd {
         None => tui::run_tui(socket, parsed.mock),
         Some(Command::Install { agent, uninstall }) => install::run_install(&agent, uninstall),
+        Some(Command::Daemon) => daemon::run_daemon(socket),
         Some(cmd) => cli::run_client(socket, cmd),
     }
 }

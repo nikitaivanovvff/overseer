@@ -291,7 +291,7 @@ fn collect_postorder(node: &AgentNode, out: &mut Vec<AgentId>) {
     out.push(node.id.clone());
 }
 
-fn remove_descendant(nodes: &mut Vec<AgentNode>, id: &AgentId) -> bool {
+fn remove_descendant(nodes: &mut [AgentNode], id: &AgentId) -> bool {
     for node in nodes.iter_mut() {
         if let Some(pos) = node.children.iter().position(|c| c.id == *id) {
             node.children.remove(pos);

@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 /// For each hook event in `overlay["hooks"]`:
 /// - Removes any existing entries with `_overseer: true` (idempotent re-run).
 /// - Appends the overlay entries.
+///
 /// Unrelated keys in `existing` are untouched.
 pub fn merge_hooks(existing: &mut Value, overlay: &Value) {
     let Some(overlay_hooks) = overlay["hooks"].as_object() else {

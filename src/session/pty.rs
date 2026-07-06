@@ -187,7 +187,6 @@ impl SessionManager {
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: true,
             env: full_env,
-            ..PtyOptions::default()
         };
 
         let window_size = WindowSize {

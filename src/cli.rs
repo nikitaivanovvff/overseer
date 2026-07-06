@@ -51,6 +51,12 @@ pub enum Command {
         #[arg(long)]
         uninstall: bool,
     },
+    /// Runs the daemon that owns the registry, sessions, and IPC socket across
+    /// TUI restarts. Not meant to be run by hand — the TUI auto-spawns one,
+    /// detached, the first time it can't reach the socket. Hidden from
+    /// `--help` since it's an implementation detail, not a user workflow.
+    #[command(hide = true)]
+    Daemon,
     /// Start a root: a bare shell in a repo (server-side launch via the running
     /// TUI), registered immediately and named after the repo. Run your own agent
     /// inside it whenever you're ready — Overseer picks up its status via the
@@ -107,7 +113,7 @@ impl From<StatusArg> for AgentStatus {
 pub fn resolve_socket(cli_socket: Option<PathBuf>) -> PathBuf {
     cli_socket
         .or_else(|| std::env::var("OVERSEER_SOCKET").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp/overseer.sock"))
+        .unwrap_or_else(crate::daemon::default_socket_path)
 }
 
 pub fn run_client(socket: PathBuf, cmd: Command) -> Result<()> {
@@ -203,6 +209,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
             Ok(Some(Request::Drop { agent_id, recursive }))
         }
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
+        Command::Daemon => unreachable!("Daemon is handled before run_client"),
     }
 }
 
