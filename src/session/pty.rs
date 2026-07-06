@@ -13,7 +13,7 @@ use alacritty_terminal::event_loop::{
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
@@ -396,7 +396,15 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
         None
     };
 
-    GridSnapshot { cols: cols as u16, lines: lines as u16, cells, cursor }
+    let mode = term.mode();
+    GridSnapshot {
+        cols: cols as u16,
+        lines: lines as u16,
+        cells,
+        cursor,
+        app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
+        bracketed_paste_mode: mode.contains(TermMode::BRACKETED_PASTE),
+    }
 }
 
 /// Pure — the wire-side twin of `ui::term_pane::map_color`, targeting

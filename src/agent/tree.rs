@@ -119,6 +119,11 @@ impl AgentTree {
         find_node_mut(&mut self.roots, id)
     }
 
+    /// Returns an immutable reference to the node with the given id (recursive).
+    pub fn find(&self, id: &AgentId) -> Option<&AgentNode> {
+        find_node(&self.roots, id)
+    }
+
     /// Inserts `node` as a child of the node identified by `parent_id`.
     /// Returns `true` if the parent was found, `false` otherwise.
     pub fn insert_child(&mut self, parent_id: &AgentId, node: AgentNode) -> bool {
@@ -562,6 +567,19 @@ mod tests {
         let mut tree = make_tree();
         let unknown = AgentId::new();
         assert!(tree.find_mut(&unknown).is_none());
+    }
+
+    #[test]
+    fn test_find_returns_immutable_ref_to_grandchild() {
+        let tree = make_tree();
+        let gc_id = tree.roots[0].children[0].children[0].id.clone();
+        assert_eq!(tree.find(&gc_id).unwrap().name, "grandchild");
+    }
+
+    #[test]
+    fn test_find_unknown_returns_none() {
+        let tree = make_tree();
+        assert!(tree.find(&AgentId::new()).is_none());
     }
 
     #[test]

@@ -12,9 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction};
-use crate::session::SessionManager;
 
-pub use term_pane::render_term_pane;
+pub use term_pane::{render_term_pane, PaneSource};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -58,7 +57,7 @@ pub fn render(
     tick: u64,
     prompt: Option<&str>,
     input: Option<&InputState>,
-    sessions: &SessionManager,
+    pane_source: &PaneSource,
     pane_focused: bool,
 ) -> Rect {
     let area = frame.area();
@@ -91,7 +90,7 @@ pub fn render(
     render_agent_tree(frame, tree.cursor, tick, left[0], &flat);
     render_agent_detail(frame, left[1], &selected);
     let pane_rect =
-        render_term_pane(frame, columns[1], sessions, selected.as_ref().map(|n| &n.id), pane_focused);
+        render_term_pane(frame, columns[1], pane_source, selected.as_ref().map(|n| &n.id), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything — a bordered, centered modal instead of

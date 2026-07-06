@@ -1,6 +1,23 @@
 use alacritty_terminal::term::TermMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Reconstructs the two `TermMode` bits `encode_key`/`encode_paste` actually
+/// consult, from the flags a `GridSnapshot` carries across the wire. Daemon
+/// (real) mode has no local `Term` to call `.mode()` on directly — this is
+/// the one place that gap is bridged, keeping `app.rs`/`tui.rs` from needing
+/// their own `alacritty_terminal` import (AGENTS.md: that stays confined to
+/// `session/` and the pane renderer).
+pub fn term_mode_from_flags(app_cursor: bool, bracketed_paste: bool) -> TermMode {
+    let mut mode = TermMode::empty();
+    if app_cursor {
+        mode.insert(TermMode::APP_CURSOR);
+    }
+    if bracketed_paste {
+        mode.insert(TermMode::BRACKETED_PASTE);
+    }
+    mode
+}
+
 /// Encodes a crossterm key event into the bytes to write to a PTY, respecting
 /// `mode` (application cursor keys). `None` for events with no PTY-meaningful
 /// encoding (e.g. a bare modifier press). This is the one component with no
@@ -115,6 +132,21 @@ fn encode_function_key(n: u8) -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_mode_from_flags_both_false_is_empty() {
+        assert_eq!(term_mode_from_flags(false, false), TermMode::empty());
+    }
+
+    #[test]
+    fn term_mode_from_flags_sets_only_the_requested_bits() {
+        assert_eq!(term_mode_from_flags(true, false), TermMode::APP_CURSOR);
+        assert_eq!(term_mode_from_flags(false, true), TermMode::BRACKETED_PASTE);
+        assert_eq!(
+            term_mode_from_flags(true, true),
+            TermMode::APP_CURSOR | TermMode::BRACKETED_PASTE
+        );
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

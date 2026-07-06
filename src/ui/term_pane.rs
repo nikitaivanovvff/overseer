@@ -11,7 +11,19 @@ use ratatui::{
 };
 
 use crate::agent::AgentId;
+use crate::ipc::protocol::{ColorDto, GridSnapshot};
 use crate::session::SessionManager;
+
+/// Where `render_term_pane` gets the selected agent's terminal content from.
+/// Mock mode holds a live `Term` locally (`Local`); real (daemon-attached)
+/// mode only ever has the last `GridSnapshot` the daemon streamed for the
+/// watched agent (`Remote`) — there's no local `Term` to read from across
+/// the process boundary (see `session::pty` for why raw bytes aren't
+/// streamed instead).
+pub enum PaneSource<'a> {
+    Local(&'a SessionManager),
+    Remote(Option<&'a GridSnapshot>),
+}
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
 /// half of the tree|pane split. `focused` draws the cursor
@@ -20,7 +32,7 @@ use crate::session::SessionManager;
 pub fn render_term_pane(
     frame: &mut Frame,
     area: Rect,
-    sessions: &SessionManager,
+    source: &PaneSource,
     selected: Option<&AgentId>,
     focused: bool,
 ) -> Rect {
@@ -35,8 +47,19 @@ pub fn render_term_pane(
         return inner;
     };
 
-    let painted = sessions.with_term(id, |term| paint_term(term, inner, frame.buffer_mut(), focused));
-    if painted.is_none() {
+    let painted = match source {
+        PaneSource::Local(sessions) => {
+            sessions.with_term(id, |term| paint_term(term, inner, frame.buffer_mut(), focused)).is_some()
+        }
+        PaneSource::Remote(grid) => match grid {
+            Some(grid) => {
+                paint_grid_snapshot(grid, inner, frame.buffer_mut(), focused);
+                true
+            }
+            None => false,
+        },
+    };
+    if !painted {
         frame.render_widget(placeholder("agent not running"), inner);
     }
     inner
@@ -132,6 +155,77 @@ fn map_color(color: AnsiColor) -> Color {
             NamedColor::BrightWhite => Color::White,
             _ => Color::Reset,
         },
+    }
+}
+
+/// The wire-side twin of `map_color`, above — converts the daemon's
+/// `ColorDto` (built server-side by `session::pty::dto_color`) back into a
+/// `ratatui::style::Color`. A mechanical 1:1 mapping since `ColorDto` was
+/// deliberately shaped to mirror `Color`'s own variants.
+fn map_dto_color(color: ColorDto) -> Color {
+    match color {
+        ColorDto::Reset => Color::Reset,
+        ColorDto::Black => Color::Black,
+        ColorDto::Red => Color::Red,
+        ColorDto::Green => Color::Green,
+        ColorDto::Yellow => Color::Yellow,
+        ColorDto::Blue => Color::Blue,
+        ColorDto::Magenta => Color::Magenta,
+        ColorDto::Cyan => Color::Cyan,
+        ColorDto::Gray => Color::Gray,
+        ColorDto::DarkGray => Color::DarkGray,
+        ColorDto::LightRed => Color::LightRed,
+        ColorDto::LightGreen => Color::LightGreen,
+        ColorDto::LightYellow => Color::LightYellow,
+        ColorDto::LightBlue => Color::LightBlue,
+        ColorDto::LightMagenta => Color::LightMagenta,
+        ColorDto::LightCyan => Color::LightCyan,
+        ColorDto::White => Color::White,
+        ColorDto::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        ColorDto::Indexed(idx) => Color::Indexed(idx),
+    }
+}
+
+/// Paints a `GridSnapshot` (the daemon's rendered-grid DTO) into `buf` —
+/// the `Remote`-source twin of `paint_term`, same cell-by-cell styling, just
+/// reading from a plain data snapshot instead of a live `Term`.
+pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, show_cursor: bool) {
+    let cols = area.width as usize;
+    let lines = area.height as usize;
+
+    for row in 0..(grid.lines as usize).min(lines) {
+        for col in 0..(grid.cols as usize).min(cols) {
+            let Some(Some(cell)) = grid.cells.get(row * grid.cols as usize + col) else { continue };
+            let x = area.x + col as u16;
+            let y = area.y + row as u16;
+            let mut style = Style::default().fg(map_dto_color(cell.fg)).bg(map_dto_color(cell.bg));
+            if cell.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if cell.inverse {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            let target = &mut buf[(x, y)];
+            target.set_char(cell.ch);
+            target.set_style(style);
+        }
+    }
+
+    if show_cursor {
+        if let Some((row, col)) = grid.cursor {
+            let (row, col) = (row as usize, col as usize);
+            if row < lines && col < cols {
+                let x = area.x + col as u16;
+                let y = area.y + row as u16;
+                buf[(x, y)].set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 

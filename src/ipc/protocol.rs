@@ -51,6 +51,18 @@ pub enum Request {
         agent_id: AgentId,
         recursive: bool,
     },
+    /// The TUI's own drop keybind (`d`/`D`), the one path allowed to drop a
+    /// root (AGENTS.md "root agents cannot be dropped via IPC — only via the
+    /// TUI"). Deliberately a distinct request from `Drop` rather than a
+    /// caller-supplied flag on it: `overseer drop`/an agent's own CLI calls
+    /// only ever construct `Drop`, so the restriction can't be opted out of
+    /// from that side. Not a security boundary (this is a local, single-user
+    /// socket) — a safety rail against a script or a supervising agent
+    /// accidentally killing a whole tree it doesn't own.
+    TuiDrop {
+        agent_id: AgentId,
+        recursive: bool,
+    },
     /// Upgrades this connection to a long-lived event stream (DAEMON.md "Attach
     /// protocol") — the daemon replies with an initial `AttachEvent::Snapshot`,
     /// then pushes registry/output events until the connection closes. Once sent,
@@ -163,6 +175,13 @@ pub struct GridSnapshot {
     pub cells: Vec<Option<CellDto>>,
     /// Cursor position as `(line, column)`, `None` if off-screen/hidden.
     pub cursor: Option<(u16, u16)>,
+    /// Whether the terminal wants application-cursor-key encoding for arrow
+    /// keys. Without a local `Term`, the client has no other way to know
+    /// this — `session::keys::encode_key` needs it to encode correctly.
+    pub app_cursor_mode: bool,
+    /// Whether the terminal wants pasted text wrapped in bracketed-paste
+    /// markers. Same rationale as `app_cursor_mode`.
+    pub bracketed_paste_mode: bool,
 }
 
 impl From<crate::agent::RegistryEvent> for AttachEvent {

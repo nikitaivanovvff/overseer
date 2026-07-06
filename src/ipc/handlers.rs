@@ -106,6 +106,16 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             }
         }
 
+        // The TUI's own drop keybind — the one caller allowed to drop a root
+        // (`allow_root: true`). See `Request::TuiDrop`'s doc comment for why
+        // this is a distinct request rather than a flag on `Drop`.
+        Request::TuiDrop { agent_id, recursive } => {
+            match drop_agent(&ctx.registry, &ctx.sessions, &agent_id, recursive, true) {
+                Ok(()) => Response::ok(None),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
         // These only make sense inside a stateful attach connection — the
         // server's `handle_conn` intercepts `Attach` before a request ever
         // reaches `dispatch`, and switches to a dedicated event-stream loop

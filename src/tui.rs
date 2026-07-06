@@ -2,7 +2,7 @@
 //! (`App`, `Focus`, `InputState`, …); this is its controller — driving
 //! `crossterm` events into state mutations and calling `ui::render` each tick.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -14,22 +14,17 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::agent::drop::drop_agent;
-use crate::agent::{AgentRegistry, AgentTree};
-use crate::app::{App, ConfirmAction, ConfirmState, Focus, InputState, PendingAction};
+use crate::agent::AgentTree;
+use crate::app::{App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction};
 use crate::config::Config;
+use crate::daemon;
 use crate::git::GitClient;
 use crate::ipc;
-use crate::ipc::handlers::dispatch;
 use crate::ipc::protocol::Request;
 use crate::ipc::AppCtx;
 use crate::session::{self, SessionManager};
 use crate::ui;
-
-/// `--mock` is inert demo data: it must never spawn a real PTY.
-fn session_manager_for(mock: bool) -> SessionManager {
-    if mock { SessionManager::dry_run() } else { SessionManager::new() }
-}
+use crate::ui::PaneSource;
 
 pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let default_panic = std::panic::take_hook();
@@ -39,32 +34,15 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         default_panic(info);
     }));
 
-    let registry = Arc::new(if mock {
-        AgentRegistry::from_tree(AgentTree::with_mock_data())
+    let mut app = if mock {
+        App::new(mock_ctx(socket.clone()))
     } else {
-        AgentRegistry::new()
-    });
-
-    let ctx = Arc::new(AppCtx {
-        registry,
-        sessions: Arc::new(session_manager_for(mock)),
-        socket: socket.clone(),
-        git: Arc::new(GitClient::new()),
-        config: Arc::new(Config::load()),
-        watch_sessions: !mock,
-    });
-
-    let socket_clone = socket.clone();
-    let ipc_ctx = ctx.clone();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        if let Err(e) = ipc::serve_blocking(ipc_ctx, socket_clone, Some(ready_tx)) {
-            eprintln!("IPC server error: {e}");
-        }
-    });
-    ready_rx.recv().ok();
-
-    let mut app = App::new(ctx);
+        daemon::ensure_daemon_running(&socket)
+            .context("failed to reach or start the overseer daemon")?;
+        let state = DaemonState::connect(socket.clone())
+            .context("failed to attach to the overseer daemon")?;
+        App::new_daemon(state)
+    };
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -82,9 +60,38 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         DisableBracketedPaste
     );
     let _ = terminal.show_cursor();
-    let _ = std::fs::remove_file(&socket);
+    // Only mock mode owns its socket (a throwaway, per-invocation IPC server
+    // it started itself) — real mode attached to the daemon's stable,
+    // persistent socket and must leave it alone; the daemon owns it across
+    // TUI restarts, that's the whole point of the split.
+    if mock {
+        let _ = std::fs::remove_file(&socket);
+    }
 
     res
+}
+
+/// `--mock` is inert demo data run fully in-process, exactly as before the
+/// daemon split — it never spawns a real PTY and never touches a daemon.
+fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
+    let ctx = Arc::new(AppCtx {
+        registry: Arc::new(crate::agent::AgentRegistry::from_tree(AgentTree::with_mock_data())),
+        sessions: Arc::new(SessionManager::dry_run()),
+        socket: socket.clone(),
+        git: Arc::new(GitClient::new()),
+        config: Arc::new(Config::load()),
+        watch_sessions: false,
+    });
+
+    let ipc_ctx = ctx.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        if let Err(e) = ipc::serve_blocking(ipc_ctx, socket, Some(ready_tx)) {
+            eprintln!("IPC server error: {e}");
+        }
+    });
+    ready_rx.recv().ok();
+    ctx
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -96,14 +103,30 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         let tick = app.tick;
 
+        // The selected agent drives which one streams to the pane — mock
+        // mode's `render_term_pane` reads `SessionManager` directly by id, so
+        // this only does real work in daemon mode (`App::watch` no-ops
+        // otherwise). "Switching on cursor move" (DAEMON.md) lives here.
+        let selected_id = app.with_tree(|t| t.selected()).map(|n| n.id);
+        match &selected_id {
+            Some(id) => app.watch(id),
+            None => app.unwatch(),
+        }
+
         let prompt = build_prompt(app);
         let input = app.input.as_ref();
         let pane_focused = app.focus == Focus::Pane;
+        let pane_source = match &app.backend {
+            Backend::Mock(ctx) => PaneSource::Local(&ctx.0.sessions),
+            Backend::Daemon(_) => {
+                PaneSource::Remote(selected_id.as_ref().and_then(|id| app.watched_grid(id)))
+            }
+        };
         let mut pane_rect = Rect::default();
-        app.ctx.registry.with_tree(|tree| {
+        app.with_tree(|tree| {
             terminal.draw(|f| {
                 pane_rect =
-                    ui::render(f, tree, tick, prompt.as_deref(), input, &app.ctx.sessions, pane_focused);
+                    ui::render(f, tree, tick, prompt.as_deref(), input, &pane_source, pane_focused);
             })
         })?;
         // Every agent shares one PTY size — resize on layout
@@ -111,7 +134,7 @@ fn run_app<B: ratatui::backend::Backend>(
         // the user ever gets to spawn one).
         let pane_size = (pane_rect.width, pane_rect.height);
         if last_pane_size != Some(pane_size) {
-            app.ctx.sessions.resize_all(pane_size.0 as usize, pane_size.1 as usize);
+            app.resize(pane_size.0 as usize, pane_size.1 as usize);
             last_pane_size = Some(pane_size);
         }
 
@@ -139,6 +162,14 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         app.tick();
+
+        // The daemon closed the connection (e.g. `overseer shutdown` from
+        // elsewhere) — nothing left to attach to, so stop like a quit.
+        if let Backend::Daemon(state) = &app.backend {
+            if state.disconnected {
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -157,13 +188,13 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-            app.ctx.registry.with_tree_mut(|t| t.move_down());
+            app.with_tree_mut(|t| t.move_down());
         }
         KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
-            app.ctx.registry.with_tree_mut(|t| t.move_up());
+            app.with_tree_mut(|t| t.move_up());
         }
         KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
-            app.ctx.registry.with_tree_mut(|t| t.toggle_expand());
+            app.with_tree_mut(|t| t.toggle_expand());
         }
         KeyCode::Enter | KeyCode::Char('o') if key.modifiers == KeyModifiers::NONE => {
             jump_in(app);
@@ -197,8 +228,8 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
 /// — the same path serves read-only preview and jump-in,
 /// this just starts routing keys to the PTY instead of the tree.
 fn jump_in(app: &mut App) {
-    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else { return };
-    if app.ctx.sessions.is_alive(&id) {
+    let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else { return };
+    if app.is_alive(&id) {
         app.focus = Focus::Pane;
     } else {
         app.status_message = Some("agent is not running".to_string());
@@ -215,20 +246,21 @@ fn handle_pane_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else {
+    let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else {
         app.focus = Focus::Tree;
         return;
     };
-    let mode = app.ctx.sessions.with_term(&id, |term| *term.mode()).unwrap_or_default();
+    let mode = app.term_mode(&id);
     if let Some(bytes) = session::keys::encode_key(&key, mode) {
-        app.ctx.sessions.write(&id, bytes);
+        app.write_input(&id, bytes);
     }
 }
 
 fn forward_paste(app: &mut App, text: &str) {
-    let Some(id) = app.ctx.registry.with_tree(|t| t.selected()).map(|n| n.id) else { return };
-    let mode = app.ctx.sessions.with_term(&id, |term| *term.mode()).unwrap_or_default();
-    app.ctx.sessions.write(&id, session::keys::encode_paste(text, mode));
+    let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else { return };
+    let mode = app.term_mode(&id);
+    let bytes = session::keys::encode_paste(text, mode);
+    app.write_input(&id, bytes);
 }
 
 /// Builds the status-bar override text for the active confirm prompt, or the
@@ -240,14 +272,9 @@ fn build_prompt(app: &App) -> Option<String> {
         return Some(match &confirm.action {
             ConfirmAction::Drop { agent_id, recursive } => {
                 let name = app
-                    .ctx
-                    .registry
-                    .get(agent_id)
-                    .map(|d| d.name)
+                    .with_tree(|t| t.find(agent_id).map(|n| n.name.clone()))
                     .unwrap_or_else(|| "?".to_string());
                 let descendants = app
-                    .ctx
-                    .registry
                     .with_tree(|t| t.subtree_ids_postorder(agent_id))
                     .map(|ids| ids.len().saturating_sub(1))
                     .unwrap_or(0);
@@ -269,7 +296,7 @@ fn build_prompt(app: &App) -> Option<String> {
 /// alone (AGENTS.md: the "no grandchildren" rule lives there, "not in the TUI, not as
 /// a UI hint") — a rejection surfaces through `submit_input`'s normal error handling.
 fn start_spawn_child_input(app: &mut App) {
-    if let Some(node) = app.ctx.registry.with_tree(|t| t.selected()) {
+    if let Some(node) = app.with_tree(|t| t.selected()) {
         app.status_message = None;
         app.input = Some(InputState {
             action: PendingAction::SpawnChild { parent_id: node.id },
@@ -279,7 +306,7 @@ fn start_spawn_child_input(app: &mut App) {
 }
 
 fn start_drop_confirm(app: &mut App, recursive: bool) {
-    if let Some(node) = app.ctx.registry.with_tree(|t| t.selected()) {
+    if let Some(node) = app.with_tree(|t| t.selected()) {
         app.status_message = None;
         app.confirm = Some(ConfirmState { action: ConfirmAction::Drop { agent_id: node.id, recursive } });
     }
@@ -311,8 +338,9 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Dispatches the composed `Start`/`Spawn` request in-process — same call the IPC
-/// socket handler would make, so the grandchild check applies uniformly.
+/// Dispatches the composed `Start`/`Spawn` request — mock mode in-process,
+/// real mode over a one-shot connection to the daemon (`App::dispatch`) —
+/// so the grandchild check applies uniformly either way.
 ///
 /// `SpawnRoot`'s empty-buffer semantics differ from `SpawnChild`'s: an empty repo
 /// path means "use cwd" (not "cancel") — the buffer is prefilled with cwd on `n`
@@ -334,17 +362,17 @@ fn submit_input(app: &mut App, input: InputState) {
                 app.status_message = Some("spawn cancelled: empty task".to_string());
                 return;
             }
-            let Some(parent) = app.ctx.registry.get(&parent_id) else {
+            let Some(parent_cwd) = app.with_tree(|t| t.find(&parent_id).map(|n| n.cwd.clone())) else {
                 app.status_message = Some("spawn failed: parent no longer exists".to_string());
                 return;
             };
-            dispatch_and_report(app, Request::Spawn { parent_id, task, adapter: None, cwd: parent.cwd });
+            dispatch_and_report(app, Request::Spawn { parent_id, task, adapter: None, cwd: parent_cwd });
         }
     }
 }
 
 fn dispatch_and_report(app: &mut App, req: Request) {
-    let resp = dispatch(&app.ctx, req);
+    let resp = app.dispatch(req);
     app.status_message = if resp.ok {
         None
     } else {
@@ -387,10 +415,12 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => match confirm.action {
             ConfirmAction::Drop { agent_id, recursive } => {
-                match drop_agent(&app.ctx.registry, &app.ctx.sessions, &agent_id, recursive, true) {
-                    Ok(()) => app.status_message = None,
-                    Err(e) => app.status_message = Some(format!("drop failed: {e}")),
-                }
+                let resp = app.dispatch(Request::TuiDrop { agent_id, recursive });
+                app.status_message = if resp.ok {
+                    None
+                } else {
+                    Some(format!("drop failed: {}", resp.error.unwrap_or_else(|| "unknown error".to_string())))
+                };
                 true
             }
         },
@@ -409,12 +439,15 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRole, AgentStatus};
+    use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
 
     #[test]
-    fn mock_mode_never_gets_a_real_session_manager() {
-        assert!(session_manager_for(true).is_dry_run());
-        assert!(!session_manager_for(false).is_dry_run());
+    fn mock_ctx_never_gets_a_real_session_manager() {
+        let id = &uuid::Uuid::new_v4().to_string()[..8];
+        let socket = PathBuf::from(format!("/tmp/ovsr-mock-{id}.sock"));
+        let ctx = mock_ctx(socket.clone());
+        assert!(ctx.sessions.is_dry_run(), "--mock must never spawn a real PTY");
+        let _ = std::fs::remove_file(&socket);
     }
 
     // ── display_path_from_home ───────────────────────────────────────────────
@@ -440,10 +473,9 @@ mod tests {
 
     // ── quit guard ────────────────────────────────────────────────────────────
 
-    fn register_agent(app: &App, id: Option<AgentId>) -> AgentId {
+    fn register_agent(ctx: &AppCtx, id: Option<AgentId>) -> AgentId {
         use crate::agent::RegisterArgs;
-        app.ctx
-            .registry
+        ctx.registry
             .register(RegisterArgs {
                 id,
                 name: "agent".to_string(),
@@ -459,7 +491,7 @@ mod tests {
             .id
     }
 
-    fn app_with_sessions(sessions: SessionManager) -> App {
+    fn app_with_sessions(sessions: SessionManager) -> (App, Arc<AppCtx>) {
         let ctx = Arc::new(AppCtx {
             registry: Arc::new(AgentRegistry::new()),
             sessions: Arc::new(sessions),
@@ -468,7 +500,7 @@ mod tests {
             config: Arc::new(Config::default()),
             watch_sessions: false,
         });
-        App::new(ctx)
+        (App::new(ctx.clone()), ctx)
     }
 
     #[test]
@@ -476,8 +508,8 @@ mod tests {
         let live_id = AgentId::new();
         let sessions =
             SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
-        let mut app = app_with_sessions(sessions);
-        register_agent(&app, Some(live_id));
+        let (mut app, ctx) = app_with_sessions(sessions);
+        register_agent(&ctx, Some(live_id));
 
         let should_continue =
             handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -488,7 +520,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_immediately_too() {
-        let mut app = app_with_sessions(SessionManager::dry_run());
+        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         let should_continue =
             handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!should_continue);
@@ -502,15 +534,15 @@ mod tests {
         // from a fixed set it was constructed with, so if quitting called
         // `kill()` on anything, `is_alive` would still report the same value
         // (dry-run kill is a no-op) — the real guarantee here is behavioral:
-        // `handle_tree_key`'s quit arms never call `app.ctx.sessions.kill`.
+        // `handle_tree_key`'s quit arms never call session kill at all.
         let live_id = AgentId::new();
         let sessions =
             SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
-        let mut app = app_with_sessions(sessions);
-        register_agent(&app, Some(live_id.clone()));
+        let (mut app, ctx) = app_with_sessions(sessions);
+        register_agent(&ctx, Some(live_id.clone()));
 
         handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
 
-        assert!(app.ctx.sessions.is_alive(&live_id), "quit must not kill live agents");
+        assert!(app.is_alive(&live_id), "quit must not kill live agents");
     }
 }
