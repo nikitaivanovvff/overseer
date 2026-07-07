@@ -458,11 +458,20 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
+        // `d/D drop` earns its place back on-screen (not just in the `?`
+        // popup) — a user reported having no visible way to clean up a
+        // `done` agent after PHASE5B.md's hint-line shortening dropped it
+        // silently. "How do I get rid of a finished agent" is common and
+        // urgent enough to not gate behind "thought to press `?` first".
         let hints: Vec<Span> = vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl-l/↵", Style::default().fg(Color::Yellow)),
             Span::styled(" jump in  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("n/s", Style::default().fg(Color::Yellow)),
+            Span::styled(" spawn  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d/D", Style::default().fg(Color::Yellow)),
+            Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::styled(" search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -835,6 +844,16 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/2 running"));
         assert!(text.contains("jump in"));
+    }
+
+    #[test]
+    fn build_status_line_shows_drop_on_screen_not_just_in_the_help_popup() {
+        // Regression: PHASE5B.md's hint-line shortening dropped "d/D drop"
+        // entirely, relying on the `?` popup alone — a real user reported
+        // having no visible way to clean up a `done` agent as a result.
+        let line = build_status_line(1, 0, 2, None, &Theme::default());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("drop"), "drop hint must stay visible on screen: {text}");
     }
 
     #[test]

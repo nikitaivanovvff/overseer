@@ -250,7 +250,7 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ since:  4m                │                                         │
 │ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
- OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  / search  q quit  ? help
+ OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; there is no second pane, no multiplexer, nothing external compositing the right side. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half of the buffer via a `PaneSource`: in `--mock` it locks the local `alacritty_terminal::Term` directly (`SessionManager::with_term`); everywhere else it paints the last `GridSnapshot` the daemon streamed for the watched agent (see "Daemon + Attach Protocol").
