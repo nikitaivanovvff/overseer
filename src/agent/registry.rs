@@ -117,6 +117,7 @@ impl AgentRegistry {
                     context_pct: None,
                     children: Vec::new(),
                     expanded: true,
+                    status_since: std::time::Instant::now(),
                 };
                 let dto = AgentDto::from_node(&node, None);
                 guard.add_root(node);
@@ -141,6 +142,7 @@ impl AgentRegistry {
                     context_pct: None,
                     children: Vec::new(),
                     expanded: true,
+                    status_since: std::time::Instant::now(),
                 };
                 let dto = AgentDto::from_node(&node, Some(parent_id.clone()));
                 if guard.insert_child(&parent_id, node) {
@@ -169,6 +171,12 @@ impl AgentRegistry {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) => {
+                    // Compare *before* overwriting — a repeated same-status
+                    // push (e.g. PostToolUse spam while `running`) must not
+                    // reset the clock (ATTENTION.md).
+                    if node.status != status {
+                        node.status_since = std::time::Instant::now();
+                    }
                     node.status = status.clone();
                     if let Some(pct) = context_pct {
                         node.context_pct = Some(pct);
@@ -351,6 +359,43 @@ mod tests {
         reg.set_status(&result.id, AgentStatus::Running, None, Some(42)).unwrap();
         reg.set_status(&result.id, AgentStatus::Idle, None, None).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
+    }
+
+    // ── status_since (ATTENTION.md) ───────────────────────────────────────────
+
+    #[test]
+    fn set_status_same_status_keeps_status_since() {
+        // make_register_root starts a node as Running (see above).
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
+
+        reg.set_status(&result.id, AgentStatus::Running, None, None).unwrap();
+
+        let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
+        assert_eq!(before, after, "a repeated same-status push (e.g. PostToolUse spam) must not reset the clock");
+    }
+
+    #[test]
+    fn set_status_actual_change_resets_status_since() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None).unwrap();
+
+        let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
+        assert!(after > before, "an actual status change must reset the clock");
+    }
+
+    #[test]
+    fn register_seeds_status_since_freshly() {
+        let reg = AgentRegistry::new();
+        let before = std::time::Instant::now();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let status_since = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
+        assert!(status_since >= before, "a freshly registered node's clock must start now, not earlier");
     }
 
     #[test]

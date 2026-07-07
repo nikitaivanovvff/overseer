@@ -233,6 +233,11 @@ mod tests {
     }
 
     #[test]
+    fn root_skill_documents_status_secs() {
+        assert!(ROOT_SKILL_CONTENT.contains("status_secs"));
+    }
+
+    #[test]
     fn child_skill_documents_overseer_task_and_done_status() {
         assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
         assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));

@@ -170,7 +170,12 @@ fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'s
     // prefix + badge (always 1 column wide) + the space separating badge from name.
     let left_fixed = node.prefix.chars().count() + 1 + 1;
     let row_width = width.saturating_sub(left_fixed);
-    let layout = format_tree_row(&node.name, node.status.label(), node.context_pct, row_width);
+    // Age only for blocked/idle (ATTENTION.md) — a running agent doesn't
+    // need a clock, it's actively doing something.
+    let age = matches!(node.status, AgentStatus::Blocked | AgentStatus::Idle)
+        .then(|| format_age(node.status_since.elapsed()));
+    let layout =
+        format_tree_row(&node.name, node.status.label(), age.as_deref(), node.context_pct, row_width);
     let gap = row_width
         .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
         .max(1);
@@ -203,8 +208,17 @@ struct TreeRowLayout {
     pct_suffix: String,
 }
 
-fn format_tree_row(name: &str, status_label: &str, pct: Option<u8>, width: usize) -> TreeRowLayout {
-    let status_word = status_label.to_string();
+fn format_tree_row(
+    name: &str,
+    status_label: &str,
+    age: Option<&str>,
+    pct: Option<u8>,
+    width: usize,
+) -> TreeRowLayout {
+    let status_word = match age {
+        Some(age) => format!("{status_label} {age}"),
+        None => status_label.to_string(),
+    };
     let pct_suffix = pct.map(|p| format!(" {p}%")).unwrap_or_default();
     let right_len = status_word.chars().count() + pct_suffix.chars().count();
     // Reserve at least 1 column of gap between name and the right block; if the
@@ -214,6 +228,19 @@ fn format_tree_row(name: &str, status_label: &str, pct: Option<u8>, width: usize
     let name_budget = width.saturating_sub(right_len + 1);
     let name = truncate_with_ellipsis(name, name_budget);
     TreeRowLayout { name, status_word, pct_suffix }
+}
+
+/// Pure. Formats an elapsed duration as a single-unit age (ATTENTION.md):
+/// `45s`, `12m`, `3h` — never a compound like "1h 2m", and never `0`-padded.
+fn format_age(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// Truncates `s` to at most `max` grapheme clusters, replacing the last one
@@ -252,6 +279,10 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
             Line::from(vec![
                 Span::styled("status: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(node.status.label(), status_style(&node.status)),
+            ]),
+            Line::from(vec![
+                Span::styled("since:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format_age(node.status_since.elapsed()), Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
                 Span::styled("repo:   ", Style::default().fg(Color::DarkGray)),
@@ -458,7 +489,7 @@ mod tests {
 
     #[test]
     fn format_tree_row_fits_without_truncation_in_a_roomy_width() {
-        let layout = format_tree_row("auth-module", "idle", Some(62), 40);
+        let layout = format_tree_row("auth-module", "idle", None, Some(62), 40);
         assert_eq!(layout.name, "auth-module");
         assert_eq!(layout.status_word, "idle");
         assert_eq!(layout.pct_suffix, " 62%");
@@ -466,14 +497,14 @@ mod tests {
 
     #[test]
     fn format_tree_row_omits_pct_when_unknown() {
-        let layout = format_tree_row("write-tests", "running", None, 40);
+        let layout = format_tree_row("write-tests", "running", None, None, 40);
         assert_eq!(layout.pct_suffix, "");
         assert_eq!(layout.status_word, "running");
     }
 
     #[test]
     fn format_tree_row_truncates_long_name_with_ellipsis() {
-        let layout = format_tree_row("a-very-long-task-description-here", "blocked", Some(91), 20);
+        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, Some(91), 20);
         assert!(layout.name.ends_with('…'));
         assert!(layout.name.chars().count() < "a-very-long-task-description-here".chars().count());
     }
@@ -481,11 +512,39 @@ mod tests {
     #[test]
     fn format_tree_row_narrow_width_does_not_panic() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "blocked", Some(5), width);
+            let layout = format_tree_row("some-task", "blocked", None, Some(5), width);
             // Right block (status + pct) always survives intact even if the name collapses.
             assert_eq!(layout.status_word, "blocked");
             assert_eq!(layout.pct_suffix, " 5%");
         }
+    }
+
+    #[test]
+    fn format_tree_row_appends_age_to_the_status_word() {
+        let layout = format_tree_row("update-docs", "blocked", Some("2m"), Some(5), 40);
+        assert_eq!(layout.status_word, "blocked 2m");
+    }
+
+    #[test]
+    fn format_tree_row_age_survives_at_a_narrow_width_alongside_pct() {
+        for width in 0..6 {
+            let layout = format_tree_row("some-task", "idle", Some("12m"), Some(5), width);
+            assert_eq!(layout.status_word, "idle 12m");
+            assert_eq!(layout.pct_suffix, " 5%");
+        }
+    }
+
+    // ── format_age ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_age_single_unit_seconds_minutes_hours() {
+        assert_eq!(format_age(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(format_age(std::time::Duration::from_secs(59)), "59s");
+        assert_eq!(format_age(std::time::Duration::from_secs(60)), "1m");
+        assert_eq!(format_age(std::time::Duration::from_secs(12 * 60)), "12m");
+        assert_eq!(format_age(std::time::Duration::from_secs(3599)), "59m");
+        assert_eq!(format_age(std::time::Duration::from_secs(3600)), "1h");
+        assert_eq!(format_age(std::time::Duration::from_secs(3 * 3600 + 59 * 60)), "3h");
     }
 
     #[test]

@@ -24,4 +24,10 @@ pub struct AgentNode {
     pub context_pct: Option<u8>,
     pub children: Vec<AgentNode>,
     pub expanded: bool,
+    /// When `status` last actually changed (ATTENTION.md) — reset by
+    /// `AgentRegistry::set_status` only when the new value differs from the
+    /// old one, so repeated same-status pushes (e.g. `PostToolUse` spam on a
+    /// `running` agent) don't reset the clock. Shipped across the wire as an
+    /// age (`AgentDto::status_secs`), never as this `Instant` itself.
+    pub status_since: std::time::Instant,
 }

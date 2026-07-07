@@ -124,6 +124,12 @@ pub enum AttachEvent {
     Snapshot { agents: Vec<AgentDto> },
     AgentRegistered { agent: AgentDto },
     AgentRemoved { agent_id: AgentId },
+    /// No `status_secs` here (unlike `AgentDto`) — a client only needs to
+    /// know whether this transition is an actual change (to decide whether
+    /// to reset its own `status_since` clock and fire a bell/notification),
+    /// and it can determine that itself by comparing against the status it
+    /// already has stored. Its own `Instant::now()` at that moment is close
+    /// enough to the daemon's own reset instant to not matter.
     StatusChanged {
         agent_id: AgentId,
         status: AgentStatus,
@@ -232,6 +238,12 @@ pub struct AgentDto {
     pub branch: String,
     pub cwd: std::path::PathBuf,
     pub context_pct: Option<u8>,
+    /// How long `status` has held its current value, in whole seconds,
+    /// computed at snapshot time (ATTENTION.md) — an age, not the
+    /// `Instant` itself, since that has no meaning across the wire. Shown to
+    /// the root agent too via `overseer list`/`overseer agent`, which is
+    /// what makes "check on long-idle children" actionable.
+    pub status_secs: u64,
 }
 
 impl AgentDto {
@@ -247,6 +259,7 @@ impl AgentDto {
             branch: node.branch.clone(),
             cwd: node.cwd.clone(),
             context_pct: node.context_pct,
+            status_secs: node.status_since.elapsed().as_secs(),
         }
     }
 }

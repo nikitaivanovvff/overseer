@@ -45,6 +45,11 @@ fine for a short task, unreadable for a paragraph-length one. Always pass
 A child stuck `blocked` or idle for a while needs your attention — jump into
 its pane or re-prompt it yourself. There is no automatic supervision loop:
 checking on children periodically is your job as the root, not Overseer's.
+Each agent in `overseer list`/`overseer agent <id>` carries a `status_secs`
+field — how long, in seconds, it's held its *current* status. That's what
+makes "stuck for a while" checkable without staring at a clock yourself: a
+child sitting at `blocked` with a large `status_secs` has been waiting on you
+specifically, not just recently paused.
 
 ## Cleanup
 

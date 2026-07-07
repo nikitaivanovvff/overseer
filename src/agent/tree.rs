@@ -18,6 +18,7 @@ fn mock_root(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         context_pct: None,
         children: Vec::new(),
         expanded: true,
+        status_since: std::time::Instant::now(),
     }
 }
 
@@ -37,6 +38,7 @@ fn mock_child(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         context_pct: None,
         children: Vec::new(),
         expanded: true,
+        status_since: std::time::Instant::now(),
     }
 }
 
@@ -55,6 +57,8 @@ pub struct FlatNode {
     pub context_pct: Option<u8>,
     pub has_children: bool,
     pub prefix: String,
+    /// When `status` last actually changed — see `AgentNode::status_since`.
+    pub status_since: std::time::Instant,
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +246,7 @@ fn flatten_node(
         context_pct: node.context_pct,
         has_children: !node.children.is_empty(),
         prefix: format!("{indent}{connector}"),
+        status_since: node.status_since,
     });
 
     if node.expanded {

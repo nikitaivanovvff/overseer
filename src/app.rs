@@ -289,6 +289,15 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
         }
         AttachEvent::StatusChanged { agent_id, status, context_pct, message: _ } => {
             if let Some(node) = state.tree.find_mut(&agent_id) {
+                // Same "compare before overwrite" rule as the registry
+                // itself (ATTENTION.md) — a repeated same-status push must
+                // not reset the client's own clock either. The event carries
+                // no status_secs of its own (see `AttachEvent::StatusChanged`
+                // doc comment); the client's own `Instant::now()` at the
+                // moment of an actual change is accurate enough.
+                if node.status != status {
+                    node.status_since = std::time::Instant::now();
+                }
                 node.status = status;
                 // The server already merged this into the node's current
                 // value before broadcasting (see `AgentRegistry::set_status`)
@@ -310,6 +319,13 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
 /// before its parent (e.g. right after a `Lagged` broadcast gap) is silently
 /// dropped rather than panicking; the next full `Snapshot` re-syncs it.
 fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
+    // Seeds the client's own clock reference from the daemon's reported age
+    // — `checked_sub` rather than bare `-` since `Instant` has no fixed
+    // epoch to safely subtract an unbounded duration from; falling back to
+    // "now" (age 0) is a harmless display-only discrepancy, not a panic.
+    let status_since = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(dto.status_secs))
+        .unwrap_or_else(std::time::Instant::now);
     let node = AgentNode {
         id: dto.id,
         name: dto.name,
@@ -322,6 +338,7 @@ fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
         context_pct: dto.context_pct,
         children: Vec::new(),
         expanded: true,
+        status_since,
     };
     match dto.parent_id {
         None => tree.add_root(node),
@@ -438,6 +455,7 @@ mod tests {
             branch: "main".to_string(),
             cwd: PathBuf::from("/tmp"),
             context_pct: None,
+            status_secs: 0,
         }
     }
 
@@ -509,6 +527,58 @@ mod tests {
         let node = state.tree.find(&root_id).unwrap();
         assert_eq!(node.status, AgentStatus::Blocked);
         assert_eq!(node.context_pct, Some(42));
+    }
+
+    #[test]
+    fn status_changed_same_status_keeps_client_side_status_since() {
+        let mut state = empty_daemon_state();
+        let root_id = AgentId::new();
+        apply_event(&mut state, AttachEvent::AgentRegistered { agent: dto(root_id.clone(), None, AgentStatus::Running) });
+        let before = state.tree.find(&root_id).unwrap().status_since;
+
+        apply_event(&mut state, AttachEvent::StatusChanged {
+            agent_id: root_id.clone(),
+            status: AgentStatus::Running,
+            message: None,
+            context_pct: None,
+        });
+
+        let after = state.tree.find(&root_id).unwrap().status_since;
+        assert_eq!(before, after, "a repeated same-status event must not reset the client's clock");
+    }
+
+    #[test]
+    fn status_changed_actual_change_resets_client_side_status_since() {
+        let mut state = empty_daemon_state();
+        let root_id = AgentId::new();
+        apply_event(&mut state, AttachEvent::AgentRegistered { agent: dto(root_id.clone(), None, AgentStatus::Running) });
+        let before = state.tree.find(&root_id).unwrap().status_since;
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        apply_event(&mut state, AttachEvent::StatusChanged {
+            agent_id: root_id.clone(),
+            status: AgentStatus::Blocked,
+            message: None,
+            context_pct: None,
+        });
+
+        let after = state.tree.find(&root_id).unwrap().status_since;
+        assert!(after > before, "an actual status change must reset the client's clock");
+    }
+
+    #[test]
+    fn insert_dto_seeds_status_since_from_status_secs() {
+        let mut state = empty_daemon_state();
+        let root_id = AgentId::new();
+        let mut agent = dto(root_id.clone(), None, AgentStatus::Idle);
+        agent.status_secs = 120;
+        let before_insert = std::time::Instant::now();
+        apply_event(&mut state, AttachEvent::AgentRegistered { agent });
+
+        let status_since = state.tree.find(&root_id).unwrap().status_since;
+        // Seeded ~120s in the past relative to "now", well before this test's
+        // own start — a generous bound avoids flaking on slow CI machines.
+        assert!(status_since <= before_insert, "a reported age must be seeded into the past, not the future");
     }
 
     #[test]
