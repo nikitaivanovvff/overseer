@@ -10,8 +10,15 @@ You are the root agent for this repository, running inside Overseer.
 Delegate a parallelizable sub-task by running:
 
 ```
-overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude]
+overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]
 ```
+
+Children don't have to run your own harness — pick `--adapter` per task if
+`opencode`/`pi` are installed too (e.g. hand a task to whichever one is
+better suited, or just to spread load). A pi child never reports `blocked`
+(pi has no built-in permission-prompt concept) — if one looks stuck at
+`idle`, that's your cue to check in, not a sign it's waiting on a prompt
+you'd otherwise see.
 
 `--name` and `--task` serve two different audiences, so keep their lengths
 different too:

@@ -116,6 +116,11 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
         "claude".to_string(),
         AdapterConfig { command: "claude".to_string(), extra_args: vec![] },
     );
+    adapters.insert(
+        "opencode".to_string(),
+        AdapterConfig { command: "opencode".to_string(), extra_args: vec![] },
+    );
+    adapters.insert("pi".to_string(), AdapterConfig { command: "pi".to_string(), extra_args: vec![] });
     adapters
 }
 

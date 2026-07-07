@@ -238,6 +238,11 @@ mod tests {
     }
 
     #[test]
+    fn root_skill_blesses_cross_harness_spawn() {
+        assert!(ROOT_SKILL_CONTENT.contains("--adapter claude|opencode|pi"));
+    }
+
+    #[test]
     fn child_skill_documents_overseer_task_and_done_status() {
         assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
         assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));

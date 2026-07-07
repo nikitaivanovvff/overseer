@@ -63,6 +63,21 @@ fn install_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()
                 .with_context(|| format!("failed to write {}", full_path.display()))?;
             println!("merged   {}", full_path.display());
         }
+        MergeStrategy::JsonArrayMerge { key, ref entries } => {
+            let existing_raw = if full_path.exists() {
+                std::fs::read_to_string(&full_path)
+                    .with_context(|| format!("failed to read {}", full_path.display()))?
+            } else {
+                "{}".to_string()
+            };
+            let mut existing: serde_json::Value =
+                serde_json::from_str(&existing_raw).unwrap_or_else(|_| serde_json::json!({}));
+            settings::merge_json_array(&mut existing, key, entries);
+            let out = serde_json::to_string_pretty(&existing)?;
+            std::fs::write(&full_path, out + "\n")
+                .with_context(|| format!("failed to write {}", full_path.display()))?;
+            println!("merged   {}", full_path.display());
+        }
     }
     Ok(())
 }
@@ -88,6 +103,19 @@ fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<
                 std::fs::write(&full_path, out + "\n")
                     .with_context(|| format!("failed to write {}", full_path.display()))?;
                 println!("updated  {} (removed overseer hooks)", full_path.display());
+            }
+        }
+        MergeStrategy::JsonArrayMerge { key, ref entries } => {
+            if full_path.exists() {
+                let raw = std::fs::read_to_string(&full_path)
+                    .with_context(|| format!("failed to read {}", full_path.display()))?;
+                let mut json: serde_json::Value =
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                settings::remove_json_array(&mut json, key, entries);
+                let out = serde_json::to_string_pretty(&json)?;
+                std::fs::write(&full_path, out + "\n")
+                    .with_context(|| format!("failed to write {}", full_path.display()))?;
+                println!("updated  {} (removed overseer entries)", full_path.display());
             }
         }
     }

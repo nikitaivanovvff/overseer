@@ -5,6 +5,8 @@ use std::process::Command;
 use crate::agent::{AgentId, AgentRole};
 
 pub mod claude;
+pub mod opencode;
+pub mod pi;
 
 /// Identity passed to an adapter at launch time.
 /// No filesystem/worktree paths — Overseer does not own a workspace.
@@ -81,7 +83,15 @@ pub enum MergeStrategy {
     /// Overseer owns the file — write it verbatim.
     Overwrite,
     /// Merge the content into an existing JSON file, preserving unrelated keys.
+    /// Claude-specific: assumes the "hooks" object-of-arrays shape and marks
+    /// its own entries with `_overseer: true` for clean removal.
     JsonMerge,
+    /// Merge/remove specific string `entries` into/from a named top-level
+    /// JSON array field (HARNESSES.md — opencode's `instructions` array).
+    /// Unlike `JsonMerge`'s hook objects, these are bare strings with no room
+    /// for an `_overseer` sentinel, so uninstall removes exactly `entries`
+    /// rather than anything tagged as Overseer's.
+    JsonArrayMerge { key: &'static str, entries: Vec<String> },
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -114,6 +124,8 @@ pub trait AgentAdapter: Send + Sync {
 pub fn adapter_for(name: &str) -> Option<Box<dyn AgentAdapter>> {
     match name {
         "claude" => Some(Box::new(claude::ClaudeAdapter::new())),
+        "opencode" => Some(Box::new(opencode::OpencodeAdapter::new())),
+        "pi" => Some(Box::new(pi::PiAdapter::new())),
         _ => None,
     }
 }

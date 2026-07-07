@@ -48,6 +48,36 @@ pub fn merge_hooks(existing: &mut Value, overlay: &Value) {
     }
 }
 
+/// Merges `entries` into `existing[key]`'s array (creating it if absent),
+/// appending any not already present — idempotent on repeated installs.
+/// Unlike `merge_hooks`, array elements here are bare strings (e.g. opencode's
+/// `instructions` file paths), so there's no room for an `_overseer` sentinel
+/// to mark ownership; `remove_json_array` instead relies on the caller
+/// passing back the exact same `entries` it originally merged in.
+pub fn merge_json_array(existing: &mut Value, key: &str, entries: &[String]) {
+    let Some(obj) = existing.as_object_mut() else { return };
+    let arr = obj.entry(key).or_insert_with(|| json!([])).as_array_mut();
+    let Some(arr) = arr else { return };
+    for entry in entries {
+        if !arr.iter().any(|e| e.as_str() == Some(entry.as_str())) {
+            arr.push(json!(entry));
+        }
+    }
+}
+
+/// Removes exactly `entries` from `existing[key]`'s array, if present.
+/// Removes the key entirely if the array becomes empty as a result.
+pub fn remove_json_array(existing: &mut Value, key: &str, entries: &[String]) {
+    let Some(obj) = existing.as_object_mut() else { return };
+    if let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+        arr.retain(|e| !entries.iter().any(|entry| e.as_str() == Some(entry.as_str())));
+    }
+    let is_empty = obj.get(key).and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+    if is_empty {
+        obj.remove(key);
+    }
+}
+
 /// Removes all Overseer-managed hook entries (those with `_overseer: true`) from
 /// `settings`. Hook event keys that become empty arrays are removed entirely.
 pub fn remove_hooks(settings: &mut Value) {
@@ -210,5 +240,50 @@ mod tests {
         merge_hooks(&mut settings, &overlay());
         let arr = settings["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
+    }
+
+    // ── merge_json_array / remove_json_array (HARNESSES.md: opencode's `instructions`) ──
+
+    #[test]
+    fn json_array_merge_creates_the_key_when_absent() {
+        let mut cfg = json!({});
+        merge_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        assert_eq!(cfg["instructions"], json!(["overseer-root.md"]));
+    }
+
+    #[test]
+    fn json_array_merge_appends_to_an_existing_array_without_disturbing_it() {
+        let mut cfg = json!({"instructions": ["user-notes.md"]});
+        merge_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        assert_eq!(cfg["instructions"], json!(["user-notes.md", "overseer-root.md"]));
+    }
+
+    #[test]
+    fn json_array_merge_is_idempotent() {
+        let mut cfg = json!({"instructions": ["user-notes.md"]});
+        merge_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        merge_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        assert_eq!(cfg["instructions"], json!(["user-notes.md", "overseer-root.md"]));
+    }
+
+    #[test]
+    fn json_array_remove_keeps_the_users_entries() {
+        let mut cfg = json!({"instructions": ["user-notes.md", "overseer-root.md"]});
+        remove_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        assert_eq!(cfg["instructions"], json!(["user-notes.md"]));
+    }
+
+    #[test]
+    fn json_array_remove_drops_the_key_entirely_once_empty() {
+        let mut cfg = json!({"instructions": ["overseer-root.md"]});
+        remove_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]);
+        assert!(cfg.get("instructions").is_none());
+    }
+
+    #[test]
+    fn json_array_remove_is_noop_on_empty_settings() {
+        let mut cfg = json!({});
+        remove_json_array(&mut cfg, "instructions", &["overseer-root.md".to_string()]); // must not panic
+        assert!(cfg.as_object().unwrap().is_empty());
     }
 }
