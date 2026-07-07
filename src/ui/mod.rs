@@ -122,8 +122,7 @@ pub fn render(
 
     render_agent_tree(frame, display_cursor, tick, left[0], &display_flat, matched.as_ref(), theme);
     render_agent_detail(frame, left[1], &selected, theme);
-    let pane_rect =
-        render_term_pane(frame, columns[1], pane_source, selected.as_ref().map(|n| &n.id), pane_focused);
+    let pane_rect = render_term_pane(frame, columns[1], pane_source, selected.as_ref(), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything — a bordered, centered modal instead of

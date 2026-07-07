@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::agent::AgentId;
+use crate::agent::{AgentStatus, FlatNode};
 use crate::ipc::protocol::{ColorDto, GridSnapshot};
 use crate::session::SessionManager;
 
@@ -33,19 +33,28 @@ pub fn render_term_pane(
     frame: &mut Frame,
     area: Rect,
     source: &PaneSource,
-    selected: Option<&AgentId>,
+    selected: Option<&FlatNode>,
     focused: bool,
 ) -> Rect {
-    let offset = match (source, selected) {
+    let id = selected.map(|n| &n.id);
+    let offset = match (source, id) {
         (PaneSource::Local(sessions), Some(id)) => sessions.display_offset(id),
         (PaneSource::Remote(Some(grid)), Some(_)) => grid.display_offset,
         _ => 0,
     };
-    let block = Block::default().borders(Borders::ALL).title(pane_title(focused, offset));
+    // A session that exits naturally (not via `d`/`D`) keeps its last
+    // rendered content around for review — by design (AGENTS.md Cleanup),
+    // not a bug — but with no marker at all, a pane the user is still
+    // looking at (or focused into) just silently stops responding with
+    // zero explanation, which a real user reported as the pane having
+    // "frozen". `alive` mirrors `App::is_alive`'s own rule (not Done, not
+    // Error) so the title can say plainly why nothing more is happening.
+    let alive = selected.is_some_and(|n| !matches!(n.status, AgentStatus::Done | AgentStatus::Error));
+    let block = Block::default().borders(Borders::ALL).title(pane_title(focused, offset, alive));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(id) = selected else {
+    let Some(id) = id else {
         frame.render_widget(placeholder("no agent selected"), inner);
         return inner;
     };
@@ -76,13 +85,17 @@ fn placeholder(text: &'static str) -> Paragraph<'static> {
 /// always resets scroll to bottom first, per SCROLLBACK.md, so a pane is
 /// never simultaneously focused and scrolled in practice, but focused still
 /// takes priority here rather than relying on that invariant holding).
-fn pane_title(focused: bool, display_offset: usize) -> String {
-    if focused {
-        " agent [FOCUSED — Ctrl-h to leave] ".to_string()
-    } else if display_offset > 0 {
-        format!(" agent [scrolled ↑{display_offset} — G to follow] ")
-    } else {
-        " agent ".to_string()
+/// `alive` wins over everything else that isn't the escape hint: a dead
+/// session's pane otherwise looks identical to a live one that's just
+/// momentarily quiet, which read as a frozen terminal to a real user who
+/// typed `exit` while jumped in and got no further feedback at all.
+fn pane_title(focused: bool, display_offset: usize, alive: bool) -> String {
+    match (focused, alive) {
+        (true, true) => " agent [FOCUSED — Ctrl-h to leave] ".to_string(),
+        (true, false) => " agent [exited — Ctrl-h to leave] ".to_string(),
+        (false, false) => " agent [exited] ".to_string(),
+        (false, true) if display_offset > 0 => format!(" agent [scrolled ↑{display_offset} — G to follow] "),
+        (false, true) => " agent ".to_string(),
     }
 }
 
@@ -389,21 +402,34 @@ mod tests {
 
     #[test]
     fn pane_title_plain_when_not_focused_and_not_scrolled() {
-        assert_eq!(pane_title(false, 0), " agent ");
+        assert_eq!(pane_title(false, 0, true), " agent ");
     }
 
     #[test]
     fn pane_title_shows_focused() {
-        assert_eq!(pane_title(true, 0), " agent [FOCUSED — Ctrl-h to leave] ");
+        assert_eq!(pane_title(true, 0, true), " agent [FOCUSED — Ctrl-h to leave] ");
     }
 
     #[test]
     fn pane_title_shows_scrolled_offset_when_not_focused() {
-        assert_eq!(pane_title(false, 42), " agent [scrolled ↑42 — G to follow] ");
+        assert_eq!(pane_title(false, 42, true), " agent [scrolled ↑42 — G to follow] ");
     }
 
     #[test]
     fn pane_title_focused_wins_over_scrolled() {
-        assert_eq!(pane_title(true, 42), " agent [FOCUSED — Ctrl-h to leave] ");
+        assert_eq!(pane_title(true, 42, true), " agent [FOCUSED — Ctrl-h to leave] ");
+    }
+
+    #[test]
+    fn pane_title_shows_exited_when_focused_on_a_dead_session() {
+        // The exact reported bug: typing `exit` while jumped in left the
+        // pane looking identical to a live, momentarily-quiet one.
+        assert_eq!(pane_title(true, 0, false), " agent [exited — Ctrl-h to leave] ");
+    }
+
+    #[test]
+    fn pane_title_shows_exited_when_not_focused_regardless_of_scroll() {
+        assert_eq!(pane_title(false, 0, false), " agent [exited] ");
+        assert_eq!(pane_title(false, 10, false), " agent [exited] ");
     }
 }

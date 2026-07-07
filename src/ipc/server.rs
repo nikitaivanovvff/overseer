@@ -354,7 +354,16 @@ async fn handle_attach(
 /// sidesteps any orphaning concern for an exited parent with live children:
 /// nothing is deleted, so nothing can be silently taken out from under them.
 async fn session_watcher(ctx: Arc<AppCtx>) {
-    let interval = Duration::from_secs(5);
+    // Was 5s — a real user reported a pane looking "frozen" after typing
+    // `exit`: the underlying PTY had already died (`SessionManager` knows
+    // immediately, via `Event::ChildExit`), but the tree/pane title had no
+    // way to reflect that until this sweep next ran and flipped the status
+    // to `done`/`error` (`ui::term_pane`'s new "[exited]" marker keys off
+    // that same status). Tightened to close the gap between "the process
+    // actually died" and "the UI says so" — cheap even at this cadence
+    // (`sweep_exited_sessions` is O(live sessions), and does nothing at all
+    // when `drain_exits()` is empty, the common case).
+    let interval = Duration::from_millis(500);
     loop {
         tokio::time::sleep(interval).await;
 
