@@ -111,6 +111,22 @@ pub trait AgentAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Whether `spawn_command`'s launch will actually succeed, not just start
+    /// and immediately crash — checked with real I/O (`Path::exists`), so
+    /// this is deliberately kept out of `install_files`'s otherwise-pure
+    /// contract. Default `true`: most harnesses launch fine even without
+    /// Overseer's install content, they just won't report status. Override
+    /// when a missing file makes the launch command *itself* fail outright
+    /// (verified live, HARNESSES.md: `pi --extension <missing path>` hard-
+    /// errors and exits before the process ever starts responding) — without
+    /// this check, a spawn against an uninstalled adapter registers a child
+    /// that immediately crashes, sitting at `spawning` until the exit
+    /// watcher's next sweep (up to 5s) catches it, which reads as "did this
+    /// even work?" rather than a clear, immediate error.
+    fn is_installed(&self) -> bool {
+        true
+    }
+
     // --- launch (runtime, pure) ---
 
     /// Returns the command to run inside the agent's PTY (program + args; no cwd/env).

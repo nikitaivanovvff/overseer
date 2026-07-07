@@ -100,6 +100,14 @@ impl AgentAdapter for PiAdapter {
         Some(self.config_dir())
     }
 
+    fn is_installed(&self) -> bool {
+        // `spawn_command` unconditionally passes `--extension
+        // <this path>`; pi hard-errors and exits if it doesn't exist
+        // (verified live, HARNESSES.md), so a missing file here means the
+        // launch itself would fail, not just run without status reporting.
+        self.extension_full_path().exists()
+    }
+
     fn install_files(&self) -> Vec<InstalledFile> {
         vec![
             InstalledFile {
@@ -238,6 +246,14 @@ mod tests {
     fn root_instructions_bless_cross_harness_spawn_and_document_the_blocked_caveat() {
         assert!(ROOT_INSTRUCTIONS_CONTENT.contains("--adapter claude|opencode|pi"));
         assert!(ROOT_INSTRUCTIONS_CONTENT.to_lowercase().contains("no built-in permission"));
+    }
+
+    #[test]
+    fn root_instructions_forbid_the_built_in_subagent_tool_for_delegation() {
+        // A real user reported the model using its own Task/subagent tool
+        // instead of `overseer spawn` — those subagents are invisible to
+        // Overseer entirely (no tree row, no tracking).
+        assert!(ROOT_INSTRUCTIONS_CONTENT.to_lowercase().contains("do not use your own built-in subagent"));
     }
 
     #[test]

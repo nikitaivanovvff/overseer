@@ -43,6 +43,8 @@ pub struct SpawnRequest {
 pub enum SpawnError {
     #[error("unknown adapter: {0}")]
     UnknownAdapter(String),
+    #[error("'{0}' adapter is not installed -- run `overseer install {0}` first")]
+    AdapterNotInstalled(String),
     #[error(transparent)]
     Registry(#[from] RegistryError),
     #[error("launch failed: {0}")]
@@ -126,6 +128,9 @@ fn spawn_child_agent(
 ) -> Result<RegisterResult, SpawnError> {
     let adapter = adapter_for(&req.adapter_name)
         .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
+    if !adapter.is_installed() {
+        return Err(SpawnError::AdapterNotInstalled(req.adapter_name.clone()));
+    }
     let adapter_config = config
         .adapters
         .get(&req.adapter_name)
@@ -402,6 +407,17 @@ mod tests {
         let err = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
             .unwrap_err();
         assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "nonexistent"));
+    }
+
+    #[test]
+    fn adapter_not_installed_error_message_points_at_the_install_command() {
+        // Not run through the real adapter lookup (whether "pi"/"opencode"
+        // report is_installed() == true/false depends on this machine's own
+        // ~/.pi, ~/.config/opencode state -- non-deterministic across
+        // environments). Just pins the error message shape a caller
+        // (a root agent's own tool output) would actually see.
+        let err = SpawnError::AdapterNotInstalled("pi".to_string());
+        assert_eq!(err.to_string(), "'pi' adapter is not installed -- run `overseer install pi` first");
     }
 
     #[test]

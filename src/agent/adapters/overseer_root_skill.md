@@ -7,7 +7,12 @@ You are the root agent for this repository, running inside Overseer.
 
 ## Spawning children
 
-Delegate a parallelizable sub-task by running:
+**Do not use your own built-in subagent/Task/parallel-tool-use feature for
+this.** A subagent launched that way is invisible to Overseer entirely — no
+tree row, no status tracking, no separate branch/worktree, nothing the user
+watching the TUI can see or check on. Delegating means running the real CLI
+command below, every time, even though your own built-in tool might feel
+like the faster/simpler choice for a given request:
 
 ```
 overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]

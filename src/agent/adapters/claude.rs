@@ -237,6 +237,15 @@ mod tests {
     }
 
     #[test]
+    fn root_skill_forbids_the_built_in_subagent_tool_for_delegation() {
+        // A real user reported the model using its own Task/subagent tool
+        // instead of `overseer spawn` — those subagents are invisible to
+        // Overseer entirely (no tree row, no tracking).
+        let lower = ROOT_SKILL_CONTENT.to_lowercase();
+        assert!(lower.contains("do not use your own built-in subagent"));
+    }
+
+    #[test]
     fn root_skill_documents_the_name_flag_for_short_kebab_labels() {
         assert!(ROOT_SKILL_CONTENT.contains("--name"));
         assert!(ROOT_SKILL_CONTENT.contains("kebab-case"));

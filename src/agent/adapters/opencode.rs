@@ -101,6 +101,15 @@ impl AgentAdapter for OpencodeAdapter {
         dirs::home_dir().map(|h| h.join(".config").join("opencode"))
     }
 
+    fn is_installed(&self) -> bool {
+        // `spawn_command` doesn't reference this path directly (opencode
+        // auto-discovers plugin/*.js on its own), so a missing file doesn't
+        // crash the launch the way pi's does -- but it does mean the session
+        // never reports a single status, sitting at `spawning` forever,
+        // which reads exactly as "did this even work?" too.
+        self.user_config_dir().is_some_and(|dir| dir.join(PLUGIN_PATH).exists())
+    }
+
     fn install_files(&self) -> Vec<InstalledFile> {
         vec![
             InstalledFile {
@@ -265,6 +274,14 @@ mod tests {
     #[test]
     fn root_instructions_guard_on_role() {
         assert!(ROOT_INSTRUCTIONS_CONTENT.contains("OVERSEER_ROLE=root"));
+    }
+
+    #[test]
+    fn root_instructions_forbid_the_built_in_subagent_tool_for_delegation() {
+        // A real user reported the model using its own Task/subagent tool
+        // instead of `overseer spawn` — those subagents are invisible to
+        // Overseer entirely (no tree row, no tracking).
+        assert!(ROOT_INSTRUCTIONS_CONTENT.to_lowercase().contains("do not use your own built-in subagent"));
     }
 
     #[test]
