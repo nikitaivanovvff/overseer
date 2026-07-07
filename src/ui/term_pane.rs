@@ -36,9 +36,12 @@ pub fn render_term_pane(
     selected: Option<&AgentId>,
     focused: bool,
 ) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if focused { " agent [FOCUSED — Ctrl-h to leave] " } else { " agent " });
+    let offset = match (source, selected) {
+        (PaneSource::Local(sessions), Some(id)) => sessions.display_offset(id),
+        (PaneSource::Remote(Some(grid)), Some(_)) => grid.display_offset,
+        _ => 0,
+    };
+    let block = Block::default().borders(Borders::ALL).title(pane_title(focused, offset));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -67,6 +70,20 @@ pub fn render_term_pane(
 
 fn placeholder(text: &'static str) -> Paragraph<'static> {
     Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
+}
+
+/// Pure — the pane border's title. Focused wins over scrolled (jump-in
+/// always resets scroll to bottom first, per SCROLLBACK.md, so a pane is
+/// never simultaneously focused and scrolled in practice, but focused still
+/// takes priority here rather than relying on that invariant holding).
+fn pane_title(focused: bool, display_offset: usize) -> String {
+    if focused {
+        " agent [FOCUSED — Ctrl-h to leave] ".to_string()
+    } else if display_offset > 0 {
+        format!(" agent [scrolled ↑{display_offset} — G to follow] ")
+    } else {
+        " agent ".to_string()
+    }
 }
 
 /// Pure grid->buffer painter — the direct unit-test seam: feed
@@ -334,5 +351,59 @@ mod tests {
         paint_term(&term, area, &mut buf, false);
         assert_eq!(buf[(0, 0)].symbol(), "h");
         assert_eq!(buf[(4, 0)].symbol(), "o");
+    }
+
+    // ── scrollback (SCROLLBACK.md) ───────────────────────────────────────────
+
+    #[test]
+    fn scroll_display_shows_older_lines_then_bottom_restores_live_content() {
+        use alacritty_terminal::grid::Scroll;
+
+        // 5 lines of visible height, but print far more so there's real
+        // scrollback history to move into.
+        let mut bytes = Vec::new();
+        for i in 0..20 {
+            bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let mut term = term_from(&bytes, 10, 5);
+
+        let area = Rect::new(0, 0, 10, 5);
+        let mut live_buf = Buffer::empty(area);
+        paint_term(&term, area, &mut live_buf, false);
+        let live_top: String = (0..5).map(|c| live_buf[(c, 0)].symbol()).collect();
+
+        term.scroll_display(Scroll::Delta(5));
+        let mut scrolled_buf = Buffer::empty(area);
+        paint_term(&term, area, &mut scrolled_buf, false);
+        let scrolled_top: String = (0..5).map(|c| scrolled_buf[(c, 0)].symbol()).collect();
+        assert_ne!(scrolled_top, live_top, "scrolling up must show older content");
+
+        term.scroll_display(Scroll::Bottom);
+        let mut restored_buf = Buffer::empty(area);
+        paint_term(&term, area, &mut restored_buf, false);
+        let restored_top: String = (0..5).map(|c| restored_buf[(c, 0)].symbol()).collect();
+        assert_eq!(restored_top, live_top, "scrolling back to bottom must restore the live view");
+    }
+
+    // ── pane_title ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pane_title_plain_when_not_focused_and_not_scrolled() {
+        assert_eq!(pane_title(false, 0), " agent ");
+    }
+
+    #[test]
+    fn pane_title_shows_focused() {
+        assert_eq!(pane_title(true, 0), " agent [FOCUSED — Ctrl-h to leave] ");
+    }
+
+    #[test]
+    fn pane_title_shows_scrolled_offset_when_not_focused() {
+        assert_eq!(pane_title(false, 42), " agent [scrolled ↑42 — G to follow] ");
+    }
+
+    #[test]
+    fn pane_title_focused_wins_over_scrolled() {
+        assert_eq!(pane_title(true, 42), " agent [FOCUSED — Ctrl-h to leave] ");
     }
 }

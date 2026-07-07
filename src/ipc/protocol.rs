@@ -74,7 +74,8 @@ pub enum Request {
     /// protocol") — the daemon replies with an initial `AttachEvent::Snapshot`,
     /// then pushes registry/output events until the connection closes. Once sent,
     /// the connection speaks `AttachEvent` outward and only `Watch`/`Unwatch`/
-    /// `Write`/`Resize`/`Shutdown` inward — never a one-shot `Response`.
+    /// `Write`/`Resize`/`Scroll`/`ScrollToBottom` inward — never a one-shot
+    /// `Response`.
     Attach,
     /// Starts (or switches) streaming `agent_id`'s rendered terminal grid as
     /// `AttachEvent::Output` on this attach connection. An immediate snapshot is
@@ -97,6 +98,17 @@ pub enum Request {
         cols: u16,
         lines: u16,
     },
+    /// Scrolls the currently **watched** agent's terminal history — positive
+    /// `delta` moves up (further into scrollback), negative moves down
+    /// (toward live). No `agent_id`: scrolling only ever applies to whichever
+    /// agent this connection is watching (SCROLLBACK.md). A no-op if nothing
+    /// is currently watched.
+    Scroll {
+        delta: i32,
+    },
+    /// Jumps the watched agent's terminal back to the live bottom (`G` in the
+    /// TUI). Same no-op rule as `Scroll`.
+    ScrollToBottom,
     /// Recursively drops every root, then exits the daemon process — the kill
     /// switch (`overseer shutdown`).
     Shutdown,
@@ -189,6 +201,9 @@ pub struct GridSnapshot {
     /// Whether the terminal wants pasted text wrapped in bracketed-paste
     /// markers. Same rationale as `app_cursor_mode`.
     pub bracketed_paste_mode: bool,
+    /// How far this snapshot is scrolled up from the live bottom (`0` = live).
+    /// Drives the pane's "[scrolled ↑N — G to follow]" title (SCROLLBACK.md).
+    pub display_offset: usize,
 }
 
 impl From<crate::agent::RegistryEvent> for AttachEvent {

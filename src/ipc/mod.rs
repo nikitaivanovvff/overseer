@@ -508,6 +508,8 @@ mod tests {
 
         send_line(&mut stream, &Request::Watch { agent_id: root_id.clone() });
         send_line(&mut stream, &Request::Resize { cols: 100, lines: 40 });
+        send_line(&mut stream, &Request::Scroll { delta: 5 });
+        send_line(&mut stream, &Request::ScrollToBottom);
         send_line(&mut stream, &Request::Unwatch);
 
         // The connection must still be alive and forwarding registry events
@@ -515,6 +517,23 @@ mod tests {
         // event through, instead of asserting on a fixed sleep.
         let (_child_id, _) = spawn_child(&socket, &root_id, "post-watch-child");
         assert!(matches!(next_event(&mut reader), AttachEvent::AgentRegistered { .. }));
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn scroll_with_nothing_watched_is_a_harmless_noop() {
+        let socket = start_server();
+        let (mut stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        // No Watch has been sent yet — Scroll/ScrollToBottom must not panic
+        // or desync the connection.
+        send_line(&mut stream, &Request::Scroll { delta: 3 });
+        send_line(&mut stream, &Request::ScrollToBottom);
+
+        let root_id = start_root(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::AgentRegistered { agent } if agent.id == root_id));
 
         let _ = std::fs::remove_file(&socket);
     }

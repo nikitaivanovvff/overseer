@@ -10,7 +10,7 @@ use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSi
 use alacritty_terminal::event_loop::{
     EventLoop, EventLoopSender, Msg, Notifier, State as EventLoopState,
 };
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
@@ -313,6 +313,32 @@ impl SessionManager {
         Some(f(&term))
     }
 
+    /// Scrolls `id`'s terminal history — positive `delta` moves up (further
+    /// into scrollback), negative moves down (toward live). A no-op for an
+    /// unknown id (already dropped, or dry-run mode, where no session is
+    /// ever inserted).
+    pub fn scroll_display(&self, id: &AgentId, delta: i32) {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = sessions.get(id) {
+            session.term.lock().scroll_display(Scroll::Delta(delta));
+        }
+    }
+
+    /// Jumps `id`'s terminal back to the live bottom — same no-op rules as
+    /// `scroll_display`.
+    pub fn scroll_to_bottom(&self, id: &AgentId) {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = sessions.get(id) {
+            session.term.lock().scroll_display(Scroll::Bottom);
+        }
+    }
+
+    /// How far `id`'s terminal is currently scrolled up from the live bottom
+    /// (`0` = live). `0` for an unknown id too — nothing to report either way.
+    pub fn display_offset(&self, id: &AgentId) -> usize {
+        self.with_term(id, |term| term.grid().display_offset()).unwrap_or(0)
+    }
+
     /// Consumes (resets to `false`) and returns whether `id`'s terminal has
     /// produced new content since the last call. The daemon's attach
     /// connection polls this for the watched agent instead of resending an
@@ -404,6 +430,7 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
         cursor,
         app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
         bracketed_paste_mode: mode.contains(TermMode::BRACKETED_PASTE),
+        display_offset: term.grid().display_offset(),
     }
 }
 
@@ -572,6 +599,53 @@ mod tests {
         s.kill(&id);
     }
 
+    // ── scroll_display / scroll_to_bottom / display_offset ──────────────────
+
+    #[test]
+    fn scroll_display_on_unknown_id_does_not_panic() {
+        let s = SessionManager::dry_run();
+        s.scroll_display(&AgentId::new(), 5);
+    }
+
+    #[test]
+    fn scroll_to_bottom_on_unknown_id_does_not_panic() {
+        let s = SessionManager::dry_run();
+        s.scroll_to_bottom(&AgentId::new());
+    }
+
+    #[test]
+    fn display_offset_is_zero_for_an_unknown_id() {
+        let s = SessionManager::dry_run();
+        assert_eq!(s.display_offset(&AgentId::new()), 0);
+    }
+
+    #[test]
+    fn real_session_scroll_display_changes_offset_and_scroll_to_bottom_resets_it() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        // Print more lines than the default 24-line grid holds so there's
+        // real scrollback history to move into.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 100 ]; do echo \"line $i\"; i=$((i+1)); done; sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.take_dirty(&id)
+        });
+        assert!(became_dirty, "session must have produced output to scroll through");
+
+        assert_eq!(s.display_offset(&id), 0, "a fresh session starts at the live bottom");
+        s.scroll_display(&id, 10);
+        assert_eq!(s.display_offset(&id), 10);
+        s.scroll_display(&id, 5);
+        assert_eq!(s.display_offset(&id), 15);
+        s.scroll_to_bottom(&id);
+        assert_eq!(s.display_offset(&id), 0);
+
+        s.kill(&id);
+    }
+
     // ── grid_snapshot_from_term / dto_color (pure) ───────────────────────────
 
     use alacritty_terminal::event::VoidListener;
@@ -622,6 +696,24 @@ mod tests {
         let term = term_from(b"ab", 10, 3);
         let grid = grid_snapshot_from_term(&term);
         assert_eq!(grid.cursor, Some((0, 2)));
+    }
+
+    #[test]
+    fn grid_snapshot_reports_zero_display_offset_at_the_live_bottom() {
+        let term = term_from(b"hi", 10, 3);
+        assert_eq!(grid_snapshot_from_term(&term).display_offset, 0);
+    }
+
+    #[test]
+    fn grid_snapshot_reports_nonzero_display_offset_when_scrolled() {
+        use alacritty_terminal::grid::Scroll;
+        let mut bytes = Vec::new();
+        for i in 0..20 {
+            bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let mut term = term_from(&bytes, 10, 3);
+        term.scroll_display(Scroll::Delta(4));
+        assert_eq!(grid_snapshot_from_term(&term).display_offset, 4);
     }
 
     #[test]

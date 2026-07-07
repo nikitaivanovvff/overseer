@@ -245,6 +245,31 @@ async fn handle_attach(
                 Ok(Request::Resize { cols, lines }) => {
                     ctx.sessions.resize_all(cols as usize, lines as usize);
                 }
+                Ok(Request::Scroll { delta }) => {
+                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Some(agent_id) = current {
+                        ctx.sessions.scroll_display(&agent_id, delta);
+                        // Scrolling doesn't touch the PTY, so it never sets
+                        // the dirty flag the output poll relies on — push the
+                        // new grid immediately instead, same as `Watch` does.
+                        if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
+                            if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(Request::ScrollToBottom) => {
+                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Some(agent_id) = current {
+                        ctx.sessions.scroll_to_bottom(&agent_id);
+                        if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
+                            if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Ok(_) | Err(_) => {
                     // One-shot requests (or garbage) arriving on an attach
                     // connection: there's no `Response` channel to answer on

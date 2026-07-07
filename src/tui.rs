@@ -100,6 +100,7 @@ fn run_app<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> Result<()> {
     let mut last_pane_size: Option<(u16, u16)> = None;
+    let mut last_selected: Option<crate::agent::AgentId> = None;
 
     loop {
         let tick = app.tick;
@@ -112,6 +113,16 @@ fn run_app<B: ratatui::backend::Backend>(
         match &selected_id {
             Some(id) => app.watch(id),
             None => app.unwatch(),
+        }
+
+        // Scroll position resets to the live bottom whenever the selection
+        // changes (SCROLLBACK.md) — covers j/k, a drop shifting the cursor,
+        // toggling a fold, all in one place instead of at each call site.
+        if selected_id != last_selected {
+            if let Some(id) = &selected_id {
+                app.scroll_to_bottom(id);
+            }
+            last_selected = selected_id.clone();
         }
 
         let prompt = build_prompt(app);
@@ -151,7 +162,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if !handle_confirm_key(app, key) {
                                     break;
                                 }
-                            } else if !handle_tree_key(app, key) {
+                            } else if !handle_tree_key(app, key, pane_rect.height) {
                                 break;
                             }
                         }
@@ -176,8 +187,9 @@ fn run_app<B: ratatui::backend::Backend>(
 }
 
 /// `Focus::Tree` key handling (nav, spawn, drop, jump-in, quit). Returns
-/// `false` to request the run loop break (quit).
-fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
+/// `false` to request the run loop break (quit). `pane_height` is this
+/// frame's rendered pane height in rows — needed to size a half-page scroll.
+fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16) -> bool {
     match key.code {
         // Quitting never kills agents — they're independent child processes
         // that outlive the TUI, tmux-detach style (AGENTS.md Cleanup). Use
@@ -221,9 +233,45 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('D') => start_drop_confirm(app, true),
         KeyCode::Char('Q') => start_shutdown_confirm(app),
+        // Scrollback (SCROLLBACK.md): tree-focus only, the pane here is a
+        // read-only preview — these keys must never be reachable while a
+        // pane is focused (that's real agent-TUI territory, e.g. readline's
+        // own Ctrl-u kill-line). Positive delta = up into history, negative
+        // = down toward live, matching `SessionManager::scroll_display`.
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, (pane_height / 2) as i32);
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, -((pane_height / 2) as i32));
+        }
+        KeyCode::Char('y') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, 1);
+        }
+        KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, -1);
+        }
+        // No modifier guard, matching the `D`/`Q` house pattern above — some
+        // terminals report `KeyModifiers::SHIFT` alongside a capital letter,
+        // some don't (confirmed via tmux: it does), so requiring `NONE` here
+        // silently swallowed the key in exactly that case.
+        KeyCode::Char('G') => {
+            scroll_to_bottom_selected(app);
+        }
         _ => {}
     }
     true
+}
+
+fn scroll_selected(app: &mut App, delta: i32) {
+    if let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) {
+        app.scroll(&id, delta);
+    }
+}
+
+fn scroll_to_bottom_selected(app: &mut App) {
+    if let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) {
+        app.scroll_to_bottom(&id);
+    }
 }
 
 /// `Ctrl-l`/`Enter`/`o` on a selected, live agent moves focus into its pane
@@ -232,6 +280,10 @@ fn handle_tree_key(app: &mut App, key: KeyEvent) -> bool {
 fn jump_in(app: &mut App) {
     let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else { return };
     if app.is_alive(&id) {
+        // Interacting with a live pane while scrolled into history would be
+        // confusing (typing blind into a stale view) — SCROLLBACK.md resets
+        // to the live bottom on jump-in.
+        app.scroll_to_bottom(&id);
         app.focus = Focus::Pane;
     } else {
         app.status_message = Some("agent is not running".to_string());
@@ -541,7 +593,7 @@ mod tests {
         register_agent(&ctx, Some(live_id));
 
         let should_continue =
-            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24);
 
         assert!(!should_continue, "q must quit immediately, no confirm gate");
         assert!(app.confirm.is_none());
@@ -551,7 +603,7 @@ mod tests {
     fn ctrl_c_quits_immediately_too() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         let should_continue =
-            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 24);
         assert!(!should_continue);
     }
 
@@ -570,8 +622,103 @@ mod tests {
         let (mut app, ctx) = app_with_sessions(sessions);
         register_agent(&ctx, Some(live_id.clone()));
 
-        handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24);
 
         assert!(app.is_alive(&live_id), "quit must not kill live agents");
+    }
+
+    // ── scrollback keys (SCROLLBACK.md) ──────────────────────────────────────
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn app_with_real_session_scrolled_to(id: &AgentId) -> (App, Arc<AppCtx>) {
+        let sessions = SessionManager::new();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        // More lines than any pane height used below, so there's real
+        // scrollback history to move into.
+        cmd.args(["-c", "i=0; while [ $i -lt 60 ]; do echo line$i; i=$((i+1)); done; sleep 60"]);
+        sessions
+            .launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &std::collections::HashMap::new())
+            .unwrap();
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sessions.take_dirty(id)
+        });
+        assert!(became_dirty, "session must produce output before there's scrollback to move into");
+
+        let (app, ctx) = app_with_sessions(sessions);
+        register_agent(&ctx, Some(id.clone()));
+        (app, ctx)
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_d_scroll_by_half_the_pane_height() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 10);
+
+        handle_tree_key(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 0);
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn ctrl_y_and_ctrl_e_scroll_by_one_line_nvim_semantics() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+
+        // y = up, e = down (nvim semantics, per AGENTS.md keybinding style).
+        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 1);
+        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 2);
+        handle_tree_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::CONTROL), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 1);
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn shift_g_jumps_back_to_the_live_bottom() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        assert!(ctx.sessions.display_offset(&id) > 0);
+
+        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20);
+        assert_eq!(ctx.sessions.display_offset(&id), 0);
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn scroll_keys_with_an_empty_tree_do_not_panic() {
+        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
+        for code in [KeyCode::Char('u'), KeyCode::Char('d'), KeyCode::Char('y'), KeyCode::Char('e')] {
+            handle_tree_key(&mut app, key(code, KeyModifiers::CONTROL), 20);
+        }
+        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20);
+    }
+
+    #[test]
+    fn jump_in_resets_scroll_to_bottom_before_focusing() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        assert!(ctx.sessions.display_offset(&id) > 0);
+
+        jump_in(&mut app);
+
+        assert_eq!(app.focus, Focus::Pane);
+        assert_eq!(ctx.sessions.display_offset(&id), 0, "jumping in must reset scroll to bottom");
+
+        ctx.sessions.kill(&id);
     }
 }

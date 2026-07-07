@@ -224,6 +224,17 @@ Status badges: `●` running · `!` blocked (needs you — permission pending) �
 | `D` | Recursive drop — agent + all children (confirm prompt) |
 | `q` / `Ctrl-C` | Quit immediately, no confirm — detaches, never kills any agent or the daemon (see Cleanup) |
 | `Q` | The kill switch: recursive-drop every agent and exit the daemon (confirm prompt) |
+| `Ctrl-u` / `Ctrl-d` | Scroll the selected agent's pane up/down half a page (tree focus only — see "Scrollback" below) |
+| `Ctrl-y` / `Ctrl-e` | Scroll one line up/down (nvim semantics: `e` = down) |
+| `G` | Jump the selected agent's pane back to the live bottom |
+
+### Scrollback
+
+While tree-focused, `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G` scroll the *selected* agent's pane — a read-only preview in that state, so these never collide with a real agent TUI's own use of the same keys (readline's `Ctrl-u` kill-line, Claude Code's own scrolling). They are deliberately unavailable once a pane is focused: `Ctrl-h` remains the *only* key a focused pane intercepts, so `Ctrl-u`/`Ctrl-d` reach the agent untouched there (verified against a real shell: typing text then `Ctrl-u` while focused clears it via the shell's own readline, not Overseer).
+
+The scrolled offset resets to the live bottom on cursor move (`j`/`k`, and any drop-driven cursor shift — handled in one place, by comparing the selection against the previous frame's) and on jump-in (`Ctrl-l`/`Enter`/`o`), so you never end up interacting with a pane mid-scroll. The pane border shows the state: `" agent [scrolled ↑N — G to follow] "` while scrolled, reverting to `" agent "` at the bottom.
+
+Scrolling happens where the real `Term` lives — the daemon (`SessionManager::scroll_display`/`scroll_to_bottom`/`display_offset`, thin wrappers over `alacritty_terminal`'s own `Scroll::Delta`/`Scroll::Bottom`). A daemon-attached TUI sends `Request::Scroll { delta }` / `Request::ScrollToBottom` on the attach connection — no `agent_id`, since both only ever apply to whichever agent that connection is currently watching — and the daemon replies immediately with a fresh `GridSnapshot` (scrolling doesn't touch the PTY, so it never sets the dirty flag the normal output poll relies on). `--mock` mode calls `SessionManager` directly, no round trip needed.
 
 ### Spawn Data Flow
 

@@ -234,6 +234,29 @@ impl App {
         }
     }
 
+    /// Scrolls `id`'s terminal history — positive `delta` moves up (further
+    /// into scrollback), negative moves down (toward live). Mock mode calls
+    /// `SessionManager` directly; daemon mode sends `Request::Scroll`, which
+    /// only ever affects whichever agent this connection is currently
+    /// watching (server-side — `id` is not part of the wire request, see
+    /// `Request::Scroll`'s doc comment) — callers are expected to only invoke
+    /// this for the currently selected/watched agent.
+    pub fn scroll(&mut self, id: &AgentId, delta: i32) {
+        match &mut self.backend {
+            Backend::Mock(ctx) => ctx.0.sessions.scroll_display(id, delta),
+            Backend::Daemon(state) => state.send(&Request::Scroll { delta }),
+        }
+    }
+
+    /// Jumps `id`'s terminal back to the live bottom (`G`). Same per-backend
+    /// split as `scroll`.
+    pub fn scroll_to_bottom(&mut self, id: &AgentId) {
+        match &mut self.backend {
+            Backend::Mock(ctx) => ctx.0.sessions.scroll_to_bottom(id),
+            Backend::Daemon(state) => state.send(&Request::ScrollToBottom),
+        }
+    }
+
     /// Sends a one-shot request (`Start`/`Spawn`/`Drop`/…) and waits for its
     /// response. Mock mode dispatches in-process; daemon mode opens a fresh
     /// one-shot connection — deliberately *not* the persistent attach
@@ -531,6 +554,7 @@ mod tests {
             cursor: None,
             app_cursor_mode: false,
             bracketed_paste_mode: false,
+            display_offset: 0,
         };
 
         // A stale reply for a different (previously watched) agent must not
@@ -582,6 +606,51 @@ mod tests {
         let app = test_app();
         let resp = app.dispatch(Request::Start { cwd: Some(PathBuf::from("/tmp")) });
         assert!(resp.ok, "dispatch failed: {:?}", resp.error);
+    }
+
+    // ── App::scroll / scroll_to_bottom (mock mode) ───────────────────────────
+
+    #[test]
+    fn mock_mode_scroll_on_unknown_id_does_not_panic() {
+        let mut app = test_app();
+        app.scroll(&AgentId::new(), 5);
+        app.scroll_to_bottom(&AgentId::new());
+    }
+
+    #[test]
+    fn mock_mode_scroll_and_scroll_to_bottom_reach_the_real_session_manager() {
+        let sessions = SessionManager::new();
+        let id = AgentId::new();
+        // More lines than the default 24-line grid so there's real scrollback
+        // history to move into — printing fewer would leave history_size() at
+        // 0 and clamp any Scroll::Delta straight back to 0.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 60 ]; do echo line$i; i=$((i+1)); done; sleep 60"]);
+        sessions.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &std::collections::HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sessions.take_dirty(&id)
+        });
+        assert!(became_dirty, "session must produce output before there's scrollback to move into");
+
+        let ctx = Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            sessions: Arc::new(sessions),
+            socket: PathBuf::from("/tmp/overseer-scroll-test.sock"),
+            git: Arc::new(GitClient::new()),
+            config: Arc::new(crate::config::Config::default()),
+            watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        let mut app = App::new(ctx.clone());
+
+        app.scroll(&id, 5);
+        assert_eq!(ctx.sessions.display_offset(&id), 5);
+        app.scroll_to_bottom(&id);
+        assert_eq!(ctx.sessions.display_offset(&id), 0);
+
+        ctx.sessions.kill(&id);
     }
 
     // A tiny escape hatch so the daemon-mode tests above can build an `App`

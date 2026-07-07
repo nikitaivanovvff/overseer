@@ -128,9 +128,16 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         // These only make sense inside a stateful attach connection — the
         // server's `handle_conn` intercepts `Attach` before a request ever
         // reaches `dispatch`, and switches to a dedicated event-stream loop
-        // that owns `Watch`/`Unwatch`/`Write`/`Resize` from then on. Reaching
-        // here means one arrived over an ordinary one-shot connection instead.
-        Request::Attach | Request::Watch { .. } | Request::Unwatch | Request::Write { .. } | Request::Resize { .. } => {
+        // that owns `Watch`/`Unwatch`/`Write`/`Resize`/`Scroll`/`ScrollToBottom`
+        // from then on. Reaching here means one arrived over an ordinary
+        // one-shot connection instead.
+        Request::Attach
+        | Request::Watch { .. }
+        | Request::Unwatch
+        | Request::Write { .. }
+        | Request::Resize { .. }
+        | Request::Scroll { .. }
+        | Request::ScrollToBottom => {
             Response::err("this request requires an attach connection (Request::Attach first)")
         }
 
@@ -452,6 +459,8 @@ mod tests {
             Request::Unwatch,
             Request::Write { agent_id: AgentId::new(), data: "x".to_string() },
             Request::Resize { cols: 80, lines: 24 },
+            Request::Scroll { delta: 5 },
+            Request::ScrollToBottom,
         ] {
             let resp = dispatch(&ctx, req);
             assert!(!resp.ok, "attach-only request must not succeed over a one-shot connection");
