@@ -302,7 +302,19 @@ async fn handle_attach(
                     ctx.sessions.write(&agent_id, data.into_bytes());
                 }
                 Ok(Request::Resize { cols, lines }) => {
-                    ctx.sessions.resize_all(cols as usize, lines as usize);
+                    // `resize_all` locks and resizes every live session's
+                    // `Term` serially (SCALE.md risk #2) -- CPU-bound work
+                    // proportional to agent count x grid size, same class of
+                    // bug as the grid-snapshot stall this file's `spawn_blocking`
+                    // split already exists to prevent. A terminal-window
+                    // resize is common enough that leaving this inline would
+                    // stall every other connection on the daemon's single-
+                    // threaded runtime each time the user resizes.
+                    let sessions = ctx.sessions.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        sessions.resize_all(cols as usize, lines as usize);
+                    })
+                    .await;
                 }
                 Ok(Request::Scroll { delta }) => {
                     let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
