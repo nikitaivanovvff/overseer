@@ -221,6 +221,7 @@ async fn handle_attach(
     // to the TUI itself.
     let registry_task = tokio::spawn({
         let write_half = write_half.clone();
+        let ctx = ctx.clone();
         async move {
             loop {
                 match registry_rx.recv().await {
@@ -229,11 +230,24 @@ async fn handle_attach(
                             break;
                         }
                     }
-                    // A slow client missed some events — nothing to replay
-                    // them from (the registry only broadcasts), so just pick
-                    // up the next one; the client still has its last-known
-                    // snapshot plus whatever it did receive.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A slow client missed some events — there's nothing to
+                    // replay them from (the registry only broadcasts), but
+                    // silently moving on used to leave the client's local
+                    // tree permanently stale for whichever agent's specific
+                    // update got dropped in the gap (a real, reported bug:
+                    // "agent is not running" shown for a live agent — the
+                    // client's own is_alive() reads its last-known status,
+                    // per `App::is_alive`'s doc comment, and a missed
+                    // StatusChanged with nothing after it to correct the
+                    // record leaves that wrong forever). A fresh `Snapshot`
+                    // is a full resync — the same mechanism `Watch` already
+                    // uses to avoid staleness on switching agents.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let snapshot = AttachEvent::Snapshot { agents: ctx.registry.snapshot() };
+                        if !send_event(&write_half, &snapshot).await {
+                            break;
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }

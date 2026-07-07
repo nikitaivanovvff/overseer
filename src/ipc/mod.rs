@@ -480,6 +480,49 @@ mod tests {
     }
 
     #[test]
+    fn attach_resyncs_with_a_fresh_snapshot_after_falling_behind() {
+        // A real user reported "agent is not running" shown for a live
+        // agent — traced back to the registry's broadcast channel dropping
+        // events for a lagged receiver with no resync afterward, silently
+        // leaving the client's local status stale forever for whatever
+        // agent's update got lost. Floods far more status pushes than the
+        // channel's capacity while deliberately not draining the attach
+        // socket, so the registry-event forwarder task's own `.recv()` is
+        // guaranteed to observe `Lagged` once it resumes — the fix sends a
+        // fresh `Snapshot` in that case, which this asserts actually shows
+        // up mid-stream, not just as the connection's very first event.
+        let socket = start_server();
+        let root_id = start_root(&socket);
+        let (_stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        // Comfortably past the registry's broadcast channel capacity (1024).
+        for _ in 0..2000 {
+            send(&socket, Request::Status {
+                agent_id: root_id.clone(),
+                status: AgentStatus::Running,
+                message: None,
+                context_pct: None,
+                adapter: None,
+            });
+        }
+
+        let mut saw_resync_snapshot = false;
+        for _ in 0..2100 {
+            match next_event(&mut reader) {
+                AttachEvent::Snapshot { .. } => {
+                    saw_resync_snapshot = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_resync_snapshot, "expected a resync Snapshot after falling behind on 2000 rapid pushes");
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
     fn attach_streams_removed_event() {
         let socket = start_server();
         let root_id = start_root(&socket);

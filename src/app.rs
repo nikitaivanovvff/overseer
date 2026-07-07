@@ -293,9 +293,22 @@ impl App {
 fn apply_event(state: &mut DaemonState, event: AttachEvent) {
     match event {
         AttachEvent::Snapshot { agents } => {
+            // A `Snapshot` isn't only the initial one anymore — a lagged
+            // registry-event receiver now triggers a resync one too (a real
+            // "agent is not running" bug traced back to a permanently-stale
+            // client-side status after a dropped StatusChanged with no
+            // Snapshot to correct it), so this must behave well mid-session,
+            // not just at connect: preserve the current selection across the
+            // rebuild rather than silently resetting the cursor to the top.
+            let selected_id = state.tree.selected().map(|n| n.id);
             state.tree = AgentTree::new();
             for agent in agents {
                 insert_dto(&mut state.tree, agent);
+            }
+            if let Some(id) = selected_id {
+                if let Some(pos) = state.tree.flatten().iter().position(|n| n.id == id) {
+                    state.tree.cursor = pos;
+                }
             }
         }
         AttachEvent::AgentRegistered { agent } => insert_dto(&mut state.tree, agent),
@@ -503,6 +516,63 @@ mod tests {
         assert_eq!(state.tree.flatten().len(), 2);
         assert!(state.tree.find(&root_id).is_some());
         assert!(state.tree.find(&child_id).is_some());
+    }
+
+    #[test]
+    fn a_second_snapshot_preserves_the_current_selection() {
+        // A lagged registry-event receiver now triggers a resync Snapshot
+        // mid-session (ipc::server), not just at initial connect — this must
+        // not silently reset the user's cursor back to the top of the tree.
+        // `ctx.registry.snapshot()` always walks parent-before-child (it
+        // recurses the real tree top-down), so the realistic case a resync
+        // must handle isn't "the same agents reordered" but "the selected
+        // agent's *flat index* shifted because something else in the tree
+        // changed in the interim" (here: a second root registered ahead of
+        // it in snapshot order).
+        let mut state = empty_daemon_state();
+        let root_id = AgentId::new();
+        let child_id = AgentId::new();
+        apply_event(&mut state, AttachEvent::Snapshot {
+            agents: vec![
+                dto(root_id.clone(), None, AgentStatus::Idle),
+                dto(child_id.clone(), Some(root_id.clone()), AgentStatus::Running),
+            ],
+        });
+        state.tree.cursor = 1; // select the child
+        assert_eq!(state.tree.selected().unwrap().id, child_id);
+
+        // Resync: a new root now sorts ahead of the original root, pushing
+        // the child's flat index from 1 to 2.
+        let new_root_id = AgentId::new();
+        apply_event(&mut state, AttachEvent::Snapshot {
+            agents: vec![
+                dto(new_root_id, None, AgentStatus::Idle),
+                dto(root_id.clone(), None, AgentStatus::Idle),
+                dto(child_id.clone(), Some(root_id.clone()), AgentStatus::Running),
+            ],
+        });
+
+        assert_eq!(state.tree.selected().unwrap().id, child_id, "selection must follow the same agent");
+        assert_eq!(state.tree.cursor, 2, "cursor should track the child's new flat index");
+    }
+
+    #[test]
+    fn a_second_snapshot_falls_back_to_the_top_if_the_selected_agent_is_gone() {
+        let mut state = empty_daemon_state();
+        let root_id = AgentId::new();
+        let child_id = AgentId::new();
+        apply_event(&mut state, AttachEvent::Snapshot {
+            agents: vec![
+                dto(root_id.clone(), None, AgentStatus::Idle),
+                dto(child_id.clone(), Some(root_id.clone()), AgentStatus::Running),
+            ],
+        });
+        state.tree.cursor = 1; // select the child
+
+        // Resync without the child (dropped in the interim).
+        apply_event(&mut state, AttachEvent::Snapshot { agents: vec![dto(root_id.clone(), None, AgentStatus::Idle)] });
+
+        assert_eq!(state.tree.selected().unwrap().id, root_id);
     }
 
     #[test]
