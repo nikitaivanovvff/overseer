@@ -60,7 +60,9 @@ overseer (binary)
 │   │                 classification, context % from transcript JSONL
 │   ├── adapters/     Pluggable per-agent-type behaviour
 │   │   ├── mod       AgentAdapter trait (install_files, spawn_command, env_inject)
-│   │   └── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
+│   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
+│   │   ├── opencode  opencode adapter (auto-loaded plugin.js + instructions array, --prompt launch)
+│   │   └── pi        pi adapter (--extension-loaded hook + --append-system-prompt, no blocked support)
 │   ├── spawn         Orchestrates session launch + env injection + register
 │   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it
 ├── git/              Read-only git info via CLI (repo name, current branch) — no worktrees
@@ -93,7 +95,7 @@ Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `
 | `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. `teach` is a hidden alias. |
 | `overseer daemon` | — | Runs the daemon itself: binds the socket, serves requests, streams attach events, watches session exits. Hidden from `--help` — not a user workflow, the TUI spawns one automatically. |
 | `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
-| `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context %. |
+| `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context % — Claude-specific; opencode's plugin and pi's extension push plain `overseer status <s>`, no `--from-hook`, since their own events are already precise. |
 | `overseer spawn` | `--task --name? --adapter?` | Request a child. Rejected if the caller is already a child. `--task` is the child's entire initial prompt; `--name` is a short, distinct tree-row label (falls back to `--task` verbatim if omitted or blank). |
 | `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. Root agents are rejected here — only the TUI's `d`/`D` (a distinct wire request, see below) can drop one. |
 | `overseer shutdown` | — | The kill switch: recursive-drops every root, then the daemon process exits. Same request the TUI's `Q` sends after its confirm. |
@@ -142,9 +144,16 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir. The Claude Code adapter produces two user-level **skills** — `~/.claude/skills/overseer-root/SKILL.md` and `~/.claude/skills/overseer-child/SKILL.md`, each scoped to what that role actually needs to do — and merges status **hooks** into `~/.claude/settings.json`. `legacy_paths()` names any previous install layout (e.g. the old single `skills/overseer/`) that install/uninstall should delete outright rather than leave to rot alongside the current one. Nothing is ever written into the user's repo.
+`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir, one of three `MergeStrategy` variants:
+- `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
+- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays shape, tagging Overseer's own entries with `_overseer: true` so uninstall removes exactly those and nothing the user added.
+- `JsonArrayMerge { key, entries }` — generic: merges/removes specific string `entries` into/from a named top-level JSON array field (opencode's `instructions`). Array elements here are bare strings with no room for an `_overseer` sentinel, so uninstall removes exactly `entries` back out, byte-for-byte restoring what wasn't Overseer's.
 
-### Agent Awareness (Claude Code Adapter)
+`legacy_paths()` names any previous install layout (e.g. Claude's old single `skills/overseer/`) that install/uninstall should delete outright rather than leave to rot alongside the current one. Nothing is ever written into the user's repo, for any adapter.
+
+Adding a fourth adapter is a repeatable recipe, not a one-off: `.claude/skills/adding-harness-support/SKILL.md` (committed to this repo) walks through it, including the "verify against the installed binary, not the docs" gate that mattered a lot in practice — see the per-adapter notes below for what it actually caught.
+
+### Agent Awareness
 
 Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_SOCKET` — Unix socket path
@@ -154,11 +163,13 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_REPO` — repository name
 - `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for root). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
 
-Role behavior lives in the **user-level skill** installed by `overseer install` — `overseer-root` or `overseer-child`, matched to `$OVERSEER_ROLE` — not in a per-launch file:
-- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>"`.
+Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE` — not in a per-launch file:
+- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is a supported feature, not an accident — a claude root may spawn an opencode or pi child and vice versa; children don't have to run their own harness.
 - Child agents: spawning is not permitted; the agent sets up its own branch/worktree for isolation, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
 
-User-level `~/.claude/settings.json` hooks (installed by `overseer install`, shared across all sessions, no-op outside Overseer, all passing `--from-hook`):
+Three harnesses, three different status-wiring mechanisms — each verified against the actually-installed binary (`.claude/skills/adding-harness-support/SKILL.md`'s Task 0 gate), not just its docs:
+
+**Claude Code** — user-level `~/.claude/settings.json` hooks (shared across all sessions, no-op outside Overseer, all passing `--from-hook`, which reads the Claude-specific hook-payload JSON from stdin):
 
 | Hook | Pushes | Why |
 |------|--------|-----|
@@ -167,6 +178,28 @@ User-level `~/.claude/settings.json` hooks (installed by `overseer install`, sha
 | `PostToolUse` | `running` | Actively working. |
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
 | `Notification` | `blocked`, downgraded to `idle` for the ~60s idle nag | Fires for both a real permission prompt and the nag; `--from-hook` classifies which via the payload's message text. |
+
+**opencode** — a plugin at `~/.config/opencode/plugin/overseer.js`, auto-loaded with zero registration needed (confirmed live: opencode scans that directory itself; no entry in `opencode.jsonc`'s `plugin` array required). Role instructions (`overseer-root.md`/`overseer-child.md`) are merged into `opencode.jsonc`'s `instructions` array unconditionally — each file's own "only applies when `$OVERSEER_ROLE=...`" opening line is what makes loading both, every session, harmless:
+
+| opencode event | Pushes | Why |
+|------|--------|-----|
+| `session.created` | `running` | A session just started. |
+| `session.status` (`status.type === "busy"`) | `running` | The actual "agent is actively working" signal — confirmed live; better grounded than proxying through `tool.execute.after`, which only fires around tool calls. |
+| `session.idle` | `idle` | Finished responding. |
+| `permission.ask` *(a separate hook, not the generic event bus)* | `blocked` | The moment a permission prompt appears. Never sets the hook's own `output.status` — Overseer only observes, the human still decides. |
+| `permission.replied` | `running` | The prompt resolved either way; work resumes. |
+| `session.error` | *(nothing)* | The exit watcher owns `error`, not a lifecycle push. |
+
+**pi** — an extension loaded via `pi --extension <absolute-path>` at spawn time (confirmed live: bypasses pi's own npm-style package manager/`settings.json` entirely, so `overseer install`/`--uninstall` is just "write/delete one file"). Role instructions are selected **per role** at spawn time via `--append-system-prompt <path>` (pi reads the file's contents when given an existing path), so only the correct doc is ever loaded — no shared array, no self-filtering preamble needed:
+
+| pi event | Pushes | Why |
+|------|--------|-----|
+| `session_start` | `running` | Mirrors Claude's `SessionStart` — closes the startup gap. |
+| `agent_start` | `running` | A turn begins. |
+| `agent_end` | `idle` | A turn ends. |
+| `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |
+
+**pi never pushes `blocked`** — confirmed against its installed `ExtensionEvent` type union: no permission-request event exists at all (permission gates are themselves opt-in extensions in pi, not something the base install has). Documented as a plain caveat in `pi_root.md`, not faked with a different event.
 
 Status meanings: `spawning` (registered, session launching) → `running` (working) → `idle` (finished responding, awaiting more input) / `blocked` (needs you — permission pending) → `done` or `error` (see Cleanup for how these two are reached).
 
@@ -303,6 +336,14 @@ adapter = "claude"
 [adapters.claude]
 command = "claude"
 extra_args = ["--dangerously-skip-permissions"]
+
+[adapters.opencode]
+command = "opencode"
+extra_args = []
+
+[adapters.pi]
+command = "pi"
+extra_args = []
 
 [adapters.aider]
 command = "aider"
