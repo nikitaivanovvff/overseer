@@ -185,7 +185,20 @@ fn run_app<B: ratatui::backend::Backend>(
             last_pane_size = Some(pane_size);
         }
 
-        if event::poll(Duration::from_millis(100))? {
+        // This timeout doubles as the whole loop's frame pacing, not just the
+        // keyboard wait: a background thread already queues attach-socket
+        // events (DaemonState::drain_events) independent of this poll, but
+        // they only get rendered once per iteration here. A 100ms value
+        // (the original choice) meant every keystroke and every streamed
+        // agent-output update could sit for up to 100ms before its own
+        // redraw, stacking with the daemon's own dirty-check poll
+        // (ipc::server::OUTPUT_POLL_INTERVAL) for a worst case pushing
+        // 200-300ms end to end — perceptible lag, reported directly by a
+        // real user typing into a jumped-in pane. Tightened to a
+        // 60fps-equivalent interval; per-frame render cost is cheap enough
+        // (SCALE.md: ~0.4ms for a 50-node tree, even unoptimized) that the
+        // extra wake-ups cost is negligible against the responsiveness win.
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if key.kind != event::KeyEventKind::Release => {
                     if app.show_help {

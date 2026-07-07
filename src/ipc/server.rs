@@ -17,9 +17,13 @@ use crate::ipc::{
 use crate::session::SessionManager;
 
 /// How often the attach connection's output task checks the watched agent's
-/// dirty flag — matches the TUI's own render tick (`tui.rs`'s 100ms poll), so
-/// streamed output feels as responsive as local rendering used to.
-const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
+/// dirty flag — matches the TUI's own render tick (`tui.rs`'s 16ms poll), so
+/// streamed output feels as responsive as local rendering used to. A real
+/// user's reported typing lag traced back to this stacking additively with
+/// the TUI's own poll: both were 80-100ms, so a keystroke's round trip
+/// (input → PTY write → agent echo → dirty → next redraw) could compound to
+/// 200-300ms worst case even though neither interval looked large on its own.
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub async fn run(
     ctx: Arc<AppCtx>,
@@ -143,9 +147,50 @@ async fn write_response(write_half: &mut OwnedWriteHalf, resp: &Response) -> boo
 /// request loop's immediate on-`Watch` snapshot all share one connection).
 /// Returns `false` on any I/O or serialization failure — callers treat that
 /// as "the client is gone".
+///
+/// Only for small events (`Snapshot`/registry events) — an `Output` event
+/// carrying a full `GridSnapshot` must go through `build_output_event_bytes`
+/// instead, which does its own (expensive) serialization off this single-
+/// threaded runtime's one thread. Serializing a large `Output` inline here
+/// would reintroduce exactly the stall this split exists to avoid.
 async fn send_event(write_half: &AsyncMutex<OwnedWriteHalf>, event: &AttachEvent) -> bool {
     let Ok(mut bytes) = serde_json::to_vec(event) else { return false };
     bytes.push(b'\n');
+    write_half.lock().await.write_all(&bytes).await.is_ok()
+}
+
+/// Builds and serializes `agent_id`'s current grid snapshot as a ready-to-
+/// write `AttachEvent::Output` line, entirely inside `spawn_blocking`.
+/// `None` means no live session for `agent_id` (nothing to send) — distinct
+/// from a later write failure, which the caller still detects from the
+/// actual socket write's own result.
+///
+/// Both steps here are CPU-bound and, for a full-screen terminal, together
+/// cost tens of milliseconds (measured: ~1MB of JSON, ~60ms to serialize a
+/// realistic 200x50 grid in a debug build — a release build is faster but
+/// still far from free). The daemon's IPC server runs a single-threaded
+/// (`new_current_thread`) tokio runtime, so doing this inline on the async
+/// task would stall *every* other connection/agent on the daemon for that
+/// whole duration — a real, reported "everything feels slow, not just one
+/// pane" bug, not a theoretical one. `spawn_blocking` moves the CPU-bound
+/// work onto tokio's separate blocking-thread pool, leaving the single
+/// async-runtime thread free to keep servicing every other connection.
+async fn build_output_event_bytes(sessions: Arc<SessionManager>, agent_id: crate::agent::AgentId) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let grid = sessions.grid_snapshot(&agent_id)?;
+        let event = AttachEvent::Output { agent_id, grid };
+        let mut bytes = serde_json::to_vec(&event).ok()?;
+        bytes.push(b'\n');
+        Some(bytes)
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Writes pre-built `Output` event bytes (from `build_output_event_bytes`) to
+/// the connection — the actual socket write is cheap and stays on the async
+/// task; only the CPU-bound build step was moved off it.
+async fn write_output_bytes(write_half: &AsyncMutex<OwnedWriteHalf>, bytes: Vec<u8>) -> bool {
     write_half.lock().await.write_all(&bytes).await.is_ok()
 }
 
@@ -212,8 +257,8 @@ async fn handle_attach(
                 if !sessions.take_dirty(&agent_id) {
                     continue;
                 }
-                let Some(grid) = sessions.grid_snapshot(&agent_id) else { continue };
-                if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                let Some(bytes) = build_output_event_bytes(sessions.clone(), agent_id).await else { continue };
+                if !write_output_bytes(&write_half, bytes).await {
                     break;
                 }
             }
@@ -230,8 +275,8 @@ async fn handle_attach(
                     *watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_id.clone());
                     // Immediate snapshot so switching the watched agent is
                     // instant, not gated on the next dirty tick.
-                    if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
-                        if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                    if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
+                        if !write_output_bytes(&write_half, bytes).await {
                             break;
                         }
                     }
@@ -252,8 +297,8 @@ async fn handle_attach(
                         // Scrolling doesn't touch the PTY, so it never sets
                         // the dirty flag the output poll relies on — push the
                         // new grid immediately instead, same as `Watch` does.
-                        if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
-                            if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                        if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
+                            if !write_output_bytes(&write_half, bytes).await {
                                 break;
                             }
                         }
@@ -263,8 +308,8 @@ async fn handle_attach(
                     let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     if let Some(agent_id) = current {
                         ctx.sessions.scroll_to_bottom(&agent_id);
-                        if let Some(grid) = ctx.sessions.grid_snapshot(&agent_id) {
-                            if !send_event(&write_half, &AttachEvent::Output { agent_id, grid }).await {
+                        if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
+                            if !write_output_bytes(&write_half, bytes).await {
                                 break;
                             }
                         }

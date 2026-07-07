@@ -447,4 +447,52 @@ mod tests {
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::Drop { agent_id: id, recursive: true } if id == agent_id));
     }
+
+    // ── GridSnapshot wire size (real-world perf bug, 2026-07) ─────────────────
+
+    /// A real user reported typing lag and general daemon sluggishness; this
+    /// traced back to a full `GridSnapshot`'s JSON size for a realistic
+    /// terminal — roughly 1MB, ~60ms to serialize even in a debug build —
+    /// generated inline on the daemon's single-threaded ("current_thread")
+    /// tokio runtime, stalling every other connection for that whole
+    /// duration (fixed in `ipc::server` via `spawn_blocking`). This is a
+    /// floor guard, not a target: it fails if the size drops far below what
+    /// today's per-cell JSON shape produces, which would mean this test
+    /// drifted out of sync with the format rather than the format actually
+    /// shrinking — a deliberate size *reduction* (a real fix, not yet built)
+    /// should come with an update to this test, not a silent pass.
+    #[test]
+    fn grid_snapshot_json_size_for_a_realistic_terminal_matches_the_known_cost() {
+        let cols = 200usize;
+        let lines = 50usize;
+        let cells: Vec<Option<CellDto>> = (0..cols * lines)
+            .map(|i| {
+                Some(CellDto {
+                    ch: char::from_u32(97 + (i % 26) as u32).unwrap(),
+                    fg: ColorDto::White,
+                    bg: ColorDto::Reset,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    inverse: false,
+                })
+            })
+            .collect();
+        let snapshot = GridSnapshot {
+            cols: cols as u16,
+            lines: lines as u16,
+            cells,
+            cursor: Some((10, 20)),
+            app_cursor_mode: false,
+            bracketed_paste_mode: false,
+            display_offset: 0,
+        };
+        let json_len = serde_json::to_string(&snapshot).unwrap().len();
+        assert!(
+            json_len > 500_000,
+            "expected today's per-cell JSON shape to cost roughly ~1MB for a 200x50 grid, got {json_len} bytes -- \
+             if this dropped a lot, a real size-reduction landed and this test/comment should be updated to match, \
+             not just loosened"
+        );
+    }
 }
