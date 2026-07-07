@@ -8,6 +8,7 @@ mod daemon;
 mod git;
 mod install;
 mod ipc;
+mod notify;
 mod session;
 mod settings;
 #[cfg(test)]

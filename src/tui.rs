@@ -44,13 +44,19 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         App::new_daemon(state)
     };
 
+    // Bell/desktop-notification preferences (ATTENTION.md) are a property of
+    // *this* terminal/desktop, not the daemon's — read independently of
+    // mock_ctx's own config load (which is only about adapter resolution),
+    // and identically regardless of which backend `app` ends up using.
+    let notify_config = Config::load().notify;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, &mut app);
+    let res = run_app(&mut terminal, &mut app, &notify_config);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -98,9 +104,12 @@ fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    notify_config: &crate::config::NotifyConfig,
 ) -> Result<()> {
     let mut last_pane_size: Option<(u16, u16)> = None;
     let mut last_selected: Option<crate::agent::AgentId> = None;
+    let mut last_statuses: std::collections::HashMap<crate::agent::AgentId, crate::agent::AgentStatus> =
+        std::collections::HashMap::new();
 
     loop {
         let tick = app.tick;
@@ -124,6 +133,16 @@ fn run_app<B: ratatui::backend::Backend>(
             }
             last_selected = selected_id.clone();
         }
+
+        // Attention surfacing (ATTENTION.md): bell/desktop notification on a
+        // →blocked (or, if configured, →idle) transition. Detected by diffing
+        // this frame's statuses against the last — identical for `--mock`
+        // and a daemon-attached session, since it only reads the
+        // already-materialized tree, not either backend's own event plumbing.
+        let flat = app.with_tree(|t| t.flatten());
+        let transitions = crate::notify::status_transitions(&last_statuses, &flat);
+        crate::notify::handle_transitions(notify_config, &transitions);
+        last_statuses = crate::notify::snapshot_statuses(&flat);
 
         let prompt = build_prompt(app);
         let input = app.input.as_ref();

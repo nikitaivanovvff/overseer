@@ -169,6 +169,19 @@ User-level `~/.claude/settings.json` hooks (installed by `overseer install`, sha
 
 Status meanings: `spawning` (registered, session launching) → `running` (working) → `idle` (finished responding, awaiting more input) / `blocked` (needs you — permission pending) → `done` or `error` (see Cleanup for how these two are reached).
 
+Every agent also carries `status_secs`: how long, in whole seconds, it's held its *current* status — reset only when the status actually changes (a repeated `running` push from hook chatter doesn't reset it). Visible via `overseer list`/`overseer agent`, which is what makes "check on a long-idle child" an actionable instruction for the root skill, not just a UI nicety. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`) — a running agent doesn't need a clock — and the detail pane always shows it under `status:`.
+
+### Attention Surfacing
+
+A `blocked` (or, if configured, `idle`) agent can reach you two ways beyond the tree's own `!` badge, both edge-triggered — they fire once on the transition *into* that status, never on a repeated push:
+
+- **Terminal bell.** The TUI writes `\x07` to its own stdout the moment any agent transitions into `blocked`. What that turns into (a badge, a sound, a dock bounce) is entirely your terminal's call — this works everywhere, including over ssh, with zero dependencies. On (default) unless `[notify] bell = false`.
+- **Desktop notification.** `osascript`/`notify-send`, fired the same way, off by default (`[notify] mode = "off"`). `"blocked"` fires on `→blocked` only; `"blocked+idle"` also fires on `→idle`, for long tasks where "it finished responding" is itself worth a ping.
+
+Both channels are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the previous frame's recorded statuses — not a hook into either backend's event plumbing, so it works identically for `--mock` and a daemon-attached session without either one needing to know notifications exist. Config lives in `[notify]` (see Config below).
+
+Explicitly out of scope (unchanged since Phase 7): a supervision loop that auto-re-prompts an idle child. This surfaces; a human (or the root agent reading `overseer list`) decides what to do about it.
+
 ### Workspace
 
 Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer's only job is to launch the PTY in the repo and inject identity env. It never runs `git worktree`, never creates branches, and never merges. Integrating an agent's branch is the user's call, same as it would be without Overseer.
@@ -192,14 +205,15 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ AGENTS                    │                                         │
 │ ◌ overseer            idle│   the selected agent's live grid,       │
 │   ├ ⠸ auth-module 8%      │   painted directly into this same       │
-│   ├ ! tests    blocked 91%│   ratatui frame by ui/term_pane —       │
+│   ├ ! tests blocked 2m 91%│   ratatui frame by ui/term_pane —       │
 │   └ ✓ docs             62%│   real color, real interaction          │
-│ ! refactor-api     blocked│   once focused (Ctrl-l)                 │
+│ ! refactor-api  blocked 5m│   once focused (Ctrl-l)                 │
 ├───────────────────────────┤                                         │
 │ task:   auth-module       │                                         │
 │ repo:   overseer          │                                         │
 │ branch: ovsr/a            │                                         │
 │ status: running           │                                         │
+│ since:  4m                │                                         │
 │ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
  OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  q quit
@@ -266,7 +280,7 @@ SessionStart hook flips it from Spawning to Running moments later.
 
 ## Config
 
-`~/.config/overseer/config.toml`. **Implemented:** `[defaults]` and `[adapters.*]` below — loaded once at TUI startup; a missing or invalid file silently falls back to the built-in default (`defaults.adapter = "claude"`, `adapters.claude = { command = "claude", extra_args = [] }`), never blocking startup. **Not implemented yet** (Phase 5b): `spawn_policy`, `[keybindings]`, theme.
+`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, and `[notify]` below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup (adapter resolution); `[notify]` loads independently in the TUI process itself, since bell/desktop notifications are a property of *your* terminal, not the daemon's. A missing or invalid file silently falls back to the built-in default, never blocking startup. **Not implemented yet** (Phase 5b): `spawn_policy`, `[keybindings]`, theme.
 
 ```toml
 [defaults]
@@ -279,9 +293,15 @@ extra_args = ["--dangerously-skip-permissions"]
 [adapters.aider]
 command = "aider"
 extra_args = []
+
+[notify]
+bell = true      # terminal BEL on a →blocked transition (default on — inert unless your terminal makes it loud)
+mode = "off"     # desktop notifications: "off" (default) | "blocked" | "blocked+idle"
 ```
 
 A child spawn resolves its `command`/`extra_args` from `config.adapters[name]`, not from the adapter name itself — this is what lets `--dangerously-skip-permissions`-style flags actually reach the launched process, and lets a user point "claude" at a custom binary or wrapper. An adapter name with no entry in `config.adapters` is the same `UnknownAdapter` error as a name with no `AgentAdapter` impl at all.
+
+`[notify]` (see "Attention Surfacing" above): every channel is independently switchable off. `bell` defaults **on** (a terminal bell is inert unless the user's own terminal turns it into something loud); `mode` defaults **off** (desktop notifications are the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`, for long tasks where "it finished responding" is worth a ping on its own.
 
 ---
 

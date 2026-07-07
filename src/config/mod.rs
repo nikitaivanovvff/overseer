@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer};
 pub struct Config {
     pub defaults: Defaults,
     pub adapters: HashMap<String, AdapterConfig>,
+    pub notify: NotifyConfig,
 }
 
 /// Deserializes the raw TOML shape, then merges the user's `[adapters.*]` on
@@ -29,12 +30,14 @@ impl<'de> Deserialize<'de> for Config {
             defaults: Defaults,
             #[serde(default)]
             adapters: HashMap<String, AdapterConfig>,
+            #[serde(default)]
+            notify: NotifyConfig,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
         let mut adapters = default_adapters();
         adapters.extend(raw.adapters);
-        Ok(Config { defaults: raw.defaults, adapters })
+        Ok(Config { defaults: raw.defaults, adapters, notify: raw.notify })
     }
 }
 
@@ -49,6 +52,40 @@ pub struct AdapterConfig {
     pub command: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+/// `[notify]` — every attention-surfacing channel is independently
+/// switchable off (ATTENTION.md's user requirement). The bell defaults on
+/// (it's inert unless the user's terminal makes it loud); desktop
+/// notifications default off (an opt-in, louder channel).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyConfig {
+    #[serde(default = "default_bell")]
+    pub bell: bool,
+    #[serde(default)]
+    pub mode: NotifyMode,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self { bell: default_bell(), mode: NotifyMode::default() }
+    }
+}
+
+fn default_bell() -> bool {
+    true
+}
+
+/// Desktop-notification scope. `BlockedIdle` also fires on `→idle` — for
+/// long tasks where "it finished responding" is itself worth a ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyMode {
+    #[default]
+    Off,
+    Blocked,
+    #[serde(rename = "blocked+idle")]
+    BlockedIdle,
 }
 
 fn default_adapter_name() -> String {
@@ -72,7 +109,7 @@ impl Default for Defaults {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { defaults: Defaults::default(), adapters: default_adapters() }
+        Self { defaults: Defaults::default(), adapters: default_adapters(), notify: NotifyConfig::default() }
     }
 }
 
@@ -172,6 +209,47 @@ mod tests {
         let claude = cfg.adapters.get("claude").unwrap();
         assert_eq!(claude.command, "/opt/claude-wrapper");
         assert_eq!(claude.extra_args, vec!["--foo".to_string()]);
+    }
+
+    // ── [notify] (ATTENTION.md) ───────────────────────────────────────────────
+
+    #[test]
+    fn notify_defaults_bell_on_desktop_off() {
+        let cfg = Config::default();
+        assert!(cfg.notify.bell);
+        assert_eq!(cfg.notify.mode, NotifyMode::Off);
+    }
+
+    #[test]
+    fn notify_defaults_when_section_is_absent_from_the_file() {
+        let cfg: Config = toml::from_str("[defaults]\nadapter = \"claude\"\n").unwrap();
+        assert!(cfg.notify.bell);
+        assert_eq!(cfg.notify.mode, NotifyMode::Off);
+    }
+
+    #[test]
+    fn notify_bell_false_parses() {
+        let cfg: Config = toml::from_str("[notify]\nbell = false\n").unwrap();
+        assert!(!cfg.notify.bell);
+    }
+
+    #[test]
+    fn notify_mode_blocked_parses() {
+        let cfg: Config = toml::from_str("[notify]\nmode = \"blocked\"\n").unwrap();
+        assert_eq!(cfg.notify.mode, NotifyMode::Blocked);
+    }
+
+    #[test]
+    fn notify_mode_blocked_plus_idle_parses() {
+        let cfg: Config = toml::from_str("[notify]\nmode = \"blocked+idle\"\n").unwrap();
+        assert_eq!(cfg.notify.mode, NotifyMode::BlockedIdle);
+    }
+
+    #[test]
+    fn notify_bell_and_mode_together() {
+        let cfg: Config = toml::from_str("[notify]\nbell = false\nmode = \"blocked+idle\"\n").unwrap();
+        assert!(!cfg.notify.bell);
+        assert_eq!(cfg.notify.mode, NotifyMode::BlockedIdle);
     }
 
     #[test]

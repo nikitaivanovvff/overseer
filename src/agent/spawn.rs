@@ -410,7 +410,8 @@ mod tests {
         // adapters map, that's the *other* UnknownAdapter path (Task 3) — same
         // error variant, different lookup.
         let (registry, sessions) = make_registry_and_sessions();
-        let empty_config = Config { defaults: Default::default(), adapters: Default::default() };
+        let empty_config =
+            Config { defaults: Default::default(), adapters: Default::default(), notify: Default::default() };
         let root = spawn_agent(
             &registry,
             &sessions,
