@@ -10,8 +10,11 @@ use ratatui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::agent::{AgentRole, AgentStatus, AgentTree, FlatNode};
+use std::collections::HashSet;
+
+use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction};
+use crate::config::{Action, Keybindings, Theme};
 
 pub use term_pane::{render_term_pane, PaneSource};
 
@@ -31,14 +34,17 @@ pub(crate) fn status_badge(status: &AgentStatus) -> &'static str {
 }
 
 /// The color/weight `status` renders with, wherever it appears in the UI.
-pub(crate) fn status_style(status: &AgentStatus) -> Style {
+/// Colors come from `theme` (PHASE5B.md); `Blocked`'s bold weight is fixed —
+/// `[theme]` is "small and honest: the statuses + chrome, nothing else",
+/// colors only.
+pub(crate) fn status_style(status: &AgentStatus, theme: &Theme) -> Style {
     match status {
-        AgentStatus::Spawning => Style::default().fg(Color::Cyan),
-        AgentStatus::Running => Style::default().fg(Color::Green),
-        AgentStatus::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        AgentStatus::Idle => Style::default().fg(Color::DarkGray),
-        AgentStatus::Done => Style::default().fg(Color::Blue),
-        AgentStatus::Error => Style::default().fg(Color::Red),
+        AgentStatus::Spawning => Style::default().fg(theme.spawning),
+        AgentStatus::Running => Style::default().fg(theme.running),
+        AgentStatus::Blocked => Style::default().fg(theme.blocked).add_modifier(Modifier::BOLD),
+        AgentStatus::Idle => Style::default().fg(theme.idle),
+        AgentStatus::Done => Style::default().fg(theme.done),
+        AgentStatus::Error => Style::default().fg(theme.error),
     }
 }
 /// Width of the tree column as a percentage of the full window — the pane
@@ -59,10 +65,13 @@ pub fn render(
     input: Option<&InputState>,
     pane_source: &PaneSource,
     pane_focused: bool,
+    theme: &Theme,
+    keybindings: &Keybindings,
+    show_help: bool,
 ) -> Rect {
     let area = frame.area();
     let (running, blocked, total) = tree.agent_counts();
-    let status_line = build_status_line(running, blocked, total, prompt);
+    let status_line = build_status_line(running, blocked, total, prompt, theme);
     let status_text: String = status_line.spans.iter().map(|s| s.content.as_ref()).collect();
     let status_height = status_bar_height(&status_text, area.width);
 
@@ -85,10 +94,34 @@ pub fn render(
         .split(columns[0]);
 
     let flat = tree.flatten();
+    // The detail pane / live grid always track the *real* cursor — a live
+    // search filter only affects what the tree list shows, nothing moves
+    // for real until Enter (PHASE5B.md).
     let selected = flat.get(tree.cursor).cloned();
 
-    render_agent_tree(frame, tree.cursor, tick, left[0], &flat);
-    render_agent_detail(frame, left[1], &selected);
+    // While `/` is open, render only rows that match the query (plus every
+    // ancestor of a match, dimmed, for context) instead of the full tree.
+    let search_query = match input {
+        Some(InputState { action: PendingAction::Search, buffer }) => Some(buffer.as_str()),
+        _ => None,
+    };
+    let (display_flat, display_cursor, matched) = match search_query {
+        Some(query) => {
+            let (visible, matched) = search_visibility(&tree.roots, query);
+            let filtered: Vec<FlatNode> = flat.iter().filter(|n| visible.contains(&n.id)).cloned().collect();
+            let real_selected_id = flat.get(tree.cursor).map(|n| n.id.clone());
+            let highlight = real_selected_id
+                .as_ref()
+                .and_then(|id| filtered.iter().position(|n| &n.id == id))
+                .or_else(|| filtered.iter().position(|n| matched.contains(&n.id)))
+                .unwrap_or(0);
+            (filtered, highlight, Some(matched))
+        }
+        None => (flat, tree.cursor, None),
+    };
+
+    render_agent_tree(frame, display_cursor, tick, left[0], &display_flat, matched.as_ref(), theme);
+    render_agent_detail(frame, left[1], &selected, theme);
     let pane_rect =
         render_term_pane(frame, columns[1], pane_source, selected.as_ref().map(|n| &n.id), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
@@ -98,10 +131,75 @@ pub fn render(
     // (no visual weight beyond wrapped plain text at the very bottom of an
     // already-narrow pane).
     if let Some(input) = input {
-        render_spawn_modal(frame, area, input);
+        render_input_modal(frame, area, input);
+    }
+
+    if show_help {
+        render_help_popup(frame, area, keybindings);
     }
 
     pane_rect
+}
+
+/// Pure. Every agent whose name matches `query` (`matched`), plus every node
+/// that's a match itself or has a matching descendant (`visible` — an
+/// ancestor stays on screen for context, dimmed in the UI). Walks the real
+/// tree (not the flattened list) since only it has parent/child structure;
+/// deliberately ignores each node's `expanded` flag — a match hidden inside
+/// a currently-folded branch still won't surface (this only filters what
+/// `flatten()` already produced), but a match's own ancestors are always
+/// included regardless of whether *they* happen to be folded.
+fn search_visibility(roots: &[AgentNode], query: &str) -> (HashSet<AgentId>, HashSet<AgentId>) {
+    fn walk(nodes: &[AgentNode], query: &str, visible: &mut HashSet<AgentId>, matched: &mut HashSet<AgentId>) -> bool {
+        let mut any = false;
+        for node in nodes {
+            let self_match = fuzzy_match(query, &node.name).is_some();
+            let child_visible = walk(&node.children, query, visible, matched);
+            if self_match || child_visible {
+                visible.insert(node.id.clone());
+                any = true;
+            }
+            if self_match {
+                matched.insert(node.id.clone());
+            }
+        }
+        any
+    }
+    let mut visible = HashSet::new();
+    let mut matched = HashSet::new();
+    walk(roots, query, &mut visible, &mut matched);
+    (visible, matched)
+}
+
+/// Pure. Case-insensitive subsequence match with a contiguity bonus — a
+/// contiguous run scores higher than the same characters scattered, so
+/// `"au"` outranks `"ae"` against `"auth-module"` even though both match.
+/// `None` if `query`'s characters don't all appear, in order, in `name`. An
+/// empty `query` matches everything (score `0`) — "not currently filtering"
+/// and "filtering on nothing" are the same thing from the caller's side.
+pub fn fuzzy_match(query: &str, name: &str) -> Option<u32> {
+    let query: Vec<char> = query.to_lowercase().chars().collect();
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut score: u32 = 0;
+    let mut qi = 0;
+    let mut consecutive: u32 = 0;
+    for &nc in &name {
+        if qi < query.len() && nc == query[qi] {
+            consecutive += 1;
+            score += consecutive;
+            qi += 1;
+        } else {
+            consecutive = 0;
+        }
+    }
+    if qi == query.len() {
+        Some(score)
+    } else {
+        None
+    }
 }
 
 /// How many terminal rows `text` needs when word-wrapped to `area_width`
@@ -128,7 +226,15 @@ fn status_bar_height(text: &str, area_width: u16) -> u16 {
     lines
 }
 
-fn render_agent_tree(frame: &mut Frame, cursor: usize, tick: u64, area: Rect, flat: &[FlatNode]) {
+fn render_agent_tree(
+    frame: &mut Frame,
+    cursor: usize,
+    tick: u64,
+    area: Rect,
+    flat: &[FlatNode],
+    matched: Option<&HashSet<AgentId>>,
+    theme: &Theme,
+) {
     // `List`'s border consumes 2 columns; the row text itself gets the rest.
     let inner_width = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = flat
@@ -136,7 +242,11 @@ fn render_agent_tree(frame: &mut Frame, cursor: usize, tick: u64, area: Rect, fl
         .enumerate()
         .map(|(i, node)| {
             let selected = i == cursor;
-            let line = tree_row(node, selected, tick, inner_width);
+            // While searching, a row kept only for ancestor context (not
+            // itself a match) renders dimmed — `matched` is `None` outside
+            // search, so nothing dims then.
+            let dimmed = matched.is_some_and(|m| !m.contains(&node.id));
+            let line = tree_row(node, selected, dimmed, tick, theme, inner_width);
             if selected {
                 ListItem::new(line).style(Style::default().bg(Color::DarkGray))
             } else {
@@ -148,13 +258,15 @@ fn render_agent_tree(frame: &mut Frame, cursor: usize, tick: u64, area: Rect, fl
     let block = Block::default()
         .title(" AGENTS ")
         .borders(Borders::ALL)
-        .border_style(focused_border(true));
+        .border_style(focused_border(true, theme));
 
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'static> {
-    let name_style = if selected {
+fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Line<'static> {
+    let name_style = if dimmed {
+        Style::default().fg(theme.idle)
+    } else if selected {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -180,15 +292,21 @@ fn tree_row(node: &FlatNode, selected: bool, tick: u64, width: usize) -> Line<'s
         .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
         .max(1);
 
-    let row_status_style = if node.status == AgentStatus::Blocked {
-        status_style(&node.status)
+    // A dimmed (ancestor-context-only) row during search stays legible but
+    // visually recedes behind actual matches — everything in `theme.idle`,
+    // badge included, regardless of the node's real status color.
+    let badge_style = if dimmed { Style::default().fg(theme.idle) } else { status_style(&node.status, theme) };
+    let row_status_style = if dimmed {
+        Style::default().fg(theme.idle)
+    } else if node.status == AgentStatus::Blocked {
+        status_style(&node.status, theme)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
-        Span::styled(badge, status_style(&node.status)),
+        Span::styled(badge, badge_style),
         Span::raw(" "),
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
@@ -263,7 +381,7 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
     }
 }
 
-fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>) {
+fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>, theme: &Theme) {
     let content = match selected {
         Some(node) => vec![
             Line::from(vec![
@@ -278,7 +396,7 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
             ]),
             Line::from(vec![
                 Span::styled("status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.status.label(), status_style(&node.status)),
+                Span::styled(node.status.label(), status_style(&node.status, theme)),
             ]),
             Line::from(vec![
                 Span::styled("since:  ", Style::default().fg(Color::DarkGray)),
@@ -315,14 +433,17 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
     let block = Block::default()
         .title(" DETAIL ")
         .borders(Borders::ALL)
-        .border_style(focused_border(false));
+        .border_style(focused_border(false, theme));
 
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
 /// Pure — builds the status line's content so `render()` can measure its
-/// wrapped height before laying out the rest of the frame.
-fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Option<&str>) -> Line<'static> {
+/// wrapped height before laying out the rest of the frame. `?` now opens the
+/// full, live keybinding reference (PHASE5B.md), so this hint line only
+/// needs to stay short and point there — `q quit` stays spelled out
+/// regardless, since "how do I leave" shouldn't require opening help first.
+fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Option<&str>, theme: &Theme) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             " OVERSEER ",
@@ -337,25 +458,17 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
-        // Quitting never kills agents (they outlive the TUI, tmux-detach
-        // style) — `d`/`D` kills one session (still confirms); `Q` is the
-        // one command that also confirms, since it reaches every agent plus
-        // the daemon itself.
         let hints: Vec<Span> = vec![
             Span::styled("j/k", Style::default().fg(Color::Yellow)),
             Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("<space>", Style::default().fg(Color::Yellow)),
-            Span::styled(" fold  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl-l/↵", Style::default().fg(Color::Yellow)),
             Span::styled(" jump in  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("n/s", Style::default().fg(Color::Yellow)),
-            Span::styled(" spawn  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d/D", Style::default().fg(Color::Yellow)),
-            Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled(" search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Q", Style::default().fg(Color::Yellow)),
-            Span::styled(" shutdown", Style::default().fg(Color::DarkGray)),
+            Span::styled("?", Style::default().fg(Color::Yellow)),
+            Span::styled(" help", Style::default().fg(Color::DarkGray)),
         ];
         let counts_text = if blocked > 0 {
             format!("{running}/{total} running · {blocked} blocked")
@@ -363,7 +476,7 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
             format!("{running}/{total} running")
         };
         let counts_style = if blocked > 0 {
-            status_style(&AgentStatus::Blocked)
+            status_style(&AgentStatus::Blocked, theme)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -392,10 +505,53 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Option<Rect> {
     Some(Rect::new(x, y, w, h))
 }
 
-fn render_spawn_modal(frame: &mut Frame, area: Rect, input: &InputState) {
-    let (title, label) = match &input.action {
-        PendingAction::SpawnRoot => (" spawn root ", "repo path:"),
-        PendingAction::SpawnChild { .. } => (" spawn child ", "task:"),
+/// Pure. Every action's current binding, in `Action::ALL` order, plus the
+/// fixed non-configurable keys — what the `?` popup lists (PHASE5B.md Task
+/// 3). Built straight from the live `Keybindings` struct, never a hardcoded
+/// string list, so a remap (or a newly added `Action` some future change
+/// forgets to label) can't silently drift out of sync with what the popup
+/// actually shows.
+pub fn help_rows(kb: &Keybindings) -> Vec<(String, &'static str)> {
+    let mut rows: Vec<(String, &'static str)> =
+        Action::ALL.iter().map(|&action| (kb.get(action).to_string(), action.label())).collect();
+    rows.push(("enter/o".to_string(), "jump in (fixed alias)"));
+    rows.push(("ctrl-c".to_string(), "quit (fixed alias)"));
+    rows.push(("ctrl-h".to_string(), "leave pane (the only key a focused pane intercepts)"));
+    rows
+}
+
+fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
+    let rows = help_rows(keybindings);
+    let height = rows.len() as u16 + 2;
+    let Some(popup) = centered_rect(area, 58, height) else { return };
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" help — any key closes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, label)| {
+            Line::from(vec![
+                Span::styled(format!("{key:>10}  "), Style::default().fg(Color::Yellow)),
+                Span::styled(*label, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
+    let (title, label, submit_hint) = match &input.action {
+        PendingAction::SpawnRoot => (" spawn root ", "repo path:", "spawn"),
+        PendingAction::SpawnChild { .. } => (" spawn child ", "task:", "spawn"),
+        PendingAction::Search => (" search ", "agent name:", "jump"),
     };
 
     let Some(popup) = centered_rect(area, 56, 6) else { return };
@@ -428,7 +584,7 @@ fn render_spawn_modal(frame: &mut Frame, area: Rect, input: &InputState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("↵ ", Style::default().fg(Color::Yellow)),
-            Span::styled("spawn   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{submit_hint}   "), Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Yellow)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ])),
@@ -455,11 +611,11 @@ fn context_bar(pct: u8) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
 }
 
-fn focused_border(focused: bool) -> Style {
+fn focused_border(focused: bool, theme: &Theme) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border)
     }
 }
 
@@ -471,16 +627,18 @@ mod tests {
 
     #[test]
     fn idle_has_distinct_badge_and_style() {
+        let theme = Theme::default();
         assert_eq!(status_badge(&AgentStatus::Idle), "◌");
-        assert_eq!(status_style(&AgentStatus::Idle), Style::default().fg(Color::DarkGray));
+        assert_eq!(status_style(&AgentStatus::Idle, &theme), Style::default().fg(Color::DarkGray));
         assert_ne!(status_badge(&AgentStatus::Idle), status_badge(&AgentStatus::Blocked));
     }
 
     #[test]
     fn blocked_is_red_and_bold() {
+        let theme = Theme::default();
         assert_eq!(status_badge(&AgentStatus::Blocked), "!");
         assert_eq!(
-            status_style(&AgentStatus::Blocked),
+            status_style(&AgentStatus::Blocked, &theme),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         );
     }
@@ -665,7 +823,7 @@ mod tests {
 
     #[test]
     fn build_status_line_with_prompt_uses_prompt_text_not_hints() {
-        let line = build_status_line(1, 0, 2, Some("drop 'agent'? (y/n)"));
+        let line = build_status_line(1, 0, 2, Some("drop 'agent'? (y/n)"), &Theme::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("drop 'agent'? (y/n)"));
         assert!(!text.contains("jump in"));
@@ -673,7 +831,7 @@ mod tests {
 
     #[test]
     fn build_status_line_without_prompt_shows_hints_and_counts() {
-        let line = build_status_line(1, 0, 2, None);
+        let line = build_status_line(1, 0, 2, None, &Theme::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/2 running"));
         assert!(text.contains("jump in"));
@@ -681,7 +839,7 @@ mod tests {
 
     #[test]
     fn build_status_line_with_blocked_shows_blocked_count() {
-        let line = build_status_line(1, 2, 4, None);
+        let line = build_status_line(1, 2, 4, None, &Theme::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/4 running"));
         assert!(text.contains("2 blocked"));
@@ -689,8 +847,140 @@ mod tests {
 
     #[test]
     fn build_status_line_without_blocked_omits_blocked_text() {
-        let line = build_status_line(1, 0, 2, None);
+        let line = build_status_line(1, 0, 2, None, &Theme::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("blocked"));
+    }
+
+    // ── fuzzy_match (PHASE5B.md Task 1) ───────────────────────────────────────
+
+    #[test]
+    fn fuzzy_match_in_order_subsequence_matches() {
+        assert!(fuzzy_match("atm", "auth-module").is_some());
+    }
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive() {
+        assert!(fuzzy_match("AUTH", "auth-module").is_some());
+        assert!(fuzzy_match("auth", "AUTH-MODULE").is_some());
+    }
+
+    #[test]
+    fn fuzzy_match_out_of_order_does_not_match() {
+        // "ma" never appears in that order in "auth-module" (a before m,
+        // never m before a) — a subsequence match requires order.
+        assert_eq!(fuzzy_match("ma", "auth"), None);
+    }
+
+    #[test]
+    fn fuzzy_match_non_contiguous_still_matches() {
+        assert!(fuzzy_match("aue", "auth-module").is_some());
+    }
+
+    #[test]
+    fn fuzzy_match_no_match_is_none() {
+        assert_eq!(fuzzy_match("xyz", "auth-module"), None);
+    }
+
+    #[test]
+    fn fuzzy_match_empty_query_matches_everything() {
+        assert_eq!(fuzzy_match("", "anything"), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_match_scores_contiguous_higher_than_scattered() {
+        // "au" is contiguous in "auth-module"; "ae" matches the same length
+        // but scattered (a...e) — contiguous must score strictly higher.
+        let contiguous = fuzzy_match("au", "auth-module").unwrap();
+        let scattered = fuzzy_match("ae", "auth-module").unwrap();
+        assert!(contiguous > scattered, "contiguous={contiguous} scattered={scattered}");
+    }
+
+    // ── search_visibility ─────────────────────────────────────────────────────
+
+    fn node(name: &str, children: Vec<AgentNode>) -> AgentNode {
+        AgentNode {
+            id: crate::agent::AgentId::new(),
+            name: name.to_string(),
+            status: AgentStatus::Running,
+            role: AgentRole::Root,
+            repo: "repo".to_string(),
+            branch: "main".to_string(),
+            adapter: "claude".to_string(),
+            cwd: std::path::PathBuf::from("."),
+            context_pct: None,
+            children,
+            expanded: true,
+            status_since: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn search_visibility_matches_by_name() {
+        let roots = vec![node("auth-module", vec![])];
+        let (visible, matched) = search_visibility(&roots, "auth");
+        assert!(visible.contains(&roots[0].id));
+        assert!(matched.contains(&roots[0].id));
+    }
+
+    #[test]
+    fn search_visibility_keeps_a_non_matching_parent_for_context() {
+        let child = node("write-tests", vec![]);
+        let child_id = child.id.clone();
+        let parent = node("implement-auth", vec![child]);
+        let parent_id = parent.id.clone();
+        let roots = vec![parent];
+
+        let (visible, matched) = search_visibility(&roots, "write");
+
+        assert!(visible.contains(&child_id));
+        assert!(matched.contains(&child_id));
+        // The parent doesn't match "write" itself, but stays visible for
+        // context — just not marked as a direct match (so the UI dims it).
+        assert!(visible.contains(&parent_id));
+        assert!(!matched.contains(&parent_id));
+    }
+
+    #[test]
+    fn search_visibility_excludes_unrelated_subtrees() {
+        let unrelated = node("fix-login-bug", vec![]);
+        let unrelated_id = unrelated.id.clone();
+        let matching = node("auth-module", vec![]);
+        let matching_id = matching.id.clone();
+        let roots = vec![unrelated, matching];
+
+        let (visible, _matched) = search_visibility(&roots, "auth");
+
+        assert!(visible.contains(&matching_id));
+        assert!(!visible.contains(&unrelated_id));
+    }
+
+    // ── help_rows (PHASE5B.md Task 3) ─────────────────────────────────────────
+
+    #[test]
+    fn help_rows_covers_every_action_exactly_once() {
+        let kb = Keybindings::default();
+        let rows = help_rows(&kb);
+        for action in Action::ALL {
+            let count = rows.iter().filter(|(_, label)| *label == action.label()).count();
+            assert_eq!(count, 1, "{:?} should appear exactly once, appeared {count} times", action.label());
+        }
+    }
+
+    #[test]
+    fn help_rows_includes_the_fixed_non_configurable_keys() {
+        let kb = Keybindings::default();
+        let rows = help_rows(&kb);
+        assert!(rows.iter().any(|(key, _)| key == "enter/o"));
+        assert!(rows.iter().any(|(key, _)| key == "ctrl-c"));
+        assert!(rows.iter().any(|(key, _)| key == "ctrl-h"));
+    }
+
+    #[test]
+    fn help_rows_reflects_a_remap() {
+        let kb = Keybindings { spawn_root: crate::config::KeyBinding::Char('a'), ..Keybindings::default() };
+        let rows = help_rows(&kb);
+        let spawn_root_row = rows.iter().find(|(_, label)| *label == Action::SpawnRoot.label()).unwrap();
+        assert_eq!(spawn_root_row.0, "a");
     }
 }

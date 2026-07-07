@@ -74,9 +74,10 @@ overseer (binary)
 │   └── client        One-shot sync client used by CLI subcommands and daemon reachability probes
 ├── app               App: Backend enum (Mock | Daemon) unifying tree access, session I/O, and
 │                     dispatch behind one API so tui.rs/ui/ don't branch on which backend is live
-└── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters}.
-                      Missing/invalid file falls back to a built-in default. Keybindings/theme
-                      are not implemented yet (Phase 5b).
+└── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters,
+                      notify, keybindings, theme}. Missing/invalid file falls back to a built-in
+                      default; per-field a bad value falls back to that field's own default too
+                      (a stderr warning, never a hard error).
 ```
 
 ---
@@ -216,7 +217,7 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ since:  4m                │                                         │
 │ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
- OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  q quit
+ OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; there is no second pane, no multiplexer, nothing external compositing the right side. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half of the buffer via a `PaneSource`: in `--mock` it locks the local `alacritty_terminal::Term` directly (`SessionManager::with_term`); everywhere else it paints the last `GridSnapshot` the daemon streamed for the watched agent (see "Daemon + Attach Protocol").
@@ -227,9 +228,12 @@ Status badges: `●` running · `!` blocked (needs you — permission pending) �
 
 **Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while a pane is focused (real Backspace still works: terminals send `DEL`, not `^H`).
 
-| Key | Action |
+Every tree-focus action below is remappable via `[keybindings]` (PHASE5B.md) — the table shows the defaults. Two things stay fixed regardless of config: `Ctrl-h` (pane-focus interception — see the paragraph above; making this remappable would invite a user to steal a key their agent's own TUI needs) and the scrollback keys (`Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G`, next section) — neither was ever in scope for `[keybindings]`. `Enter`/`o` and `Ctrl-C` also stay fixed *as extra aliases* for `jump_in`/`quit` even if those actions are remapped to something else.
+
+| Key (default) | Action |
 |-----|--------|
 | `j` / `k` | Navigate agent tree (tree focus only) |
+| `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
 | `n` | Spawn a root: a bare shell in a chosen repo (default cwd) — no agent launched, run your own |
@@ -238,9 +242,19 @@ Status badges: `●` running · `!` blocked (needs you — permission pending) �
 | `D` | Recursive drop — agent + all children (confirm prompt) |
 | `q` / `Ctrl-C` | Quit immediately, no confirm — detaches, never kills any agent or the daemon (see Cleanup) |
 | `Q` | The kill switch: recursive-drop every agent and exit the daemon (confirm prompt) |
-| `Ctrl-u` / `Ctrl-d` | Scroll the selected agent's pane up/down half a page (tree focus only — see "Scrollback" below) |
-| `Ctrl-y` / `Ctrl-e` | Scroll one line up/down (nvim semantics: `e` = down) |
-| `G` | Jump the selected agent's pane back to the live bottom |
+| `/` | Fuzzy search the tree by name (see "Search" below) |
+| `?` | Open the live keybinding reference — any key closes it |
+| `Ctrl-u` / `Ctrl-d` | Scroll the selected agent's pane up/down half a page (tree focus only, fixed — see "Scrollback" below) |
+| `Ctrl-y` / `Ctrl-e` | Scroll one line up/down (nvim semantics: `e` = down; fixed) |
+| `G` | Jump the selected agent's pane back to the live bottom (fixed) |
+
+### Search
+
+`/` opens a centered input (same modal chrome as spawn); as you type, the tree shows only agents whose name fuzzy-matches the query, plus every ancestor of a match (dimmed, kept for context — e.g. a matching child keeps its parent row visible so you can still see whose child it is). Matching is a pure `fuzzy_match(query, name) -> Option<u32>`: case-insensitive, in-order subsequence, with a score that rewards contiguous runs over scattered ones (so typing `au` ranks `auth-module` above a node that only matches `a` and `u` far apart). `Enter` moves the *real* cursor to the current selection if it still matches, else the first match in tree order, and closes the prompt; `Esc` closes it without moving anything. Nothing about the real cursor changes while you're still typing — only what the tree list renders.
+
+### Help
+
+`?` (itself remappable) opens a centered popup listing every binding — generated from the live `Keybindings` struct (`ui::help_rows`), never a hardcoded string, so a remap or a newly-added action can't silently drift out of sync with what's shown. Includes the fixed keys too (`Enter`/`o`, `Ctrl-C`, `Ctrl-h`), labeled as fixed. Any key closes it.
 
 ### Scrollback
 
@@ -280,7 +294,7 @@ SessionStart hook flips it from Spawning to Running moments later.
 
 ## Config
 
-`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, and `[notify]` below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup (adapter resolution); `[notify]` loads independently in the TUI process itself, since bell/desktop notifications are a property of *your* terminal, not the daemon's. A missing or invalid file silently falls back to the built-in default, never blocking startup. **Not implemented yet** (Phase 5b): `spawn_policy`, `[keybindings]`, theme.
+`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, `[notify]`, `[keybindings]`, and `[theme]` — all below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup (adapter resolution); `[notify]`/`[keybindings]`/`[theme]` load independently in the TUI process itself (PHASE5B.md), since they're all properties of *your* terminal/desktop, not the daemon's. A missing or invalid file falls back to the built-in default; a bad *value* for one field (an unknown action name, an unparseable key, an unrecognized color) warns on stderr and keeps that field's own default — never a hard error, and never blocks startup.
 
 ```toml
 [defaults]
@@ -297,11 +311,32 @@ extra_args = []
 [notify]
 bell = true      # terminal BEL on a →blocked transition (default on — inert unless your terminal makes it loud)
 mode = "off"     # desktop notifications: "off" (default) | "blocked" | "blocked+idle"
+
+[keybindings]     # tree-focus bindings only, all optional — see the keybinding table above for defaults
+spawn_root = "n"
+spawn_child = "s"
+search = "/"
+help = "?"
+# ...every other tree-focus action is remappable the same way.
+
+[theme]           # status + chrome colors only — named ratatui colors or #rrggbb
+running = "green"
+blocked = "red"
+idle = "dark_gray"
+done = "blue"
+error = "red"
+spawning = "cyan"
+border_focused = "yellow"
+border = "dark_gray"
 ```
 
 A child spawn resolves its `command`/`extra_args` from `config.adapters[name]`, not from the adapter name itself — this is what lets `--dangerously-skip-permissions`-style flags actually reach the launched process, and lets a user point "claude" at a custom binary or wrapper. An adapter name with no entry in `config.adapters` is the same `UnknownAdapter` error as a name with no `AgentAdapter` impl at all.
 
 `[notify]` (see "Attention Surfacing" above): every channel is independently switchable off. `bell` defaults **on** (a terminal bell is inert unless the user's own terminal turns it into something loud); `mode` defaults **off** (desktop notifications are the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`, for long tasks where "it finished responding" is worth a ping on its own.
+
+`[keybindings]` (PHASE5B.md): a key is `j`/`D`/`/` (single char, case-sensitive) or `ctrl-<char>` (case-insensitive on the letter — Ctrl+A and Ctrl+a are the same physical keystroke). Two actions bound to the same key is a startup warning, not an error — the action declared later wins, deterministically (see `config::keybindings::Action::ALL`'s order). `Ctrl-h` (pane interception) and the scrollback keys are **not** in this table at all — see the house-style note above for why. Every binding is reflected live in the `?` popup.
+
+`[theme]` (PHASE5B.md): colors only, nothing else — `Blocked`'s bold weight, for instance, is fixed. `Theme::default()` is asserted (in a test) to reproduce the exact colors Overseer shipped with before `[theme]` existed, so this section existing can't silently change anyone's look who never touches it.
 
 ---
 

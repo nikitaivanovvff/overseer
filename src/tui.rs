@@ -16,7 +16,7 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::agent::AgentTree;
 use crate::app::{App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction};
-use crate::config::Config;
+use crate::config::{Action, Config, KeyBinding, Keybindings};
 use crate::daemon;
 use crate::git::GitClient;
 use crate::ipc;
@@ -44,11 +44,15 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         App::new_daemon(state)
     };
 
-    // Bell/desktop-notification preferences (ATTENTION.md) are a property of
-    // *this* terminal/desktop, not the daemon's — read independently of
-    // mock_ctx's own config load (which is only about adapter resolution),
-    // and identically regardless of which backend `app` ends up using.
-    let notify_config = Config::load().notify;
+    // Bell/desktop-notification, keybinding, and theme preferences (ATTENTION.md
+    // / PHASE5B.md) are all properties of *this* terminal/desktop, not the
+    // daemon's — read independently of mock_ctx's own config load (which is
+    // only about adapter resolution), and identically regardless of which
+    // backend `app` ends up using.
+    let ui_config = Config::load();
+    let notify_config = ui_config.notify;
+    let keybindings = ui_config.keybindings;
+    let theme = ui_config.theme;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -56,7 +60,7 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, &mut app, &notify_config);
+    let res = run_app(&mut terminal, &mut app, &notify_config, &keybindings, &theme);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -105,6 +109,8 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     notify_config: &crate::config::NotifyConfig,
+    keybindings: &Keybindings,
+    theme: &crate::config::Theme,
 ) -> Result<()> {
     let mut last_pane_size: Option<(u16, u16)> = None;
     let mut last_selected: Option<crate::agent::AgentId> = None;
@@ -156,8 +162,18 @@ fn run_app<B: ratatui::backend::Backend>(
         let mut pane_rect = Rect::default();
         app.with_tree(|tree| {
             terminal.draw(|f| {
-                pane_rect =
-                    ui::render(f, tree, tick, prompt.as_deref(), input, &pane_source, pane_focused);
+                pane_rect = ui::render(
+                    f,
+                    tree,
+                    tick,
+                    prompt.as_deref(),
+                    input,
+                    &pane_source,
+                    pane_focused,
+                    theme,
+                    keybindings,
+                    app.show_help,
+                );
             })
         })?;
         // Every agent shares one PTY size — resize on layout
@@ -172,17 +188,23 @@ fn run_app<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                    match app.focus {
-                        Focus::Pane => handle_pane_key(app, key),
-                        Focus::Tree => {
-                            if app.input.is_some() {
-                                handle_input_key(app, key);
-                            } else if app.confirm.is_some() {
-                                if !handle_confirm_key(app, key) {
+                    if app.show_help {
+                        // Any key closes it (PHASE5B.md) — doesn't matter
+                        // which, so this comes before focus/input dispatch.
+                        app.show_help = false;
+                    } else {
+                        match app.focus {
+                            Focus::Pane => handle_pane_key(app, key),
+                            Focus::Tree => {
+                                if app.input.is_some() {
+                                    handle_input_key(app, key);
+                                } else if app.confirm.is_some() {
+                                    if !handle_confirm_key(app, key) {
+                                        break;
+                                    }
+                                } else if !handle_tree_key(app, key, pane_rect.height, keybindings) {
                                     break;
                                 }
-                            } else if !handle_tree_key(app, key, pane_rect.height) {
-                                break;
                             }
                         }
                     }
@@ -208,33 +230,71 @@ fn run_app<B: ratatui::backend::Backend>(
 /// `Focus::Tree` key handling (nav, spawn, drop, jump-in, quit). Returns
 /// `false` to request the run loop break (quit). `pane_height` is this
 /// frame's rendered pane height in rows — needed to size a half-page scroll.
-fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16) -> bool {
+/// `keybindings` drives everything remappable (PHASE5B.md); a handful of
+/// keys stay fixed regardless (see the two `match`es below this doc comment).
+fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: &Keybindings) -> bool {
+    // Fixed, non-remappable aliases: Ctrl-C always quits (same as `q`, just
+    // the universal terminal muscle-memory one); Enter/`o` always jump in
+    // (mirroring `jump_in`'s own doc comment) regardless of what `jump_in`
+    // is bound to.
     match key.code {
-        // Quitting never kills agents — they're independent child processes
-        // that outlive the TUI, tmux-detach style (AGENTS.md Cleanup). Use
-        // `d`/`D` on a specific agent first if you want it gone.
-        KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => return false,
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => return false,
+        KeyCode::Enter | KeyCode::Char('o') if key.modifiers == KeyModifiers::NONE => {
+            jump_in(app);
+            return true;
+        }
         _ => {}
     }
 
+    // Scrollback (SCROLLBACK.md): tree-focus only, the pane here is a
+    // read-only preview — these keys must never be reachable while a pane is
+    // focused (that's real agent-TUI territory, e.g. readline's own Ctrl-u
+    // kill-line). Positive delta = up into history, negative = down toward
+    // live, matching `SessionManager::scroll_display`. Not modeled in
+    // `Keybindings` — SCROLLBACK.md never asked for these to be remappable.
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, (pane_height / 2) as i32);
+            return true;
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, -((pane_height / 2) as i32));
+            return true;
+        }
+        KeyCode::Char('y') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, 1);
+            return true;
+        }
+        KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+            scroll_selected(app, -1);
+            return true;
+        }
+        // No modifier guard, matching the `D`/`Q` house pattern below — some
+        // terminals report `KeyModifiers::SHIFT` alongside a capital letter,
+        // some don't (confirmed via tmux: it does), so requiring `NONE` here
+        // silently swallowed the key in exactly that case.
+        KeyCode::Char('G') => {
+            scroll_to_bottom_selected(app);
+            return true;
+        }
+        _ => {}
+    }
+
+    let Some(binding) = key_binding_from_event(&key) else { return true };
+    let Some(action) = keybindings.action_for_key(binding) else { return true };
+
+    match action {
+        Action::NavDown => {
             app.with_tree_mut(|t| t.move_down());
         }
-        KeyCode::Char('k') | KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+        Action::NavUp => {
             app.with_tree_mut(|t| t.move_up());
         }
-        KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
+        Action::ToggleExpand => {
             app.with_tree_mut(|t| t.toggle_expand());
         }
-        KeyCode::Enter | KeyCode::Char('o') if key.modifiers == KeyModifiers::NONE => {
-            jump_in(app);
-        }
-        KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
-            jump_in(app);
-        }
-        KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+        Action::JumpIn => jump_in(app),
+        Action::SpawnRoot => {
             app.status_message = None;
             let default_cwd = std::env::current_dir()
                 .map(|p| display_path_from_home(&p))
@@ -244,41 +304,41 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16) -> bool {
                 buffer: default_cwd,
             });
         }
-        KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE => {
-            start_spawn_child_input(app);
-        }
-        KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
-            start_drop_confirm(app, false);
-        }
-        KeyCode::Char('D') => start_drop_confirm(app, true),
-        KeyCode::Char('Q') => start_shutdown_confirm(app),
-        // Scrollback (SCROLLBACK.md): tree-focus only, the pane here is a
-        // read-only preview — these keys must never be reachable while a
-        // pane is focused (that's real agent-TUI territory, e.g. readline's
-        // own Ctrl-u kill-line). Positive delta = up into history, negative
-        // = down toward live, matching `SessionManager::scroll_display`.
-        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-            scroll_selected(app, (pane_height / 2) as i32);
-        }
-        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-            scroll_selected(app, -((pane_height / 2) as i32));
-        }
-        KeyCode::Char('y') if key.modifiers == KeyModifiers::CONTROL => {
-            scroll_selected(app, 1);
-        }
-        KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
-            scroll_selected(app, -1);
-        }
-        // No modifier guard, matching the `D`/`Q` house pattern above — some
-        // terminals report `KeyModifiers::SHIFT` alongside a capital letter,
-        // some don't (confirmed via tmux: it does), so requiring `NONE` here
-        // silently swallowed the key in exactly that case.
-        KeyCode::Char('G') => {
-            scroll_to_bottom_selected(app);
-        }
-        _ => {}
+        Action::SpawnChild => start_spawn_child_input(app),
+        // Quitting never kills agents — they're independent child processes
+        // that outlive the TUI, tmux-detach style (AGENTS.md Cleanup). Use
+        // `d`/`D` on a specific agent first if you want it gone.
+        Action::Drop => start_drop_confirm(app, false),
+        Action::DropRecursive => start_drop_confirm(app, true),
+        Action::Quit => return false,
+        Action::Shutdown => start_shutdown_confirm(app),
+        Action::Search => start_search(app),
+        Action::Help => app.show_help = true,
     }
     true
+}
+
+/// Converts a live key event into the config-file vocabulary `Keybindings`
+/// speaks — the inverse of `parse_binding`. Kept here (not in `config/`)
+/// since it's the one piece that actually depends on `crossterm`.
+fn key_binding_from_event(key: &KeyEvent) -> Option<KeyBinding> {
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(KeyBinding::Ctrl(c.to_ascii_lowercase()))
+        }
+        KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT => {
+            Some(KeyBinding::Char(c))
+        }
+        KeyCode::Enter if key.modifiers == KeyModifiers::NONE => Some(KeyBinding::Enter),
+        KeyCode::Esc if key.modifiers == KeyModifiers::NONE => Some(KeyBinding::Esc),
+        _ => None,
+    }
+}
+
+/// `/`: opens a live-filtering search prompt from tree focus (PHASE5B.md).
+fn start_search(app: &mut App) {
+    app.status_message = None;
+    app.input = Some(InputState { action: PendingAction::Search, buffer: String::new() });
 }
 
 fn scroll_selected(app: &mut App, delta: i32) {
@@ -454,6 +514,24 @@ fn submit_input(app: &mut App, input: InputState) {
             };
             dispatch_and_report(app, Request::Spawn { parent_id, task, name: None, adapter: None, cwd: parent_cwd });
         }
+        // Enter on a live search: keep the cursor where it is if that node
+        // still matches, otherwise jump to the first match in tree order
+        // (PHASE5B.md: "moves the cursor to the first/selected match").
+        // Filtering itself is render-only (ui::render reads `input` live
+        // while it's `Some`) — this is the one place the *real* cursor moves.
+        PendingAction::Search => {
+            let query = input.buffer.trim().to_string();
+            app.with_tree_mut(|t| {
+                let flat = t.flatten();
+                let cursor_still_matches =
+                    flat.get(t.cursor).is_some_and(|n| ui::fuzzy_match(&query, &n.name).is_some());
+                if !cursor_still_matches {
+                    if let Some(pos) = flat.iter().position(|n| ui::fuzzy_match(&query, &n.name).is_some()) {
+                        t.cursor = pos;
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -612,7 +690,7 @@ mod tests {
         register_agent(&ctx, Some(live_id));
 
         let should_continue =
-            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24);
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24, &Keybindings::default());
 
         assert!(!should_continue, "q must quit immediately, no confirm gate");
         assert!(app.confirm.is_none());
@@ -622,7 +700,7 @@ mod tests {
     fn ctrl_c_quits_immediately_too() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         let should_continue =
-            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 24);
+            handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 24, &Keybindings::default());
         assert!(!should_continue);
     }
 
@@ -641,7 +719,7 @@ mod tests {
         let (mut app, ctx) = app_with_sessions(sessions);
         register_agent(&ctx, Some(live_id.clone()));
 
-        handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24);
+        handle_tree_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 24, &Keybindings::default());
 
         assert!(app.is_alive(&live_id), "quit must not kill live agents");
     }
@@ -677,10 +755,10 @@ mod tests {
         let id = AgentId::new();
         let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
 
-        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 10);
 
-        handle_tree_key(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('d'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 0);
 
         ctx.sessions.kill(&id);
@@ -692,11 +770,11 @@ mod tests {
         let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
 
         // y = up, e = down (nvim semantics, per AGENTS.md keybinding style).
-        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 1);
-        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 2);
-        handle_tree_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 1);
 
         ctx.sessions.kill(&id);
@@ -707,10 +785,10 @@ mod tests {
         let id = AgentId::new();
         let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
 
-        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert!(ctx.sessions.display_offset(&id) > 0);
 
-        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20, &Keybindings::default());
         assert_eq!(ctx.sessions.display_offset(&id), 0);
 
         ctx.sessions.kill(&id);
@@ -720,9 +798,9 @@ mod tests {
     fn scroll_keys_with_an_empty_tree_do_not_panic() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         for code in [KeyCode::Char('u'), KeyCode::Char('d'), KeyCode::Char('y'), KeyCode::Char('e')] {
-            handle_tree_key(&mut app, key(code, KeyModifiers::CONTROL), 20);
+            handle_tree_key(&mut app, key(code, KeyModifiers::CONTROL), 20, &Keybindings::default());
         }
-        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('G'), KeyModifiers::NONE), 20, &Keybindings::default());
     }
 
     #[test]
@@ -730,7 +808,7 @@ mod tests {
         let id = AgentId::new();
         let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
 
-        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20);
+        handle_tree_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL), 20, &Keybindings::default());
         assert!(ctx.sessions.display_offset(&id) > 0);
 
         jump_in(&mut app);
@@ -739,5 +817,96 @@ mod tests {
         assert_eq!(ctx.sessions.display_offset(&id), 0, "jumping in must reset scroll to bottom");
 
         ctx.sessions.kill(&id);
+    }
+
+    // ── keybindings config (PHASE5B.md Task 2) ───────────────────────────────
+
+    #[test]
+    fn handle_tree_key_respects_a_remapped_action() {
+        let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
+        register_agent(&ctx, None);
+        let kb = Keybindings { spawn_root: KeyBinding::Char('a'), ..Keybindings::default() };
+
+        // 'n' (the default) must no longer trigger spawn-root once remapped away.
+        handle_tree_key(&mut app, key(KeyCode::Char('n'), KeyModifiers::NONE), 24, &kb);
+        assert!(app.input.is_none(), "'n' must be inert once spawn_root is remapped to 'a'");
+
+        // 'a' (the remap) must trigger it instead.
+        handle_tree_key(&mut app, key(KeyCode::Char('a'), KeyModifiers::NONE), 24, &kb);
+        assert!(matches!(
+            app.input.as_ref().map(|i| &i.action),
+            Some(PendingAction::SpawnRoot)
+        ));
+    }
+
+    // ── fuzzy search (PHASE5B.md Task 1) ─────────────────────────────────────
+
+    fn register_named_agent(ctx: &AppCtx, name: &str) -> AgentId {
+        use crate::agent::RegisterArgs;
+        ctx.registry
+            .register(RegisterArgs {
+                id: None,
+                name: name.to_string(),
+                role: AgentRole::Root,
+                parent_id: None,
+                adapter: "shell".to_string(),
+                repo: "repo".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                branch: None,
+                initial_status: AgentStatus::Idle,
+            })
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn slash_opens_a_search_prompt() {
+        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
+        handle_tree_key(&mut app, key(KeyCode::Char('/'), KeyModifiers::NONE), 24, &Keybindings::default());
+        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::Search)));
+    }
+
+    #[test]
+    fn submit_search_jumps_the_cursor_to_the_first_match() {
+        let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
+        register_named_agent(&ctx, "fix-login-bug");
+        let auth_id = register_named_agent(&ctx, "auth-module");
+        app.with_tree_mut(|t| t.cursor = 0); // start on "fix-login-bug"
+
+        app.input = Some(InputState { action: PendingAction::Search, buffer: "auth".to_string() });
+        handle_input_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.input.is_none(), "Enter must close the search prompt");
+        let selected = app.with_tree(|t| t.selected()).unwrap();
+        assert_eq!(selected.id, auth_id);
+    }
+
+    #[test]
+    fn submit_search_keeps_the_cursor_if_it_already_matches() {
+        let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
+        register_named_agent(&ctx, "auth-module");
+        let write_tests_id = register_named_agent(&ctx, "write-tests");
+        app.with_tree_mut(|t| t.cursor = 1); // start on "write-tests", which itself matches "write"
+
+        app.input = Some(InputState { action: PendingAction::Search, buffer: "write".to_string() });
+        handle_input_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let selected = app.with_tree(|t| t.selected()).unwrap();
+        assert_eq!(selected.id, write_tests_id, "cursor must stay put when it's already a match");
+    }
+
+    #[test]
+    fn esc_during_search_restores_the_full_tree_without_moving_the_cursor() {
+        let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
+        let fix_id = register_named_agent(&ctx, "fix-login-bug");
+        register_named_agent(&ctx, "auth-module");
+        app.with_tree_mut(|t| t.cursor = 0); // "fix-login-bug"
+
+        app.input = Some(InputState { action: PendingAction::Search, buffer: "auth".to_string() });
+        handle_input_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.input.is_none(), "Esc must close the search prompt");
+        let selected = app.with_tree(|t| t.selected()).unwrap();
+        assert_eq!(selected.id, fix_id, "Esc must not move the real cursor");
     }
 }

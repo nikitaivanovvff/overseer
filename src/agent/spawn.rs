@@ -411,7 +411,13 @@ mod tests {
         // error variant, different lookup.
         let (registry, sessions) = make_registry_and_sessions();
         let empty_config =
-            Config { defaults: Default::default(), adapters: Default::default(), notify: Default::default() };
+            Config {
+                defaults: Default::default(),
+                adapters: Default::default(),
+                notify: Default::default(),
+                keybindings: Default::default(),
+                theme: Default::default(),
+            };
         let root = spawn_agent(
             &registry,
             &sessions,

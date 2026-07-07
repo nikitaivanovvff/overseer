@@ -11,11 +11,15 @@ use crate::agent::{AgentId, AgentNode, AgentStatus, AgentTree};
 use crate::ipc::protocol::{AgentDto, AttachEvent, GridSnapshot, Request, Response};
 use crate::ipc::AppCtx;
 
-/// What a text-input prompt (`n` / `s`) is being collected for.
+/// What a text-input prompt (`n` / `s` / `/`) is being collected for.
 #[derive(Debug, Clone)]
 pub enum PendingAction {
     SpawnRoot,
     SpawnChild { parent_id: AgentId },
+    /// Fuzzy agent search (PHASE5B.md) — unlike the spawn prompts, this one
+    /// re-filters the tree live as `buffer` changes rather than waiting for
+    /// a submit; `ui::render` reads it directly off `App`'s `input` field.
+    Search,
 }
 
 /// Active when the user is typing a task description for `n`/`s`.
@@ -81,6 +85,9 @@ pub struct App {
     pub confirm: Option<ConfirmState>,
     pub status_message: Option<String>,
     pub focus: Focus,
+    /// `?` popup (PHASE5B.md) — any key closes it; doesn't interact with
+    /// `input`/`confirm` at all, so it can overlay either.
+    pub show_help: bool,
 }
 
 impl App {
@@ -93,7 +100,15 @@ impl App {
     }
 
     fn from_backend(backend: Backend) -> Self {
-        Self { backend, tick: 0, input: None, confirm: None, status_message: None, focus: Focus::Tree }
+        Self {
+            backend,
+            tick: 0,
+            input: None,
+            confirm: None,
+            status_message: None,
+            focus: Focus::Tree,
+            show_help: false,
+        }
     }
 
     pub fn tick(&mut self) {

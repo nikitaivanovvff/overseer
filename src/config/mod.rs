@@ -1,5 +1,11 @@
-//! Minimal `[defaults]`/`[adapters.*]` config loader (AGENTS.md "Config").
-//! Keybindings/theme are still Phase 5b — not modeled here.
+//! `[defaults]`/`[adapters.*]`/`[notify]`/`[keybindings]`/`[theme]` config
+//! loader (AGENTS.md "Config").
+
+mod keybindings;
+mod theme;
+
+pub use keybindings::{Action, KeyBinding, Keybindings};
+pub use theme::Theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +17,8 @@ pub struct Config {
     pub defaults: Defaults,
     pub adapters: HashMap<String, AdapterConfig>,
     pub notify: NotifyConfig,
+    pub keybindings: Keybindings,
+    pub theme: Theme,
 }
 
 /// Deserializes the raw TOML shape, then merges the user's `[adapters.*]` on
@@ -32,12 +40,22 @@ impl<'de> Deserialize<'de> for Config {
             adapters: HashMap<String, AdapterConfig>,
             #[serde(default)]
             notify: NotifyConfig,
+            #[serde(default)]
+            keybindings: Keybindings,
+            #[serde(default)]
+            theme: Theme,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
         let mut adapters = default_adapters();
         adapters.extend(raw.adapters);
-        Ok(Config { defaults: raw.defaults, adapters, notify: raw.notify })
+        Ok(Config {
+            defaults: raw.defaults,
+            adapters,
+            notify: raw.notify,
+            keybindings: raw.keybindings,
+            theme: raw.theme,
+        })
     }
 }
 
@@ -109,7 +127,13 @@ impl Default for Defaults {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { defaults: Defaults::default(), adapters: default_adapters(), notify: NotifyConfig::default() }
+        Self {
+            defaults: Defaults::default(),
+            adapters: default_adapters(),
+            notify: NotifyConfig::default(),
+            keybindings: Keybindings::default(),
+            theme: Theme::default(),
+        }
     }
 }
 
