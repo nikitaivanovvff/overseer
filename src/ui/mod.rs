@@ -983,4 +983,44 @@ mod tests {
         let spawn_root_row = rows.iter().find(|(_, label)| *label == Action::SpawnRoot.label()).unwrap();
         assert_eq!(spawn_root_row.0, "a");
     }
+
+    // ── render-path perf (SCALE.md Task 1) ───────────────────────────────────
+
+    /// Not run by default (`cargo test`); `cargo test -- --ignored` or a
+    /// direct name match runs it. A pure timing check, not a correctness
+    /// test: catches an accidental O(n²) creeping into the per-frame
+    /// flatten+format path, which runs every tick regardless of whether
+    /// anything changed (SCALE.md's risk #3).
+    ///
+    /// Tree shape (5 roots times 9 children, plus the 5 roots themselves)
+    /// approximates the spec's "30 agents" fleet with headroom; 1000 frames
+    /// approximates roughly 100 seconds of continuous rendering at a
+    /// 10fps-equivalent poll rate.
+    #[test]
+    #[ignore]
+    fn flatten_and_format_1000_frames_of_a_50_node_tree_stays_fast() {
+        let mut tree = AgentTree::new();
+        for r in 0..5 {
+            let mut root = node(&format!("root-{r}"), vec![]);
+            for c in 0..9 {
+                root.children.push(node(&format!("root-{r}-child-{c}"), vec![]));
+            }
+            tree.add_root(root);
+        }
+        let theme = Theme::default();
+
+        let start = std::time::Instant::now();
+        for tick in 0..1000u64 {
+            let flat = tree.flatten();
+            for (i, n) in flat.iter().enumerate() {
+                let _ = tree_row(n, i == 0, false, tick, &theme, 80);
+            }
+        }
+        let elapsed = start.elapsed();
+
+        eprintln!("1000 frames of a 50-node tree (flatten + row format): {elapsed:?}");
+        // Generous ceiling -- this is a canary for an accidental O(n^2), not a
+        // tight perf budget; a real regression would blow well past this.
+        assert!(elapsed.as_millis() < 2000, "flatten+format got suspiciously slow: {elapsed:?}");
+    }
 }

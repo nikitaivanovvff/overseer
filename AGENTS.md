@@ -407,6 +407,16 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 
 ---
 
+## Limits
+
+Measured, not assumed (SCALE.md) — `scripts/stress.sh [N]` spawns 1 root + N children running a stub that emits output and pushes `running`/`idle` on a tight 0.2s loop (chattier than any real hook traffic), then measures daemon RSS, spawn latency, and status-push latency under that load.
+
+Tested at **N=30** (the target fleet size) and **N=50** (extra headroom) on the dev machine, release build: daemon RSS 10-100MB (well under the 500MB budget — dominated by each agent's `alacritty_terminal` scrollback buffer, not by fleet size itself), spawn latency ~10-30ms mean, status-push round-trip a few ms to tens of ms mean even at N=50 (0 pushes lost at either size). Latency does grow with fleet size — the one registry `Mutex` serializing every status push is a real, measured effect, not just a theoretical risk — but the growth is nowhere near a threshold worth pre-optimizing for; measurements came back clean at both sizes, so per SCALE.md's own budget this closes with this note, no code changes.
+
+**One structural consequence worth knowing, not fixing:** every agent's PTY is resized to one shared rect (`SessionManager::resize_all`) — a TUI resize locks and resizes every live `Term` serially on the UI thread. Fine at the tested sizes; revisit (dirty-flag the tree render, resize only the watched `Term` eagerly and others lazily) only if a future measurement at a larger N actually shows it.
+
+---
+
 ## Specs & Planning Docs
 
 Implementation plans (`PHASE*.md`) and research notes live in **`.specs/`**, which is **gitignored** — they are local working documents that drive development, not part of the distributed repo. Every new spec/phase plan goes into `.specs/`; never commit one to the repo root, and never reference a spec from code or committed docs — once a phase ships, its spec is disposable and the code/AGENTS.md must stand on their own.
