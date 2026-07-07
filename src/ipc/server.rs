@@ -369,7 +369,7 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
         } else {
             (AgentStatus::Error, Some("agent process exited".to_string()))
         };
-        let _ = registry.set_status(&id, status, message, None);
+        let _ = registry.set_status(&id, status, message, None, None);
     }
 }
 
@@ -438,7 +438,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
-        registry.set_status(&root_id, AgentStatus::Done, None, None).unwrap();
+        registry.set_status(&root_id, AgentStatus::Done, None, None, None).unwrap();
 
         // The wrapping process exits non-zero after the agent already
         // explicitly reported done — that must not clobber it.

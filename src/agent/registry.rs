@@ -160,12 +160,24 @@ impl AgentRegistry {
     /// `None` leaves the node's existing value untouched — most status pushes
     /// don't carry one. `message` isn't stored on the node (no field for it),
     /// but is forwarded verbatim on the broadcast event for attach clients.
+    ///
+    /// `adapter` lets a session self-identify its actual harness — a root's
+    /// adapter is always registered as the honest-but-uninformative "shell"
+    /// (`overseer start` never launches one), so this is the only way a
+    /// bare-shell root running (say) pi ever stops looking like "shell" in
+    /// the registry. Each adapter's own SessionStart-equivalent install hook
+    /// passes this once, alongside its very first status push; a spawned
+    /// child re-asserting its already-correct adapter here is harmless
+    /// (same value, idempotent). Whatever ends up here is what `Request::Spawn`
+    /// defaults an omitted `--adapter` to (its own children run the same
+    /// harness unless told otherwise) — see `ipc::handlers`.
     pub fn set_status(
         &self,
         id: &AgentId,
         status: AgentStatus,
         message: Option<String>,
         context_pct: Option<u8>,
+        adapter: Option<String>,
     ) -> Result<(), RegistryError> {
         let new_context_pct = {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
@@ -180,6 +192,9 @@ impl AgentRegistry {
                     node.status = status.clone();
                     if let Some(pct) = context_pct {
                         node.context_pct = Some(pct);
+                    }
+                    if let Some(adapter) = adapter {
+                        node.adapter = adapter;
                     }
                     node.context_pct
                 }
@@ -339,7 +354,7 @@ mod tests {
     fn set_status_unknown_id_returns_error() {
         let reg = AgentRegistry::new();
         let err = reg
-            .set_status(&AgentId::new(), AgentStatus::Done, None, None)
+            .set_status(&AgentId::new(), AgentStatus::Done, None, None, None)
             .unwrap_err();
         assert!(matches!(err, RegistryError::UnknownAgent(_)));
     }
@@ -348,7 +363,7 @@ mod tests {
     fn set_status_with_context_pct_updates_it() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(42)).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
     }
 
@@ -356,8 +371,8 @@ mod tests {
     fn set_status_without_context_pct_keeps_existing_value() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(42)).unwrap();
-        reg.set_status(&result.id, AgentStatus::Idle, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
     }
 
@@ -370,7 +385,7 @@ mod tests {
         let result = reg.register(make_register_root("agent")).unwrap();
         let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
 
-        reg.set_status(&result.id, AgentStatus::Running, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None).unwrap();
 
         let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
         assert_eq!(before, after, "a repeated same-status push (e.g. PostToolUse spam) must not reset the clock");
@@ -383,7 +398,7 @@ mod tests {
         let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        reg.set_status(&result.id, AgentStatus::Blocked, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None).unwrap();
 
         let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
         assert!(after > before, "an actual status change must reset the clock");
@@ -538,10 +553,10 @@ mod tests {
     fn set_status_broadcasts_status_changed_with_message_and_merged_context_pct() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(10)).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(10), None).unwrap();
 
         let mut rx = reg.subscribe();
-        reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None, None).unwrap();
         match rx.try_recv().unwrap() {
             RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
                 assert_eq!(agent_id, result.id);
@@ -559,7 +574,7 @@ mod tests {
     fn set_status_unknown_agent_does_not_broadcast() {
         let reg = AgentRegistry::new();
         let mut rx = reg.subscribe();
-        let err = reg.set_status(&AgentId::new(), AgentStatus::Done, None, None).unwrap_err();
+        let err = reg.set_status(&AgentId::new(), AgentStatus::Done, None, None, None).unwrap_err();
         assert!(matches!(err, RegistryError::UnknownAgent(_)));
         assert!(rx.try_recv().is_err());
     }

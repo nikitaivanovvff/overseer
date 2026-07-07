@@ -166,6 +166,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: None,
+            adapter: None,
         });
         assert!(resp.ok, "set child status failed");
         assert!(resp.data.is_none(), "status ack should have no data body");
@@ -176,6 +177,7 @@ mod tests {
             status: AgentStatus::Done,
             message: Some("all PRs merged".to_string()),
             context_pct: None,
+            adapter: None,
         });
         assert!(resp.ok, "set root status failed");
 
@@ -215,6 +217,7 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: Some(37),
+            adapter: None,
         });
         assert!(resp.ok);
 
@@ -230,6 +233,7 @@ mod tests {
             status: AgentStatus::Idle,
             message: None,
             context_pct: None,
+            adapter: None,
         });
         assert!(resp.ok);
 
@@ -343,6 +347,7 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: None,
+            adapter: None,
         });
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap_or("").contains("unknown agent"));
@@ -458,6 +463,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: Some("needs you".to_string()),
             context_pct: Some(42),
+            adapter: None,
         });
         match next_event(&mut reader) {
             AttachEvent::StatusChanged { agent_id, status, message, context_pct } => {

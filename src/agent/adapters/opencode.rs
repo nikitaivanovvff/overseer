@@ -67,7 +67,7 @@ export const OverseerPlugin = async () => {{
   return {{
     event: async ({{ event }}) => {{
       if (event.type === "session.created") {{
-        push("running");
+        execFile(OVERSEER_BIN, ["status", "running", "--adapter", "opencode"], () => {{}});
       }} else if (event.type === "session.status" && event.properties?.status?.type === "busy") {{
         push("running");
       }} else if (event.type === "session.idle") {{
@@ -229,6 +229,21 @@ mod tests {
         let content = make_adapter().plugin_content();
         assert!(content.contains(r#""session.created""#));
         assert!(content.contains(r#""busy""#));
+    }
+
+    #[test]
+    fn plugin_self_identifies_as_opencode_only_on_session_created() {
+        // The only place this needs saying — a bare-shell root's registered
+        // adapter is always "shell" until the real harness inside it says
+        // otherwise; this is what an omitted --adapter on a later
+        // `overseer spawn` inherits.
+        let content = make_adapter().plugin_content();
+        assert!(content.contains(r#""--adapter", "opencode""#));
+        // Every other push (busy/idle/permission.replied/permission.ask)
+        // stays a plain two-element argv — only session.created's gets the
+        // extra pair.
+        let adapter_occurrences = content.matches("--adapter").count();
+        assert_eq!(adapter_occurrences, 1, "adapter self-id should appear exactly once: {content}");
     }
 
     #[test]

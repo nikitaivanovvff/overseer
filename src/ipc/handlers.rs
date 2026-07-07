@@ -34,8 +34,8 @@ pub struct AppCtx {
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
 pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     match req {
-        Request::Status { agent_id, status, message, context_pct } => {
-            match ctx.registry.set_status(&agent_id, status, message, context_pct) {
+        Request::Status { agent_id, status, message, context_pct, adapter } => {
+            match ctx.registry.set_status(&agent_id, status, message, context_pct, adapter) {
                 Ok(()) => Response::ok(None),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -77,11 +77,23 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         }
 
         Request::Spawn { parent_id, task, name, adapter, cwd } => {
-            let adapter_name = adapter.unwrap_or_else(|| ctx.config.defaults.adapter.clone());
-
             let Some(parent) = ctx.registry.get(&parent_id) else {
                 return Response::err(format!("unknown agent: {}", parent_id.short()));
             };
+            // Default to the spawning agent's *own* adapter, not a fixed
+            // global default (AGENTS.md: cross-harness spawning is opt-in
+            // via an explicit --adapter, not the fallback) -- a pi/opencode
+            // root's own children should run the same harness unless told
+            // otherwise. `ctx.config.defaults.adapter` only still matters for
+            // a bare-shell root (`parent.adapter == "shell"`, nothing real to
+            // inherit), where it's the only sensible fallback left.
+            let adapter_name = adapter.unwrap_or_else(|| {
+                if parent.adapter == "shell" {
+                    ctx.config.defaults.adapter.clone()
+                } else {
+                    parent.adapter.clone()
+                }
+            });
             // The one and only "no grandchildren" check (AGENTS.md) — not duplicated
             // anywhere else, including the TUI, which routes through this same arm.
             if parent.role == AgentRole::Child {
@@ -192,6 +204,7 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: None,
+            adapter: None,
         };
         let resp = dispatch(&ctx, req);
         assert!(!resp.ok);
@@ -207,6 +220,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: Some(17),
+            adapter: None,
         };
         let resp = dispatch(&ctx, status_req);
         assert!(resp.ok);

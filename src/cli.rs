@@ -36,6 +36,14 @@ pub enum Command {
         /// hook — malformed/missing stdin just means less context on the push.
         #[arg(long)]
         from_hook: bool,
+        /// Self-identifies the calling session's actual harness (e.g.
+        /// "claude"/"opencode"/"pi") — only each adapter's own install hook
+        /// passes this, once, at session start. Lets a bare-shell root stop
+        /// looking like "shell" the moment a real harness actually runs
+        /// inside it, which is what an omitted `--adapter` on a later
+        /// `overseer spawn` inherits from.
+        #[arg(long)]
+        adapter: Option<String>,
     },
     List,
     Agent {
@@ -76,9 +84,12 @@ pub enum Command {
         /// `--task`. Falls back to `--task` verbatim if omitted or blank.
         #[arg(long)]
         name: Option<String>,
-        /// Adapter to use (default: claude).
-        #[arg(long, default_value = "claude")]
-        adapter: String,
+        /// Adapter to use. Defaults to the spawning agent's own adapter when
+        /// omitted (a pi root's children run pi too, unless told otherwise) —
+        /// never a fixed "claude" default, which would silently launch the
+        /// wrong harness for a non-claude root.
+        #[arg(long)]
+        adapter: Option<String>,
     },
     /// Kill the agent's session and deregister it. Root agents can only be
     /// dropped through the TUI, not this command.
@@ -168,7 +179,7 @@ fn read_context_pct(path: &str) -> Option<u8> {
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 fn build_request(cmd: Command) -> Result<Option<Request>> {
     match cmd {
-        Command::Status { status, message, from_hook } => {
+        Command::Status { status, message, from_hook, adapter } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
                 Ok(s) => s,
                 // Not in an Overseer session — hook must be a silent no-op.
@@ -189,7 +200,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                     .and_then(read_context_pct);
             }
 
-            Ok(Some(Request::Status { agent_id, status, message, context_pct }))
+            Ok(Some(Request::Status { agent_id, status, message, context_pct, adapter }))
         }
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
@@ -208,7 +219,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                 .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
             let cwd = std::env::current_dir()
                 .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?;
-            Ok(Some(Request::Spawn { parent_id, task, name, adapter: Some(adapter), cwd }))
+            Ok(Some(Request::Spawn { parent_id, task, name, adapter, cwd }))
         }
         Command::Drop { id, recursive } => {
             let agent_id = id
@@ -230,7 +241,7 @@ mod tests {
     #[test]
     fn build_request_status_no_env_var_returns_none() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
-        let cmd = Command::Status { status: StatusArg::Running, message: None, from_hook: false };
+        let cmd = Command::Status { status: StatusArg::Running, message: None, from_hook: false, adapter: None };
         let result = build_request(cmd).unwrap();
         assert!(result.is_none(), "Status without OVERSEER_AGENT_ID should be a silent no-op");
     }
@@ -239,7 +250,7 @@ mod tests {
     fn build_request_status_with_env_var_returns_request() {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
-        let cmd = Command::Status { status: StatusArg::Done, message: None, from_hook: false };
+        let cmd = Command::Status { status: StatusArg::Done, message: None, from_hook: false, adapter: None };
         let result = build_request(cmd).unwrap();
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Request::Status { .. }));
@@ -267,7 +278,7 @@ mod tests {
     #[test]
     fn build_request_spawn_without_env_var_is_error() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
-        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: "claude".to_string() };
+        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: Some("claude".to_string()) };
         assert!(build_request(cmd).is_err());
     }
 
@@ -275,7 +286,7 @@ mod tests {
     fn build_request_spawn_with_env_var_returns_spawn() {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
-        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: "claude".to_string() };
+        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: Some("claude".to_string()) };
         let req = build_request(cmd).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { parent_id, task, .. }
             if parent_id == id && task == "write tests"));
@@ -288,10 +299,22 @@ mod tests {
         let cmd = Command::Spawn {
             task: "write unit tests for the login flow".to_string(),
             name: Some("login-tests".to_string()),
-            adapter: "claude".to_string(),
+            adapter: Some("claude".to_string()),
         };
         let req = build_request(cmd).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { name: Some(n), .. } if n == "login-tests"));
+    }
+
+    #[test]
+    fn build_request_spawn_without_adapter_flag_leaves_it_none() {
+        // No `--adapter` on the CLI must reach the wire as `None`, not a
+        // fixed "claude" default — the handler is what decides the actual
+        // default (the caller's own adapter), not clap.
+        let id = AgentId::new();
+        let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
+        let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: None };
+        let req = build_request(cmd).unwrap().unwrap();
+        assert!(matches!(req, Request::Spawn { adapter: None, .. }));
     }
 
     #[test]

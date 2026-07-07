@@ -40,11 +40,21 @@ impl ClaudeAdapter {
         let running_cmd = self.hook_command("status running --from-hook");
         let idle_cmd = self.hook_command("status idle --from-hook");
         let blocked_cmd = self.hook_command("status blocked --from-hook");
+        // SessionStart's own push additionally self-identifies as "claude" —
+        // the only place this needs saying, since a bare-shell root's own
+        // registered adapter is always the honest-but-uninformative "shell"
+        // (`overseer start` never launches one). This is what an omitted
+        // `--adapter` on a later `overseer spawn` from this session inherits
+        // (`ipc::handlers`) — without it, a claude session running inside a
+        // bare-shell root would never stop looking like "shell" to a spawn
+        // default. Every other hook re-asserts `running`/`idle`/`blocked`
+        // only — no need to repeat the adapter identity on every push.
+        let session_start_status_cmd = self.hook_command("status running --from-hook --adapter claude");
         // Also pushes `running` immediately at session start (not just at the first
         // tool call) — closes the gap between "user runs claude" and "first tool
         // use" for a bare-shell root that started `Idle`. Still pure push, no polling.
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer-%s skill.\n' "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {running_cmd}; }} || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer-%s skill.\n' "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {session_start_status_cmd}; }} || true"#
         );
 
         serde_json::json!({
@@ -292,6 +302,30 @@ mod tests {
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"), "SessionStart should also push running: {cmd}");
         assert!(cmd.contains("OVERSEER_AGENT_ID"), "must stay guarded, no-op outside Overseer");
+    }
+
+    #[test]
+    fn settings_session_start_self_identifies_as_claude() {
+        // The only place this needs saying — a bare-shell root's registered
+        // adapter is always "shell" until the real harness inside it says
+        // otherwise; this is what an omitted `--adapter` on a later
+        // `overseer spawn` inherits from.
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("--adapter claude"), "SessionStart should self-identify: {cmd}");
+    }
+
+    #[test]
+    fn other_hooks_do_not_repeat_the_adapter_self_id() {
+        // Only SessionStart needs to self-identify; every other push stays
+        // exactly the plain status command it always was.
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop", "Notification"] {
+            let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(!cmd.contains("--adapter"), "{event} should not repeat the adapter self-id: {cmd}");
+        }
     }
 
     #[test]

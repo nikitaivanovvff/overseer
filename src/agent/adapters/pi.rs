@@ -79,7 +79,7 @@ export default function (pi) {{
   }}
   const push = (status) => execFile(OVERSEER_BIN, ["status", status], () => {{}});
 
-  pi.on("session_start", () => push("running"));
+  pi.on("session_start", () => execFile(OVERSEER_BIN, ["status", "running", "--adapter", "pi"], () => {{}}));
   pi.on("agent_start", () => push("running"));
   pi.on("agent_end", () => push("idle"));
   // session_shutdown: nothing -- the exit watcher owns error, not a lifecycle push.
@@ -211,6 +211,18 @@ mod tests {
         assert!(content.contains(r#""session_start""#));
         assert!(content.contains(r#""agent_start""#));
         assert!(content.contains(r#""agent_end""#));
+    }
+
+    #[test]
+    fn extension_self_identifies_as_pi_only_on_session_start() {
+        // The only place this needs saying — a bare-shell root's registered
+        // adapter is always "shell" until the real harness inside it says
+        // otherwise; this is what an omitted --adapter on a later
+        // `overseer spawn` inherits.
+        let content = make_adapter().extension_content();
+        assert!(content.contains(r#""--adapter", "pi""#));
+        let adapter_occurrences = content.matches("--adapter").count();
+        assert_eq!(adapter_occurrences, 1, "adapter self-id should appear exactly once: {content}");
     }
 
     #[test]

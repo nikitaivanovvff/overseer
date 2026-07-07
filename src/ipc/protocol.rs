@@ -24,6 +24,14 @@ pub enum Request {
         /// existing value untouched — most status pushes don't carry one.
         #[serde(default)]
         context_pct: Option<u8>,
+        /// Self-identifies the pushing session's actual harness. `None`
+        /// leaves the node's existing value untouched — only each adapter's
+        /// own SessionStart-equivalent install hook passes this, once, so a
+        /// bare-shell root (`overseer start` never launches an adapter, so
+        /// it's always registered as "shell") stops looking like "shell" the
+        /// moment the user actually runs claude/opencode/pi inside it.
+        #[serde(default)]
+        adapter: Option<String>,
     },
     List,
     Agent {
@@ -333,6 +341,7 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: Some(42),
+            adapter: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
