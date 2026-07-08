@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -52,15 +52,15 @@ impl Dimensions for GridSize {
 pub type AgentTerm = Term<EventProxy>;
 
 /// `EventListener` for one agent's `Term`. Handles the query-reply loop
-/// (`PtyWrite`), child-exit bookkeeping, and dirty tracking invisibly to the
-/// rest of the app — callers only ever see `SessionManager::drain_exits`/
-/// `is_alive`/`take_dirty`.
+/// (`PtyWrite`), child-exit bookkeeping, and generation tracking invisibly to
+/// the rest of the app — callers only ever see `SessionManager::drain_exits`/
+/// `is_alive`/`generation`.
 #[derive(Clone)]
 pub struct EventProxy {
     id: AgentId,
     sender: Arc<OnceLock<EventLoopSender>>,
     alive: Arc<AtomicBool>,
-    dirty: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     exits: Arc<Mutex<Vec<(AgentId, bool)>>>,
 }
 
@@ -79,12 +79,16 @@ impl EventListener for EventProxy {
                     .unwrap_or_else(|e| e.into_inner())
                     .push((self.id.clone(), status.success()));
             }
-            // "New terminal content available" — the daemon's attach
-            // connection polls this flag to decide whether the watched
-            // agent's grid snapshot needs resending (session::pty doesn't
-            // have raw PTY bytes to stream directly; see `GridSnapshot`).
+            // "New terminal content available" — bumps a per-session
+            // generation counter that each attach connection compares
+            // against the last generation *it* sent, to decide whether the
+            // watched agent's grid snapshot needs resending (session::pty
+            // doesn't have raw PTY bytes to stream directly; see
+            // `GridSnapshot`). A counter rather than a consumed flag so two
+            // connections watching the same agent each see every update
+            // (F3) instead of racing to steal one shared flag.
             Event::Wakeup => {
-                self.dirty.store(true, Ordering::Relaxed);
+                self.generation.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -97,7 +101,7 @@ struct PtySession {
     term: Arc<FairMutex<AgentTerm>>,
     channel: EventLoopSender,
     alive: Arc<AtomicBool>,
-    dirty: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     reader: Option<JoinHandle<(SessionEventLoop, EventLoopState)>>,
     /// The child's own pid, captured before it moves into the `EventLoop` —
     /// needed because `kill()` must be able to force-terminate it directly
@@ -211,15 +215,15 @@ impl SessionManager {
 
         let sender_slot: Arc<OnceLock<EventLoopSender>> = Arc::new(OnceLock::new());
         let alive = Arc::new(AtomicBool::new(true));
-        // Starts dirty so a `Watch` arriving before the first real Wakeup
-        // still finds something worth sending — harmless either way since
-        // `Watch` also sends an immediate snapshot regardless of this flag.
-        let dirty = Arc::new(AtomicBool::new(true));
+        // Starts at 0 — a `Watch` arriving before the first real Wakeup still
+        // gets its content, since `Watch` always sends an immediate snapshot
+        // regardless of generation; no need to fake an initial "dirty" value.
+        let generation = Arc::new(AtomicU64::new(0));
         let proxy = EventProxy {
             id: id.clone(),
             sender: sender_slot.clone(),
             alive: alive.clone(),
-            dirty: dirty.clone(),
+            generation: generation.clone(),
             exits: self.exits.clone(),
         };
 
@@ -238,7 +242,7 @@ impl SessionManager {
 
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
-            PtySession { term, channel, alive, dirty, reader: Some(reader), pid },
+            PtySession { term, channel, alive, generation, reader: Some(reader), pid },
         );
         Ok(())
     }
@@ -339,17 +343,22 @@ impl SessionManager {
         self.with_term(id, |term| term.grid().display_offset()).unwrap_or(0)
     }
 
-    /// Consumes (resets to `false`) and returns whether `id`'s terminal has
-    /// produced new content since the last call. The daemon's attach
-    /// connection polls this for the watched agent instead of resending an
-    /// unchanged grid every tick. `false` for an unknown id or in dry-run
-    /// mode — nothing to send either way.
-    pub fn take_dirty(&self, id: &AgentId) -> bool {
+    /// Returns `id`'s current content-generation counter — incremented every
+    /// time the terminal produces new content (`Event::Wakeup`). A read, not
+    /// a consume: each attach connection compares this against the last
+    /// generation *it* sent for `id` to decide whether a resend is needed,
+    /// so two connections watching the same agent both see every update
+    /// instead of racing to steal one shared dirty flag (a real bug,
+    /// PERFORMANCE.md F3 — the previous consumed-bool design meant whichever
+    /// connection polled first each tick silently starved the other).
+    /// `None` for an unknown id or in dry-run mode — nothing to send either
+    /// way.
+    pub fn generation(&self, id: &AgentId) -> Option<u64> {
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .is_some_and(|s| s.dirty.swap(false, Ordering::Relaxed))
+            .map(|s| s.generation.load(Ordering::Relaxed))
     }
 
     /// Renders `id`'s current terminal grid into a wire-ready `GridSnapshot`
@@ -560,18 +569,50 @@ mod tests {
         assert!(!s.is_alive(&id));
     }
 
-    // ── take_dirty / grid_snapshot ───────────────────────────────────────────
+    // ── generation / grid_snapshot ────────────────────────────────────────────
 
     #[test]
-    fn take_dirty_is_false_for_an_unknown_id() {
+    fn generation_is_none_for_an_unknown_id() {
         let s = SessionManager::dry_run();
-        assert!(!s.take_dirty(&AgentId::new()));
+        assert!(s.generation(&AgentId::new()).is_none());
     }
 
     #[test]
     fn grid_snapshot_is_none_for_an_unknown_id() {
         let s = SessionManager::dry_run();
         assert!(s.grid_snapshot(&AgentId::new()).is_none());
+    }
+
+    /// Regression test for PERFORMANCE.md F3: with the old consumed dirty
+    /// bool, whichever caller read it first each tick reset it for everyone
+    /// else, so a second watcher of the same agent could see `false` forever
+    /// even though the terminal kept producing content. `generation` is a
+    /// read, not a consume — two independent "watchers" polling it must both
+    /// observe the same bumped value, neither stealing it from the other.
+    #[test]
+    fn generation_is_readable_by_multiple_watchers_without_stealing() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf hello; sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.generation(&id).unwrap_or(0) > 0
+        });
+        assert!(became_dirty, "session must have produced output first");
+
+        // Simulate two independent connections both watching this agent:
+        // both must see the same non-zero generation, and neither read may
+        // reset it for the other.
+        let watcher_a = s.generation(&id).unwrap();
+        let watcher_b = s.generation(&id).unwrap();
+        assert_eq!(watcher_a, watcher_b, "both watchers must observe the same generation");
+        assert!(watcher_a > 0);
+        assert_eq!(s.generation(&id).unwrap(), watcher_a, "reading generation must not consume it");
+
+        s.kill(&id);
     }
 
     #[test]
@@ -584,7 +625,7 @@ mod tests {
 
         let became_dirty = (0..50).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            s.take_dirty(&id)
+            s.generation(&id).unwrap_or(0) > 0
         });
         assert!(became_dirty, "a live session that printed output must eventually report dirty");
 
@@ -631,7 +672,7 @@ mod tests {
 
         let became_dirty = (0..50).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            s.take_dirty(&id)
+            s.generation(&id).unwrap_or(0) > 0
         });
         assert!(became_dirty, "session must have produced output to scroll through");
 

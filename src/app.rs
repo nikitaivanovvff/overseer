@@ -785,7 +785,7 @@ mod tests {
 
         let became_dirty = (0..50).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            sessions.take_dirty(&id)
+            sessions.generation(&id).unwrap_or(0) > 0
         });
         assert!(became_dirty, "session must produce output before there's scrollback to move into");
 

@@ -17,13 +17,27 @@ use crate::ipc::{
 use crate::session::SessionManager;
 
 /// How often the attach connection's output task checks the watched agent's
-/// dirty flag — matches the TUI's own render tick (`tui.rs`'s 16ms poll), so
-/// streamed output feels as responsive as local rendering used to. A real
-/// user's reported typing lag traced back to this stacking additively with
-/// the TUI's own poll: both were 80-100ms, so a keystroke's round trip
+/// content generation — matches the TUI's own render tick (`tui.rs`'s 16ms
+/// poll), so streamed output feels as responsive as local rendering used to.
+/// A real user's reported typing lag traced back to this stacking additively
+/// with the TUI's own poll: both were 80-100ms, so a keystroke's round trip
 /// (input → PTY write → agent echo → dirty → next redraw) could compound to
 /// 200-300ms worst case even though neither interval looked large on its own.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// One attach connection's watch state: which agent (if any) it's currently
+/// streaming, and the last content generation (`SessionManager::generation`)
+/// it sent for that agent. Shared between the request-read loop (which
+/// updates it on `Watch`/`Unwatch`) and the output poller (which reads it
+/// each tick and updates `last_sent_gen` after a successful send) — moving
+/// this state per-connection, instead of a single flag consumed off the
+/// session itself, is what fixes F3: two connections watching the same agent
+/// each track their own progress instead of racing to steal one shared flag.
+#[derive(Clone)]
+struct WatchState {
+    agent_id: Option<crate::agent::AgentId>,
+    last_sent_gen: u64,
+}
 
 pub async fn run(
     ctx: Arc<AppCtx>,
@@ -213,8 +227,8 @@ async fn handle_attach(
     }
 
     let mut registry_rx = ctx.registry.subscribe();
-    let watch: Arc<std::sync::Mutex<Option<crate::agent::AgentId>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let watch: Arc<std::sync::Mutex<WatchState>> =
+        Arc::new(std::sync::Mutex::new(WatchState { agent_id: None, last_sent_gen: 0 }));
 
     // Forwards registry mutations (register/status/remove) as they happen —
     // no polling, per AGENTS.md's "status is push, not pull", now extended
@@ -255,9 +269,12 @@ async fn handle_attach(
     });
 
     // Streams the watched agent's rendered terminal grid, throttled to a
-    // dirty-flag poll (see `session::pty::EventProxy` — `alacritty_terminal`
-    // 0.26 has no raw-byte tap without reimplementing its event loop, so this
-    // is the "hard part" from DAEMON.md's design, adapted).
+    // content-generation poll (see `session::pty::EventProxy` —
+    // `alacritty_terminal` 0.26 has no raw-byte tap without reimplementing
+    // its event loop, so this is the "hard part" from DAEMON.md's design,
+    // adapted). Compares against this connection's own `last_sent_gen`
+    // rather than consuming a shared flag (F3), so a second connection
+    // watching the same agent doesn't starve this one.
     let output_task = tokio::spawn({
         let write_half = write_half.clone();
         let watch = watch.clone();
@@ -266,14 +283,25 @@ async fn handle_attach(
             let mut interval = tokio::time::interval(OUTPUT_POLL_INTERVAL);
             loop {
                 interval.tick().await;
-                let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let Some(agent_id) = current else { continue };
-                if !sessions.take_dirty(&agent_id) {
+                let (agent_id, last_sent_gen) = {
+                    let w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                    (w.agent_id.clone(), w.last_sent_gen)
+                };
+                let Some(agent_id) = agent_id else { continue };
+                let Some(gen) = sessions.generation(&agent_id) else { continue };
+                if gen == last_sent_gen {
                     continue;
                 }
-                let Some(bytes) = build_output_event_bytes(sessions.clone(), agent_id).await else { continue };
+                let Some(bytes) = build_output_event_bytes(sessions.clone(), agent_id.clone()).await else { continue };
                 if !write_output_bytes(&write_half, bytes).await {
                     break;
+                }
+                // Only record progress if still watching the same agent —
+                // a concurrent `Watch` switch already reset `last_sent_gen`
+                // for the new agent, and this send was for the old one.
+                let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                if w.agent_id.as_ref() == Some(&agent_id) {
+                    w.last_sent_gen = gen;
                 }
             }
         }
@@ -286,17 +314,33 @@ async fn handle_attach(
             Ok(0) => break,
             Ok(_) => match serde_json::from_str::<Request>(line.trim()) {
                 Ok(Request::Watch { agent_id }) => {
-                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_id.clone());
+                    // Read the generation *before* building the snapshot: if
+                    // a Wakeup lands mid-build, we'd rather resend once more
+                    // on the next tick than record a generation newer than
+                    // what we actually sent (which would let a real update
+                    // slip past undetected).
+                    let gen = ctx.sessions.generation(&agent_id).unwrap_or(0);
                     // Immediate snapshot so switching the watched agent is
-                    // instant, not gated on the next dirty tick.
-                    if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
+                    // instant, not gated on the next poll tick.
+                    let sent = if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id.clone()).await {
                         if !write_output_bytes(&write_half, bytes).await {
                             break;
                         }
-                    }
+                        true
+                    } else {
+                        false
+                    };
+                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = WatchState {
+                        agent_id: Some(agent_id),
+                        // No live session to snapshot from (`sent == false`)
+                        // — leave last_sent_gen at 0 so the poller doesn't
+                        // skip a real first send once the session appears.
+                        last_sent_gen: if sent { gen } else { 0 },
+                    };
                 }
                 Ok(Request::Unwatch) => {
-                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *watch.lock().unwrap_or_else(|e| e.into_inner()) =
+                        WatchState { agent_id: None, last_sent_gen: 0 };
                 }
                 Ok(Request::Write { agent_id, data }) => {
                     ctx.sessions.write(&agent_id, data.into_bytes());
@@ -317,12 +361,12 @@ async fn handle_attach(
                     .await;
                 }
                 Ok(Request::Scroll { delta }) => {
-                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).agent_id.clone();
                     if let Some(agent_id) = current {
                         ctx.sessions.scroll_display(&agent_id, delta);
-                        // Scrolling doesn't touch the PTY, so it never sets
-                        // the dirty flag the output poll relies on — push the
-                        // new grid immediately instead, same as `Watch` does.
+                        // Scrolling doesn't touch the PTY, so it never bumps
+                        // the generation the output poll relies on — push
+                        // the new grid immediately instead, same as `Watch`.
                         if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
                             if !write_output_bytes(&write_half, bytes).await {
                                 break;
@@ -331,7 +375,7 @@ async fn handle_attach(
                     }
                 }
                 Ok(Request::ScrollToBottom) => {
-                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let current = watch.lock().unwrap_or_else(|e| e.into_inner()).agent_id.clone();
                     if let Some(agent_id) = current {
                         ctx.sessions.scroll_to_bottom(&agent_id);
                         if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {

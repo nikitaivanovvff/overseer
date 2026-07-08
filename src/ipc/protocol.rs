@@ -146,7 +146,7 @@ pub enum AttachEvent {
     },
     /// The watched agent's rendered terminal grid. Sent immediately on `Watch`,
     /// then whenever the terminal has produced new content since the last send
-    /// (a dirty-flag poll, not per-byte — see `session::pty`).
+    /// (a content-generation poll, not per-byte — see `session::pty`).
     Output { agent_id: AgentId, grid: GridSnapshot },
     /// The daemon is exiting (`overseer shutdown`) — every attached client
     /// should treat this the same as the connection closing.
