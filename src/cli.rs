@@ -167,11 +167,33 @@ fn read_hook_payload() -> Option<agent::hook::HookPayload> {
     agent::hook::parse_hook_payload(&raw)
 }
 
+/// Max transcript bytes read when computing context % (SECURITY-AUDIT.md
+/// F8) — `path` comes straight from the hook's own JSON stdin, so an
+/// attacker-influenced payload pointing at a huge file must not turn this
+/// into its own unbounded-read DoS. Only the tail matters:
+/// `context_pct_from_transcript` scans from the end for the most recent
+/// usage entry, so reading just the last `MAX_TRANSCRIPT_READ_BYTES` bytes
+/// loses nothing a full read would have found for any transcript smaller
+/// than that.
+const MAX_TRANSCRIPT_READ_BYTES: u64 = 1024 * 1024;
+
 /// Reads the transcript at `path` and extracts a context %. `None` on any read
 /// failure or if the transcript has no usage data yet (e.g. brand new) —
 /// never fails the hook over this, it just means no pct on this push.
 fn read_context_pct(path: &str) -> Option<u8> {
-    let contents = std::fs::read_to_string(path).ok()?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > MAX_TRANSCRIPT_READ_BYTES {
+        file.seek(SeekFrom::Start(len - MAX_TRANSCRIPT_READ_BYTES)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    // A truncating seek can land mid-codepoint at the very start of `buf`;
+    // lossy conversion turns that into a harmless leading garbage line that
+    // the line-skipping logic below already tolerates, rather than failing
+    // the whole read the way `read_to_string` would.
+    let contents = String::from_utf8_lossy(&buf);
     agent::hook::context_pct_from_transcript(&contents)
 }
 
@@ -348,5 +370,26 @@ mod tests {
     #[test]
     fn read_context_pct_missing_file_returns_none() {
         assert_eq!(read_context_pct("/nonexistent/transcript.jsonl"), None);
+    }
+
+    /// F8: a transcript larger than `MAX_TRANSCRIPT_READ_BYTES` must still
+    /// yield the correct percentage from its tail, without reading the
+    /// whole file -- proves the seek-to-tail cap doesn't just avoid a crash,
+    /// it still finds the answer for any real (bounded) transcript.
+    #[test]
+    fn read_context_pct_finds_the_answer_in_a_transcript_larger_than_the_cap() {
+        let path = std::env::temp_dir().join(format!("overseer-transcript-big-test-{}", AgentId::new()));
+        let filler_line = "{\"type\":\"user\",\"message\":{\"content\":\"padding\"}}\n";
+        let filler_bytes_needed = MAX_TRANSCRIPT_READ_BYTES as usize + 4096;
+        let mut contents = filler_line.repeat(filler_bytes_needed / filler_line.len() + 1);
+        contents.push_str(
+            r#"{"message":{"usage":{"input_tokens":180000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        );
+        assert!(contents.len() as u64 > MAX_TRANSCRIPT_READ_BYTES);
+        std::fs::write(&path, &contents).unwrap();
+
+        assert_eq!(read_context_pct(path.to_str().unwrap()), Some(90));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
