@@ -6,7 +6,7 @@ use crate::agent::spawn::{spawn_agent, SpawnRequest};
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::GitClient;
-use crate::ipc::protocol::{OkBody, Request, Response};
+use crate::ipc::protocol::{OkBody, Request, Response, MAX_SPAWN_TASK_BYTES};
 use crate::session::SessionManager;
 
 /// Shared context injected into every IPC handler.
@@ -77,6 +77,11 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         }
 
         Request::Spawn { parent_id, task, name, adapter, cwd } => {
+            if task.len() > MAX_SPAWN_TASK_BYTES {
+                return Response::err(format!(
+                    "task exceeds max size of {MAX_SPAWN_TASK_BYTES} bytes"
+                ));
+            }
             let Some(parent) = ctx.registry.get(&parent_id) else {
                 return Response::err(format!("unknown agent: {}", parent_id.short()));
             };
@@ -412,6 +417,25 @@ mod tests {
         });
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap_or("").contains("cannot spawn"));
+    }
+
+    #[test]
+    fn dispatch_spawn_rejects_a_task_over_the_size_cap() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let resp = dispatch(&ctx, Request::Spawn {
+            parent_id: root_id,
+            task: "x".repeat(MAX_SPAWN_TASK_BYTES + 1),
+            name: None,
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        });
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("exceeds max size"));
+
+        // Rejected before touching the registry -- no half-registered agent.
+        let list_resp = dispatch(&ctx, Request::List);
+        assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.len() == 1));
     }
 
     #[test]

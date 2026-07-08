@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     net::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
         UnixListener,
@@ -12,9 +12,67 @@ use tokio::{
 use crate::agent::{AgentRegistry, AgentStatus};
 use crate::ipc::{
     handlers::{dispatch, AppCtx},
-    protocol::{AttachEvent, Request, Response},
+    protocol::{AttachEvent, Request, Response, MAX_WRITE_DATA_BYTES},
 };
 use crate::session::SessionManager;
+
+/// Max size of one newline-delimited protocol line (SECURITY-AUDIT.md F1).
+/// `AsyncBufReadExt::read_line` grows its buffer without bound until a
+/// newline arrives, so any client holding `OVERSEER_SOCKET` could otherwise
+/// stream gigabytes with no newline and OOM the single daemon process that
+/// backs every agent. Sized comfortably above the largest legitimate line —
+/// a `Spawn.task` near `MAX_SPAWN_TASK_BYTES` (128 KiB) plus its JSON
+/// envelope — while still capping the worst case tightly.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Reads one newline-terminated line into `buf` (replacing its contents),
+/// capped at `MAX_LINE_BYTES` total bytes read (F1). Mirrors
+/// `AsyncBufReadExt::read_line`'s `Ok(0)` == clean EOF convention. Returns an
+/// error (without waiting for a newline that may never come) once the cap is
+/// exceeded — callers treat that the same as any other I/O error: drop the
+/// connection.
+///
+/// Operates on raw bytes rather than `String`/`read_line` so a malicious
+/// client can't force UTF-8 (re-)validation over an unbounded, still-growing
+/// buffer either; the one UTF-8 check happens once, in `serde_json`, over an
+/// already-capped slice.
+async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let newline_at = available.iter().position(|&b| b == b'\n');
+        let chunk_len = newline_at.map(|i| i + 1).unwrap_or(available.len());
+        if total + chunk_len > MAX_LINE_BYTES {
+            reader.consume(chunk_len);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds max size",
+            ));
+        }
+        buf.extend_from_slice(&available[..chunk_len]);
+        reader.consume(chunk_len);
+        total += chunk_len;
+        if newline_at.is_some() {
+            return Ok(total);
+        }
+    }
+}
+
+/// Trims ASCII whitespace (matches the `\n`/`\r\n` line endings this protocol
+/// actually produces) from both ends of a byte slice — the byte-oriented
+/// counterpart of `str::trim` now that lines are read as `Vec<u8>` (F1).
+fn trim_ascii_whitespace(b: &[u8]) -> &[u8] {
+    let start = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
+    let end = b.iter().rposition(|c| !c.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+    &b[start..end]
+}
 
 /// How often the attach connection's output task checks the watched agent's
 /// content generation — matches the TUI's own render tick (`tui.rs`'s 16ms
@@ -88,14 +146,14 @@ pub async fn run(
 async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        match read_line_capped(&mut reader, &mut line).await {
             Ok(0) => break,
             Ok(_) => {
-                match serde_json::from_str::<Request>(line.trim()) {
+                match serde_json::from_slice::<Request>(trim_ascii_whitespace(&line)) {
                     // `Attach` upgrades this connection for the rest of its
                     // life — hand off to the dedicated event-stream loop and
                     // never return to one-shot request/response handling.
@@ -307,12 +365,12 @@ async fn handle_attach(
         }
     });
 
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        match read_line_capped(&mut reader, &mut line).await {
             Ok(0) => break,
-            Ok(_) => match serde_json::from_str::<Request>(line.trim()) {
+            Ok(_) => match serde_json::from_slice::<Request>(trim_ascii_whitespace(&line)) {
                 Ok(Request::Watch { agent_id }) => {
                     // Read the generation *before* building the snapshot: if
                     // a Wakeup lands mid-build, we'd rather resend once more
@@ -343,7 +401,13 @@ async fn handle_attach(
                         WatchState { agent_id: None, last_sent_gen: 0 };
                 }
                 Ok(Request::Write { agent_id, data }) => {
-                    ctx.sessions.write(&agent_id, data.into_bytes());
+                    // Oversized writes are silently dropped rather than
+                    // acted on (SECURITY-AUDIT.md F2) -- there's no
+                    // `Response` channel on an attach connection to report
+                    // an error over, same as the garbage-request case below.
+                    if data.len() <= MAX_WRITE_DATA_BYTES {
+                        ctx.sessions.write(&agent_id, data.into_bytes());
+                    }
                 }
                 Ok(Request::Resize { cols, lines }) => {
                     // `resize_all` locks and resizes every live session's
@@ -458,6 +522,55 @@ mod tests {
     use crate::agent::spawn::{spawn_agent, SpawnRequest};
     use crate::agent::{AgentId, AgentRole};
     use crate::config::Config;
+
+    // ── read_line_capped / trim_ascii_whitespace (F1) ─────────────────────────
+
+    #[tokio::test]
+    async fn read_line_capped_reads_a_normal_line() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"hello\n").await.unwrap();
+        drop(client);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+        let n = read_line_capped(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(buf, b"hello\n");
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_returns_zero_on_clean_eof() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+        let n = read_line_capped(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// The core F1 regression test: a client that streams bytes with no
+    /// newline past `MAX_LINE_BYTES` must be rejected, not grown forever.
+    #[tokio::test]
+    async fn read_line_capped_errors_on_an_unterminated_line_past_the_cap() {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let mut reader = BufReader::new(server);
+        let huge = vec![b'a'; MAX_LINE_BYTES + 1];
+        let write_task = tokio::spawn(async move {
+            let _ = client.write_all(&huge).await;
+        });
+        let mut buf = Vec::new();
+        let result = read_line_capped(&mut reader, &mut buf).await;
+        assert!(result.is_err(), "an unterminated line past the cap must error, not keep growing");
+        write_task.abort();
+    }
+
+    #[test]
+    fn trim_ascii_whitespace_strips_leading_and_trailing() {
+        assert_eq!(trim_ascii_whitespace(b"  hi \n"), b"hi");
+        assert_eq!(trim_ascii_whitespace(b"hi"), b"hi");
+        assert_eq!(trim_ascii_whitespace(b"   "), b"");
+        assert_eq!(trim_ascii_whitespace(b""), b"");
+    }
     use std::path::PathBuf;
 
     fn spawn(

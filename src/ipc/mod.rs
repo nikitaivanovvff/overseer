@@ -601,6 +601,62 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    // ── size limits (F1/F2) ───────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_unterminated_line_disconnects_rather_than_hanging_the_daemon() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let socket = start_server();
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // Comfortably past the server's line cap (1 MiB), no trailing newline
+        // — the exact scenario F1 exists to bound.
+        let huge = vec![b'a'; 2 * 1024 * 1024];
+        let _ = std::io::Write::write_all(&mut stream, &huge);
+
+        // The server must close its end once the cap is exceeded -- read
+        // returns Ok(0) (EOF) rather than the connection hanging open while
+        // an ever-growing buffer is allocated server-side.
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "server should close the connection once the line cap is exceeded");
+
+        // The daemon itself must still be alive for other clients.
+        let resp = send(&socket, Request::List);
+        assert!(resp.ok, "daemon should survive an oversized line from one client");
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn oversized_write_on_an_attach_connection_is_dropped_not_acted_on() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+        let (mut stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+
+        send_line(&mut stream, &Request::Write {
+            agent_id: root_id,
+            data: "x".repeat(crate::ipc::protocol::MAX_WRITE_DATA_BYTES + 1),
+        });
+
+        // The oversized Write must not desync or kill the connection --
+        // ordinary traffic on it (a fresh registration event) keeps arriving
+        // right after.
+        let other_root = start_root(&socket);
+        assert!(matches!(
+            next_event(&mut reader),
+            AttachEvent::AgentRegistered { agent } if agent.id == other_root
+        ));
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
     // ── shutdown ──────────────────────────────────────────────────────────────
 
     #[test]

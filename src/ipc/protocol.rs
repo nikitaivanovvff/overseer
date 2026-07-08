@@ -13,6 +13,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus};
 
+/// Max size of one `Write.data` payload (SECURITY-AUDIT.md F2). A single
+/// keystroke is a few bytes; a large paste is the only realistic case, and
+/// 64 KiB is generous for that. Bounds how much a hostile agent can flood a
+/// sibling's PTY with in one request.
+pub const MAX_WRITE_DATA_BYTES: usize = 64 * 1024;
+
+/// Max size of one `Spawn.task` payload (SECURITY-AUDIT.md F2). `task`
+/// becomes a process argv entry — well above any realistic initial prompt,
+/// but far below sizes that risk `E2BIG` from the OS after allocation.
+pub const MAX_SPAWN_TASK_BYTES: usize = 128 * 1024;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
