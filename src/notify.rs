@@ -103,12 +103,23 @@ fn notify_desktop(agent_name: &str, message: &str) {
     let body = format!("{agent_name} {message}");
     #[cfg(target_os = "macos")]
     {
+        // Absolute path (SECURITY-AUDIT.md F6): a stable, standard location
+        // on macOS, so this can't be shadowed by an earlier `osascript` on
+        // an attacker-influenced `$PATH`.
         let script = format!(r#"display notification "{}" with title "Overseer""#, escape_applescript(&body));
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+        let _ = std::process::Command::new("/usr/bin/osascript").arg("-e").arg(script).spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("notify-send").arg("Overseer").arg(&body).spawn();
+        // `--` (SECURITY-AUDIT.md F7) stops `body` from ever being parsed as
+        // a flag if a future refactor drops the trailing message text that
+        // today always follows `agent_name`, making a `--`/`-`-prefixed
+        // agent name unable to start a bare positional.
+        let _ = std::process::Command::new("/usr/bin/notify-send")
+            .arg("Overseer")
+            .arg("--")
+            .arg(&body)
+            .spawn();
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

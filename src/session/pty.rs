@@ -259,13 +259,18 @@ impl SessionManager {
     /// signal, that `wait()` can block this calling thread (the UI thread,
     /// for a `d`/`D`/quit-confirmed kill) forever. `SIGKILL` can't be caught
     /// or ignored, so the child is reliably dead by the time we join.
+    ///
+    /// Calls `libc::kill` directly rather than shelling out to a `kill`
+    /// binary resolved through `$PATH` (SECURITY-AUDIT.md F6) — the pid is
+    /// already captured, so the subprocess added nothing but a hijackable
+    /// lookup.
     pub fn kill(&self, id: &AgentId) {
         let session = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         let Some(session) = session else { return };
         let _ = session.channel.send(Msg::Shutdown);
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &session.pid.to_string()])
-            .status();
+        unsafe {
+            libc::kill(session.pid as libc::pid_t, libc::SIGKILL);
+        }
         if let Some(handle) = session.reader {
             let _ = handle.join();
         }

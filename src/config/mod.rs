@@ -152,7 +152,15 @@ impl Config {
 
     fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
+            Ok(raw) => toml::from_str(&raw).unwrap_or_else(|e| {
+                // Distinct from the "no file at all" path below, which stays
+                // silent -- a *present* file that fails to parse could be a
+                // corrupted or partially-tampered config silently reverting
+                // to defaults with no signal to the user (SECURITY-AUDIT.md
+                // F10).
+                eprintln!("warning: failed to parse {} ({e}), using defaults", path.display());
+                Self::default()
+            }),
             Err(_) => Self::default(),
         }
     }
