@@ -8,6 +8,27 @@
 //!   ok+data:  {"ok":true,"data":{"agent_id":"<uuid>","branch":"main"}}
 //!   ok:       {"ok":true}
 //!   error:    {"ok":false,"error":"unknown parent: 00000000"}
+//!
+//! # SECURITY: every agent under one daemon fully trusts every other agent
+//!
+//! `agent_id` is a plain, caller-supplied field on every request below — it
+//! is never checked against the identity of the connection sending it,
+//! because the wire protocol has no notion of connection identity at all.
+//! Concretely, any process holding `OVERSEER_SOCKET` (i.e. any agent this
+//! daemon launched, root or child) can:
+//! - `Write` raw bytes into **any other agent's** PTY (including the root
+//!   shell's), which is a real cross-agent code-execution path, not just a
+//!   UI nuisance;
+//! - push a `Status` for any `agent_id`, forging the tree a human operator
+//!   reads to make trust decisions;
+//! - `Drop` any non-root agent regardless of who spawned it, or `Shutdown`
+//!   the whole daemon (every session for the user).
+//!
+//! This is a deliberate, accepted trade-off (SECURITY-AUDIT.md F4), not an
+//! oversight: the socket has no `SO_PEERCRED` check and the protocol has no
+//! per-agent auth handshake. Do not run mutually-distrusting agents under
+//! one daemon — the isolation this tool provides is organizational (a tree
+//! you can see and `drop`), not a security sandbox between siblings.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,9 +103,10 @@ pub enum Request {
     /// TUI"). Deliberately a distinct request from `Drop` rather than a
     /// caller-supplied flag on it: `overseer drop`/an agent's own CLI calls
     /// only ever construct `Drop`, so the restriction can't be opted out of
-    /// from that side. Not a security boundary (this is a local, single-user
-    /// socket) — a safety rail against a script or a supervising agent
-    /// accidentally killing a whole tree it doesn't own.
+    /// from that side. This guards against *accidental* misuse (a script or
+    /// a supervising agent killing a whole tree it doesn't own) — it is not
+    /// an authorization boundary between agents; see this module's top-level
+    /// SECURITY note (SECURITY-AUDIT.md F4) for what's actually enforced.
     TuiDrop {
         agent_id: AgentId,
         recursive: bool,

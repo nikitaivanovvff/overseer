@@ -123,9 +123,15 @@ The same connection accepts `Watch { agent_id }` / `Unwatch` (the TUI watches wh
 
 `Output` streams a rendered `GridSnapshot` DTO (cells, colors, cursor, the two `TermModes` bits key encoding needs), not raw PTY bytes (see "What to Avoid" for why), whenever `SessionManager`'s per-agent generation counter says the watched agent's screen changed. `ui::term_pane::paint_grid_snapshot` paints it directly.
 
-Root-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only by the TUI's `d`/`D` handling — a safety rail (not a security boundary — this is a local, single-user socket) so a script or supervising agent calling the documented CLI can't take out a whole root tree.
+Root-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only by the TUI's `d`/`D` handling — a safety rail against *accidental* misuse (a script or supervising agent calling the documented CLI taking out a whole root tree it doesn't own), not an authorization boundary between agents — see "Security" below for what actually is.
 
 `--mock` never touches any of this: fully in-process, its own throwaway socket, seeded demo data, no real PTYs.
+
+### Security
+
+Every agent under one daemon fully trusts every other agent. `agent_id` is a plain, caller-supplied field on every IPC request — never checked against the identity of the connection sending it, because the protocol has no notion of connection identity (no `SO_PEERCRED` check, no per-agent auth handshake). Any agent holding `OVERSEER_SOCKET` can `Write` into any other agent's PTY (including the root shell's — real cross-agent code execution, not a UI nuisance), forge any agent's `Status`, `Drop` any non-root agent, or `Shutdown` the whole daemon. This is a deliberate, accepted trade-off, not an oversight (see `.specs/SECURITY-AUDIT.md` F4) — the isolation Overseer provides is organizational (a tree you can see and `drop`), not a sandbox between siblings. **Do not run mutually-distrusting agents under one daemon.**
+
+Cross-user isolation relies on the socket directory being owner-only (`0700`, validated rather than blindly chmod'd — a pre-existing dir at the predictable `/tmp/overseer-$UID` fallback path is checked for real-directory/ownership/mode before being trusted) and the socket node itself being `0600`.
 
 ### Agent Adapter Trait
 
