@@ -1,12 +1,12 @@
 # Overseer
 
-**An IDE for agents.** A terminal-native TUI for observing and steering a fleet of parallel AI coding agents from a single window — instead of juggling five terminal tabs. Built in Rust. Nvim-aesthetic; a single ordinary alt-screen app with no bundled multiplexer — each agent is a PTY Overseer owns directly, emulated in-process via `alacritty_terminal` and rendered straight into the same ratatui frame — with a Unix socket IPC layer that gives agents a lightweight API to register, report status, and spawn children — without MCP overhead.
+**An IDE for agents.** A terminal-native TUI for observing and steering a fleet of parallel AI coding agents from a single window — instead of juggling five terminal tabs. Built in Rust. Nvim-aesthetic; a single ordinary alt-screen app with no bundled multiplexer — each agent is a PTY Overseer owns directly, emulated in-process and rendered straight into the same ratatui frame — with a Unix socket IPC layer that gives agents a lightweight API to register, report status, and spawn children — without MCP overhead.
 
 The agents are already smart. Overseer does **not** reimplement what they do — it does not manage git worktrees, branches, or merges; agents handle their own isolation. Overseer is the observability, routing, and approval surface on top: see every agent's state at a glance, jump into any one to approve or intervene, or leave the parent to supervise its own children.
 
-The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself, in your own time, exactly as you would without Overseer; the row appears in the tree immediately, named after the repo, and its status flips from `idle` to `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language — "implement X", "research Y", "write unit tests for Z" — and it fans the work out into child agents, each running in its own PTY (auto-launched via the configured adapter) and surfacing as its own row in the TUI. You can drop into any child for approval or a nudge, or ignore them and let the parent check on them periodically.
+The usual shape is **one root per repository**. `n` spawns a root as a bare shell in a repo you choose (default: cwd) — Overseer doesn't launch an agent for you. You `cd`/run `claude` (or whatever) yourself; the row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks. From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
 
-The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, aider, etc.) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
+The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **root's** node name is the **repo name** — there's no task description at the point a bare shell is spawned, since no agent runs there until you start one yourself. The adapter (claude, opencode, pi) is shown in the detail panel; a not-yet-running root shows adapter `shell`.
 
 ---
 
@@ -17,14 +17,14 @@ You (the user)
   └─ Overseer TUI                                                        ← one window, the whole fleet
        └─ Root  (name: overseer, adapter: shell → claude once you run it) ← bare shell in the repo checkout
             ├─ Child Agent A  (task: auth-module, adapter: claude)       ← own PTY, own branch
-            └─ Child Agent B  (task: write-tests, adapter: aider)        ← own PTY, own branch
+            └─ Child Agent B  (task: write-tests, adapter: opencode)     ← own PTY, own branch
 ```
 
-You spawn the root, run your own agent inside it, and talk to it directly; the agent then fans out children on your behalf. Each agent is a PTY Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation between children is the **agent's** job, not Overseer's — Overseer just launches the session and gets out of the way.
+You spawn the root, run your own agent inside it, and talk to it directly; it fans out children on your behalf. Each agent is a PTY Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation is the **agent's** job, not Overseer's.
 
-Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>` (`overseer teach` still works as a hidden alias). Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens consumed, nothing written into your repo.
+Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>` (`overseer teach` is a hidden alias). Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens, nothing written into your repo.
 
-The registry and every agent's PTY live in a **daemon** process, not the TUI — a `overseer` launch attaches to it as a client (auto-spawning one if it isn't already running). Quitting the TUI detaches; the daemon and every agent it's tracking keep running, and a later `overseer` launch reattaches to exactly what was there before. See "Daemon + Attach Protocol" below.
+The registry and every agent's PTY live in a **daemon** process, not the TUI — an `overseer` launch attaches as a client (auto-spawning one if it isn't running). Quitting the TUI detaches; the daemon and every agent keep running, and a later launch reattaches to exactly what was there before (see "Daemon + Attach Protocol").
 
 ---
 
@@ -32,26 +32,28 @@ The registry and every agent's PTY live in a **daemon** process, not the TUI —
 
 ```
 overseer daemon (background, one per user, auto-spawned by the TUI)
-├── AgentRegistry, SessionManager, Config, git/   ← unchanged internals, all owned here now
+├── AgentRegistry, SessionManager, Config, git/   ← owned by the daemon, not the TUI
 ├── IPC socket  $XDG_RUNTIME_DIR/overseer/daemon.sock
 │               (fallback /tmp/overseer-$UID/daemon.sock), mode 0700 dir, flock-guarded
-├── one-shot requests: status/list/agent/start/spawn/drop/shutdown  ← existing protocol, unchanged
+├── one-shot requests: status/list/agent/start/spawn/drop/shutdown
 └── attach connections: long-lived streams of registry events + rendered terminal snapshots
 
 overseer (TUI) = attach client                    overseer <subcommand> = one-shot client
-overseer --mock = fully in-process demo data, never touches a daemon at all
+overseer --mock = fully in-process demo data, never spawns a real PTY, never touches a daemon
 ```
 
 ```
 overseer (binary)
 ├── ui/               Ratatui-based terminal UI
 │   ├── mod           Tree|pane split (~25/75): agent tree, detail, status bar, spawn modal
-│   └── term_pane     Paints the selected agent's terminal into the pane half — a live
-│                     alacritty_terminal grid in --mock, a daemon-streamed GridSnapshot otherwise
-├── session/          PTY + terminal-emulator management (daemon-side only, post-split)
-│   ├── pty           SessionManager: owns one alacritty_terminal Term + PTY per agent, keyed by
-│   │                 AgentId; also renders GridSnapshot DTOs and tracks each Term's dirty flag
-│   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder (input path for a focused pane)
+│   └── term_pane     Paints the selected agent's pane from a GridSnapshot — the only render
+│                     currency, in both --mock and daemon-attached modes
+├── session/          PTY + terminal-emulator management, keyed by AgentId
+│   ├── pty           SessionManager: owns one PTY + terminal emulator per agent — the only file
+│   │                 in the crate that imports alacritty_terminal. Renders GridSnapshot DTOs and
+│   │                 tracks a per-agent content-generation counter (bumped on new PTY output)
+│   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder, parameterized by the neutral
+│                     TermModes struct (input path for a focused pane)
 ├── agent/            Agent model and lifecycle
 │   ├── model         AgentNode, AgentStatus, AgentRole, AgentTree
 │   ├── registry      AgentRegistry: in-memory tree of registered agents + a broadcast channel
@@ -88,7 +90,7 @@ overseer (binary)
 
 ### IPC Server
 
-Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `/tmp/overseer-$UID/daemon.sock` when `$XDG_RUNTIME_DIR` is unset), owned by the daemon process — one stable, per-user socket that every repo's TUI and every agent's CLI calls share, unlike the old per-invocation socket. The only channel agents use to talk to Overseer — no MCP, no HTTP, no polling. The `overseer` binary doubles as the client: each subcommand opens the socket, sends one newline-delimited JSON request, prints the reply, and exits. Agents invoke these commands, not raw HTTP endpoints — it's a terminal app, the API is its CLI.
+Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `/tmp/overseer-$UID/daemon.sock`), owned by the daemon — one stable, per-user socket every repo's TUI and every agent's CLI shares. The only channel agents use to talk to Overseer — no MCP, no HTTP, no polling. `overseer` doubles as the client: each subcommand opens the socket, sends one newline-delimited JSON request, prints the reply, exits.
 
 | Command | Args | Description |
 |---------|------|-------------|
@@ -106,24 +108,24 @@ Identity (`OVERSEER_AGENT_ID`, socket path) comes from injected env, so commands
 
 ### Daemon + Attach Protocol
 
-The daemon is what actually owns `AgentRegistry` and `SessionManager` — the TUI is just its first, richest client. On startup the TUI tries to connect to the socket; if that fails, it spawns `overseer daemon` detached from its own controlling terminal (`setsid`, stdio to a log file next to the socket) and retries with backoff before attaching. A `flock`-based lockfile (`daemon.pid`, next to the socket) makes a second daemon targeting the same socket fail fast instead of racing the first for the bind.
+The daemon owns `AgentRegistry` and `SessionManager`; the TUI is its first, richest client. On startup the TUI connects to the socket, or spawns `overseer daemon` detached (`setsid`, stdio to a log file next to the socket) and retries with backoff. A `flock` lockfile (`daemon.pid`) makes a second daemon on the same socket fail fast instead of racing for the bind.
 
-Attaching upgrades a connection with `Request::Attach`: the daemon replies with one `AttachEvent::Snapshot` (every agent, as of that instant), then streams events until the connection closes:
+`Request::Attach` upgrades a connection: one `AttachEvent::Snapshot` (every agent, as of that instant), then a stream:
 
 | Event | When |
 |-------|------|
-| `AgentRegistered` / `AgentRemoved` | A `start`/`spawn`/`drop` mutates the registry — pushed from `AgentRegistry`'s own broadcast channel, not polled |
+| `AgentRegistered` / `AgentRemoved` | A `start`/`spawn`/`drop` mutates the registry — pushed from `AgentRegistry`'s broadcast channel, not polled |
 | `StatusChanged` | Any status push (hook, explicit `overseer status`, exit sweep) |
 | `Output` | The **watched** agent's rendered terminal grid — see below |
-| `Shutdown` | The daemon is exiting (`overseer shutdown`/`Q`) — the client treats this like the connection dropping |
+| `Shutdown` | The daemon is exiting (`overseer shutdown`/`Q`) — treated like the connection dropping |
 
-The same connection accepts `Watch { agent_id }` / `Unwatch` (start/stop streaming one agent's terminal — the TUI watches whichever agent is currently selected, switching on cursor move and sending an immediate grid on `Watch` so switching feels instant), `Write { agent_id, data }` (forward keystrokes/paste), and `Resize { cols, lines }` (every agent shares one PTY size). `Start`/`Spawn`/`Drop`/`Status`/`List`/`Agent` still go over ordinary one-shot connections, exactly as before the daemon split — the attach connection is additive, not a replacement for those.
+The same connection accepts `Watch { agent_id }` / `Unwatch` (the TUI watches whichever agent is selected, switching on cursor move; `Watch` sends an immediate grid so switching feels instant), `Write { agent_id, data }` (keystrokes/paste), and `Resize { cols, lines }` (every agent shares one PTY size). `Start`/`Spawn`/`Drop`/`Status`/`List`/`Agent` stay one-shot, additive to the attach connection.
 
-**Rendering deviation from the original design:** the natural design ships raw PTY bytes so the client can feed its own `Term` — but `alacritty_terminal` 0.26 doesn't expose incoming PTY bytes without reimplementing its mio/signalfd event loop, so the daemon instead keeps owning the real `Term` (`session::pty`, unchanged internals) and the attach connection streams a rendered `GridSnapshot` DTO (cells + colors + cursor + the two `TermMode` bits key encoding needs) whenever `SessionManager`'s dirty flag (set on `Event::Wakeup`) says the watched agent's screen changed. `ui::term_pane::paint_grid_snapshot` paints it directly — no client-side `Term` needed. Same visual result as the raw-byte design, without touching the already-tested PTY plumbing.
+`Output` streams a rendered `GridSnapshot` DTO (cells, colors, cursor, the two `TermModes` bits key encoding needs), not raw PTY bytes (see "What to Avoid" for why), whenever `SessionManager`'s per-agent generation counter says the watched agent's screen changed. `ui::term_pane::paint_grid_snapshot` paints it directly.
 
-Root-drop's IPC restriction survives the client/server split as `Request::TuiDrop` — a request distinct from `Request::Drop`, sent only by the TUI's own `d`/`D` key handling (never by `cli.rs`'s `overseer drop`, never by an agent). It's a safety rail, not a security boundary (this is a local, single-user socket) — the point is that a script or a supervising agent calling the documented CLI can't accidentally take out a whole root tree.
+Root-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only by the TUI's `d`/`D` handling — a safety rail (not a security boundary — this is a local, single-user socket) so a script or supervising agent calling the documented CLI can't take out a whole root tree.
 
-`--mock` never touches any of this: it's the pre-daemon-split architecture verbatim, in-process, with its own throwaway socket, purely for demoing the UI against seeded tree data.
+`--mock` never touches any of this: fully in-process, its own throwaway socket, seeded demo data, no real PTYs.
 
 ### Agent Adapter Trait
 
@@ -144,14 +146,14 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`InstalledFile` is a `(path, content, merge_strategy)` triple written under the agent's user config dir, one of three `MergeStrategy` variants:
+`InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
-- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays shape, tagging Overseer's own entries with `_overseer: true` so uninstall removes exactly those and nothing the user added.
-- `JsonArrayMerge { key, entries }` — generic: merges/removes specific string `entries` into/from a named top-level JSON array field (opencode's `instructions`). Array elements here are bare strings with no room for an `_overseer` sentinel, so uninstall removes exactly `entries` back out, byte-for-byte restoring what wasn't Overseer's.
+- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those.
+- `JsonArrayMerge { key, entries }` — generic: merges/removes string `entries` into/from a named top-level JSON array (opencode's `instructions`); uninstall removes exactly `entries` back out.
 
-`legacy_paths()` names any previous install layout (e.g. Claude's old single `skills/overseer/`) that install/uninstall should delete outright rather than leave to rot alongside the current one. Nothing is ever written into the user's repo, for any adapter.
+`legacy_paths()` names a previous install layout to delete outright rather than leave to rot. Nothing is ever written into the user's repo, for any adapter.
 
-Adding a fourth adapter is a repeatable recipe, not a one-off: `.claude/skills/adding-harness-support/SKILL.md` (committed to this repo) walks through it, including the "verify against the installed binary, not the docs" gate that mattered a lot in practice — see the per-adapter notes below for what it actually caught.
+Adding a fourth adapter is a repeatable recipe: `.claude/skills/adding-harness-support/SKILL.md` walks through it, including a "verify against the installed binary, not the docs" gate. (`aider` appears elsewhere in this doc purely as a config-shape example — no `AgentAdapter` impl, not a real launch target.)
 
 ### Agent Awareness
 
@@ -163,13 +165,13 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_REPO` — repository name
 - `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for root). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
 
-Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE` — not in a per-launch file:
-- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is a supported feature, not an accident — a claude root may spawn an opencode or pi child and vice versa; children don't have to run their own harness.
-- Child agents: spawning is not permitted; the agent sets up its own branch/worktree for isolation, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
+Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE`:
+- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is supported — a claude root may spawn an opencode or pi child and vice versa.
+- Child agents: spawning is not permitted; the agent sets up its own branch/worktree, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
 
-Three harnesses, three different status-wiring mechanisms — each verified against the actually-installed binary (`.claude/skills/adding-harness-support/SKILL.md`'s Task 0 gate), not just its docs:
+Three harnesses, three status-wiring mechanisms — each verified against the installed binary, not just its docs:
 
-**Claude Code** — user-level `~/.claude/settings.json` hooks (shared across all sessions, no-op outside Overseer, all passing `--from-hook`, which reads the Claude-specific hook-payload JSON from stdin):
+**Claude Code** — user-level `~/.claude/settings.json` hooks (shared across sessions, no-op outside Overseer, all passing `--from-hook`, which reads the Claude-specific hook-payload JSON from stdin):
 
 | Hook | Pushes | Why |
 |------|--------|-----|
@@ -179,7 +181,7 @@ Three harnesses, three different status-wiring mechanisms — each verified agai
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
 | `Notification` | `blocked`, downgraded to `idle` for the ~60s idle nag | Fires for both a real permission prompt and the nag; `--from-hook` classifies which via the payload's message text. |
 
-**opencode** — a plugin at `~/.config/opencode/plugin/overseer.js`, auto-loaded with zero registration needed (confirmed live: opencode scans that directory itself; no entry in `opencode.jsonc`'s `plugin` array required). Role instructions (`overseer-root.md`/`overseer-child.md`) are merged into `opencode.jsonc`'s `instructions` array unconditionally — each file's own "only applies when `$OVERSEER_ROLE=...`" opening line is what makes loading both, every session, harmless:
+**opencode** — a plugin at `~/.config/opencode/plugin/overseer.js`, auto-loaded (opencode scans that directory itself, no `opencode.jsonc` entry needed). Role instructions (`overseer-root.md`/`overseer-child.md`) merge into `opencode.jsonc`'s `instructions` array unconditionally — each file's own "only applies when `$OVERSEER_ROLE=...`" opening line makes loading both, every session, harmless:
 
 | opencode event | Pushes | Why |
 |------|--------|-----|
@@ -190,7 +192,7 @@ Three harnesses, three different status-wiring mechanisms — each verified agai
 | `permission.replied` | `running` | The prompt resolved either way; work resumes. |
 | `session.error` | *(nothing)* | The exit watcher owns `error`, not a lifecycle push. |
 
-**pi** — an extension loaded via `pi --extension <absolute-path>` at spawn time (confirmed live: bypasses pi's own npm-style package manager/`settings.json` entirely, so `overseer install`/`--uninstall` is just "write/delete one file"). Role instructions are selected **per role** at spawn time via `--append-system-prompt <path>` (pi reads the file's contents when given an existing path), so only the correct doc is ever loaded — no shared array, no self-filtering preamble needed:
+**pi** — an extension loaded via `pi --extension <absolute-path>` at spawn time (bypasses pi's own package manager/`settings.json` entirely, so install/uninstall is just "write/delete one file"). Role instructions are selected **per role** at spawn time via `--append-system-prompt <path>`, so only the correct doc is ever loaded:
 
 | pi event | Pushes | Why |
 |------|--------|-----|
@@ -199,38 +201,36 @@ Three harnesses, three different status-wiring mechanisms — each verified agai
 | `agent_end` | `idle` | A turn ends. |
 | `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |
 
-**pi never pushes `blocked`** — confirmed against its installed `ExtensionEvent` type union: no permission-request event exists at all (permission gates are themselves opt-in extensions in pi, not something the base install has). Documented as a plain caveat in `pi_root.md`, not faked with a different event.
+**pi never pushes `blocked`** — no permission-request event exists in its `ExtensionEvent` union (permission gates are opt-in extensions in pi, not part of the base install). Documented as a caveat in `pi_root.md`, not faked with a different event.
 
-Status meanings: `spawning` (registered, session launching) → `running` (working) → `idle` (finished responding, awaiting more input) / `blocked` (needs you — permission pending) → `done` or `error` (see Cleanup for how these two are reached).
+Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
 
-Every agent also carries `status_secs`: how long, in whole seconds, it's held its *current* status — reset only when the status actually changes (a repeated `running` push from hook chatter doesn't reset it). Visible via `overseer list`/`overseer agent`, which is what makes "check on a long-idle child" an actionable instruction for the root skill, not just a UI nicety. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`) — a running agent doesn't need a clock — and the detail pane always shows it under `status:`.
+Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the detail pane always shows it under `status:`.
 
 ### Attention Surfacing
 
-A `blocked` (or, if configured, `idle`) agent can reach you two ways beyond the tree's own `!` badge, both edge-triggered — they fire once on the transition *into* that status, never on a repeated push:
+A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tree's own `!` badge, both edge-triggered (fire once on the transition, not on a repeated push):
 
-- **Terminal bell.** The TUI writes `\x07` to its own stdout the moment any agent transitions into `blocked`. What that turns into (a badge, a sound, a dock bounce) is entirely your terminal's call — this works everywhere, including over ssh, with zero dependencies. On (default) unless `[notify] bell = false`.
-- **Desktop notification.** `osascript`/`notify-send`, fired the same way, off by default (`[notify] mode = "off"`). `"blocked"` fires on `→blocked` only; `"blocked+idle"` also fires on `→idle`, for long tasks where "it finished responding" is itself worth a ping.
+- **Terminal bell.** `\x07` to the TUI's own stdout on any `→blocked` transition — works everywhere, including over ssh. On by default unless `[notify] bell = false`.
+- **Desktop notification.** `osascript`/`notify-send`, off by default (`[notify] mode = "off"`). `"blocked"` fires on `→blocked` only; `"blocked+idle"` also fires on `→idle`.
 
-Both channels are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the previous frame's recorded statuses — not a hook into either backend's event plumbing, so it works identically for `--mock` and a daemon-attached session without either one needing to know notifications exist. Config lives in `[notify]` (see Config below).
-
-Explicitly out of scope (unchanged since Phase 7): a supervision loop that auto-re-prompts an idle child. This surfaces; a human (or the root agent reading `overseer list`) decides what to do about it.
+Both are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the last — identical for `--mock` and daemon-attached. Config in `[notify]` (see Config below). Out of scope: a supervision loop that auto-re-prompts an idle child — this surfaces, a human (or the root agent reading `overseer list`) decides.
 
 ### Workspace
 
-Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer's only job is to launch the PTY in the repo and inject identity env. It never runs `git worktree`, never creates branches, and never merges. Integrating an agent's branch is the user's call, same as it would be without Overseer.
+Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer never runs `git worktree`, creates branches, or merges. Integrating an agent's branch is the user's call.
 
 ### Cleanup
 
-Dropping an agent kills its PTY and deregisters it — that's all. Overseer does not delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent, so no session is orphaned. Root agents cannot be dropped via IPC — only via the TUI (`Request::TuiDrop`, see "Daemon + Attach Protocol").
+Dropping an agent kills its PTY and deregisters it — Overseer doesn't delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent. Root agents can't be dropped via IPC, only the TUI (`Request::TuiDrop`).
 
-A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0 — including a root shell where the user typed `exit`) or `error` (non-zero/signal), and the agent stays visible for you to review before an explicit `drop`.
+A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0) or `error` (non-zero/signal), and the agent stays visible for review before an explicit `drop`.
 
-**Quitting the TUI is a detach, not a kill.** `q`/`Ctrl-C` closes the attach connection and exits immediately, no confirm — the daemon (and every agent it's tracking) is completely unaffected, since it's a separate process the TUI never owned in the first place. A later `overseer` launch reattaches to that same daemon and recovers the full tree *and* each agent's terminal content (the daemon never stopped rendering into its `Term`s while no one was watching). This is what "quitting never kills agents" (long-standing house rule) actually resolves to post-daemon-split: previously it meant "the PTYs survive as orphaned, untracked processes"; now it means "the daemon keeps tracking them and you can get back to exactly where you left off."
+**Quitting the TUI is a detach, not a kill.** `q`/`Ctrl-C` closes the attach connection immediately, no confirm — the daemon and every agent it tracks are unaffected. A later `overseer` launch reattaches and recovers the full tree and each agent's terminal content.
 
-**`overseer shutdown`** (CLI) or **`Q`** (TUI, with a confirm — "kill N agents and the daemon?") is the actual kill switch: recursive-drops every root, then the daemon process exits. Dropping the last remaining agent does *not* shut the daemon down on its own — an idle daemon is cheap, and predictable beats clever here.
+**`overseer shutdown`** (CLI) or **`Q`** (TUI, with a confirm) is the actual kill switch: recursive-drops every root, then the daemon exits. Dropping the last agent does *not* shut the daemon down on its own.
 
-**Daemon-death caveat:** "persistence" here means the daemon process staying alive, not serialized state — if the daemon itself is killed (crash, `kill -9`, machine restart), every PTY it owned dies with it, the same contract a `tmux` server has with its panes. There is no on-disk state file and no plan to add one; a fresh daemon after that always starts from an empty tree.
+**Daemon death is total.** No on-disk state file — if the daemon itself dies (crash, `kill -9`, reboot), every PTY it owned dies with it (same contract a `tmux` server has with its panes); a fresh daemon starts from an empty tree.
 
 ### TUI Layout
 
@@ -253,15 +253,15 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
  OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
 ```
 
-Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; there is no second pane, no multiplexer, nothing external compositing the right side. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half of the buffer via a `PaneSource`: in `--mock` it locks the local `alacritty_terminal::Term` directly (`SessionManager::with_term`); everywhere else it paints the last `GridSnapshot` the daemon streamed for the watched agent (see "Daemon + Attach Protocol").
+Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
 
-Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`, matching its badge); the name truncates with `…` to whatever width remains, computed by the pure `format_tree_row`/`truncate_with_ellipsis` helpers. The status bar shows "`N running`" normally, or "`N running · M blocked`" once any agent needs attention.
+Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention.
 
-Status badges: `●` running · `!` blocked (needs you — permission pending) · `◌` idle (finished responding / a not-yet-started root) · `✓` done (explicit push, or a clean PTY exit) · `✗` error (unexpected process exit) · `…` spawning
+Status badges: `●` running · `!` blocked (needs you) · `◌` idle · `✓` done · `✗` error · `…` spawning
 
-**Keybinding house style: nvim.** Navigation follows nvim conventions — `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` to move between panes, like nvim window navigation. New bindings should extend this vocabulary, not invent a parallel one — and must never require a prefix-key/chord model. One hard constraint: keys that agents' own TUIs rely on (e.g. `Ctrl-j` = Claude Code's insert-newline) must pass through to a focused agent pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while a pane is focused (real Backspace still works: terminals send `DEL`, not `^H`).
+**Keybinding house style: nvim.** `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` between panes. New bindings extend this vocabulary, never a parallel one or a prefix-key/chord model. Keys an agent's own TUI relies on (e.g. `Ctrl-j` = Claude Code's insert-newline) pass through to a focused pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while focused (real Backspace still works: terminals send `DEL`, not `^H`).
 
-Every tree-focus action below is remappable via `[keybindings]` (PHASE5B.md) — the table shows the defaults. Two things stay fixed regardless of config: `Ctrl-h` (pane-focus interception — see the paragraph above; making this remappable would invite a user to steal a key their agent's own TUI needs) and the scrollback keys (`Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G`, next section) — neither was ever in scope for `[keybindings]`. `Enter`/`o` and `Ctrl-C` also stay fixed *as extra aliases* for `jump_in`/`quit` even if those actions are remapped to something else.
+Every tree-focus action below is remappable via `[keybindings]`. Fixed regardless of config: `Ctrl-h` (stealing it would take a key an agent's own TUI needs) and the scrollback keys (next section). `Enter`/`o`/`Ctrl-C` also stay fixed as extra aliases for `jump_in`/`quit` even if those actions are remapped.
 
 | Key (default) | Action |
 |-----|--------|
@@ -283,19 +283,19 @@ Every tree-focus action below is remappable via `[keybindings]` (PHASE5B.md) —
 
 ### Search
 
-`/` opens a centered input (same modal chrome as spawn); as you type, the tree shows only agents whose name fuzzy-matches the query, plus every ancestor of a match (dimmed, kept for context — e.g. a matching child keeps its parent row visible so you can still see whose child it is). Matching is a pure `fuzzy_match(query, name) -> Option<u32>`: case-insensitive, in-order subsequence, with a score that rewards contiguous runs over scattered ones (so typing `au` ranks `auth-module` above a node that only matches `a` and `u` far apart). `Enter` moves the *real* cursor to the current selection if it still matches, else the first match in tree order, and closes the prompt; `Esc` closes it without moving anything. Nothing about the real cursor changes while you're still typing — only what the tree list renders.
+`/` opens a centered input; as you type, the tree shows only agents whose name fuzzy-matches (`fuzzy_match(query, name) -> Option<u32>`: case-insensitive, in-order subsequence, contiguous runs score higher), plus every ancestor of a match (dimmed, for context). `Enter` moves the *real* cursor to the current selection (or the first match) and closes the prompt; `Esc` closes it without moving anything.
 
 ### Help
 
-`?` (itself remappable) opens a centered popup listing every binding — generated from the live `Keybindings` struct (`ui::help_rows`), never a hardcoded string, so a remap or a newly-added action can't silently drift out of sync with what's shown. Includes the fixed keys too (`Enter`/`o`, `Ctrl-C`, `Ctrl-h`), labeled as fixed. Any key closes it.
+`?` opens a centered popup listing every binding — generated from the live `Keybindings` struct (`ui::help_rows`), never a hardcoded string. Includes the fixed keys too (`Enter`/`o`, `Ctrl-C`, `Ctrl-h`), labeled as fixed. Any key closes it.
 
 ### Scrollback
 
-While tree-focused, `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G` scroll the *selected* agent's pane — a read-only preview in that state, so these never collide with a real agent TUI's own use of the same keys (readline's `Ctrl-u` kill-line, Claude Code's own scrolling). They are deliberately unavailable once a pane is focused: `Ctrl-h` remains the *only* key a focused pane intercepts, so `Ctrl-u`/`Ctrl-d` reach the agent untouched there (verified against a real shell: typing text then `Ctrl-u` while focused clears it via the shell's own readline, not Overseer).
+While tree-focused, `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G` scroll the *selected* agent's pane — a read-only preview in that state, so these never collide with a real agent TUI's own use of the same keys (readline's `Ctrl-u` kill-line). Unavailable once a pane is focused (`Ctrl-h` remains the only key a focused pane intercepts).
 
-The scrolled offset resets to the live bottom on cursor move (`j`/`k`, and any drop-driven cursor shift — handled in one place, by comparing the selection against the previous frame's) and on jump-in (`Ctrl-l`/`Enter`/`o`), so you never end up interacting with a pane mid-scroll. The pane border shows the state: `" agent [scrolled ↑N — G to follow] "` while scrolled, reverting to `" agent "` at the bottom.
+The scrolled offset resets to the live bottom on cursor move and on jump-in, so you never interact with a pane mid-scroll. The pane border shows the state: `" agent [scrolled ↑N — G to follow] "`, reverting to `" agent "` at the bottom.
 
-Scrolling happens where the real `Term` lives — the daemon (`SessionManager::scroll_display`/`scroll_to_bottom`/`display_offset`, thin wrappers over `alacritty_terminal`'s own `Scroll::Delta`/`Scroll::Bottom`). A daemon-attached TUI sends `Request::Scroll { delta }` / `Request::ScrollToBottom` on the attach connection — no `agent_id`, since both only ever apply to whichever agent that connection is currently watching — and the daemon replies immediately with a fresh `GridSnapshot` (scrolling doesn't touch the PTY, so it never sets the dirty flag the normal output poll relies on). `--mock` mode calls `SessionManager` directly, no round trip needed.
+Scrolling happens where the real terminal state lives — the daemon (`SessionManager::scroll_display`/`scroll_to_bottom`/`display_offset`). A daemon-attached TUI sends `Request::Scroll { delta }` / `Request::ScrollToBottom` on the attach connection (no `agent_id` — always the connection's watched agent), and gets back a fresh `GridSnapshot` immediately (scrolling doesn't touch the PTY, so it never bumps the generation counter the normal output poll relies on). `--mock` calls `SessionManager` directly, no round trip.
 
 ### Spawn Data Flow
 
@@ -327,7 +327,7 @@ SessionStart hook flips it from Spawning to Running moments later.
 
 ## Config
 
-`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, `[notify]`, `[keybindings]`, and `[theme]` — all below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup (adapter resolution); `[notify]`/`[keybindings]`/`[theme]` load independently in the TUI process itself (PHASE5B.md), since they're all properties of *your* terminal/desktop, not the daemon's. A missing or invalid file falls back to the built-in default; a bad *value* for one field (an unknown action name, an unparseable key, an unrecognized color) warns on stderr and keeps that field's own default — never a hard error, and never blocks startup.
+`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, `[notify]`, `[keybindings]`, `[theme]` — all below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup; `[notify]`/`[keybindings]`/`[theme]` load independently in the TUI process, since they're properties of *your* terminal, not the daemon's. Missing/invalid file falls back to the built-in default; a bad *value* for one field warns on stderr and keeps that field's own default — never a hard error.
 
 ```toml
 [defaults]
@@ -343,10 +343,6 @@ extra_args = []
 
 [adapters.pi]
 command = "pi"
-extra_args = []
-
-[adapters.aider]
-command = "aider"
 extra_args = []
 
 [notify]
@@ -371,13 +367,13 @@ border_focused = "yellow"
 border = "dark_gray"
 ```
 
-A child spawn resolves its `command`/`extra_args` from `config.adapters[name]`, not from the adapter name itself — this is what lets `--dangerously-skip-permissions`-style flags actually reach the launched process, and lets a user point "claude" at a custom binary or wrapper. An adapter name with no entry in `config.adapters` is the same `UnknownAdapter` error as a name with no `AgentAdapter` impl at all.
+A child spawn resolves `command`/`extra_args` from `config.adapters[name]`, not the adapter name itself — lets flags like `--dangerously-skip-permissions` reach the process, and lets a user point "claude" at a custom binary. A name with no entry in `config.adapters` is the same `UnknownAdapter` error as one with no `AgentAdapter` impl (e.g. `aider`, a config-shape example only — see "Agent Adapter Trait").
 
-`[notify]` (see "Attention Surfacing" above): every channel is independently switchable off. `bell` defaults **on** (a terminal bell is inert unless the user's own terminal turns it into something loud); `mode` defaults **off** (desktop notifications are the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`, for long tasks where "it finished responding" is worth a ping on its own.
+`[notify]`: every channel independently switchable off. `bell` defaults **on**; `mode` defaults **off** (the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`.
 
-`[keybindings]` (PHASE5B.md): a key is `j`/`D`/`/` (single char, case-sensitive) or `ctrl-<char>` (case-insensitive on the letter — Ctrl+A and Ctrl+a are the same physical keystroke). Two actions bound to the same key is a startup warning, not an error — the action declared later wins, deterministically (see `config::keybindings::Action::ALL`'s order). `Ctrl-h` (pane interception) and the scrollback keys are **not** in this table at all — see the house-style note above for why. Every binding is reflected live in the `?` popup.
+`[keybindings]`: a key is `j`/`D`/`/` (single char, case-sensitive) or `ctrl-<char>` (case-insensitive on the letter). Two actions bound to the same key is a startup warning, not an error — the later declaration wins. `Ctrl-h` and the scrollback keys are **not** in this table — see the house-style note under "TUI Layout." Every binding reflects live in the `?` popup.
 
-`[theme]` (PHASE5B.md): colors only, nothing else — `Blocked`'s bold weight, for instance, is fixed. `Theme::default()` is asserted (in a test) to reproduce the exact colors Overseer shipped with before `[theme]` existed, so this section existing can't silently change anyone's look who never touches it.
+`[theme]`: colors only — `Blocked`'s bold weight is fixed. `Theme::default()` is asserted (in a test) to reproduce Overseer's pre-`[theme]` colors exactly, so this section can't silently change anyone's look who never touches it.
 
 ---
 
@@ -397,7 +393,7 @@ A child spawn resolves its `command`/`extra_args` from `config.adapters[name]`, 
 | Error handling | `anyhow` + `thiserror` |
 | Daemon lifecycle | `libc` — `setsid` (detach from the controlling terminal), `flock` (single-daemon lockfile), `getuid` (default socket path) |
 
-**Runtime dependencies:** `git`. Standard on macOS/Linux. (No `tmux` — Overseer owns its own PTYs now.)
+**Runtime dependencies:** `git`. Standard on macOS/Linux. (No `tmux` — Overseer owns its own PTYs.)
 
 ---
 
@@ -409,45 +405,41 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 
 ## Limits
 
-Measured, not assumed (SCALE.md) — `scripts/stress.sh [N] [lines_per_sec]` spawns 1 root + N children running a stub that emits output and pushes `running`/`idle` on a tight 0.2s loop (chattier than any real hook traffic); one designated child additionally streams at a settable high output rate (default 400 lines/sec, matching a real observed agent pane), watched by a tmux-driven TUI for the entire load window, not after it. Measures daemon RSS, daemon CPU%, spawn latency, and status-push latency under that load, plus a precise write→render→stream round trip timed over a second, independent raw attach connection that watches the same chatty child concurrently.
+Measured, not assumed — `scripts/stress.sh [N] [lines_per_sec]` spawns 1 root + N chatty children (status pushes + one high-output pane, default 400 lines/sec) and watches the streaming pane for the entire load window (a watched pane must be exercised throughout, not just after — an earlier version of this script that skipped that missed a real regression).
 
-Tested at **N=30** (the target fleet size) and **N=50** (extra headroom) on the dev machine, release build, chatty pane watched throughout: daemon RSS 150-250MB (well under the 500MB budget — dominated by each agent's `alacritty_terminal` scrollback buffer, not by fleet size itself), daemon CPU under ~17% of one core even with two simultaneous watchers on the streaming pane, spawn latency ~10-30ms mean, status-push round-trip a few ms to tens of ms mean even at N=50 (0 pushes lost at either size), write→`Output` round trip consistently in the tens of milliseconds.
+Tested at **N=30** (target fleet size) and **N=50** (headroom), release build: daemon RSS 150-250MB (under the 500MB budget, dominated by scrollback buffers not fleet size), daemon CPU under ~17% of one core with two simultaneous watchers, spawn latency ~10-30ms mean, status-push round-trip a few ms to tens of ms (0 pushes lost), write→`Output` round trip in the tens of milliseconds.
 
-**An earlier version of this measurement had a real gap, found the hard way.** The stub used to only push small status updates — it never watched a pane or generated a `GridSnapshot`, so it never exercised the code path that turned out to matter: a real user's dogfooding session hit noticeable typing lag and general daemon sluggishness that this "clean" result completely missed. Root causes (fixed 2026-07-07): the IPC server's `new_current_thread` runtime was generating and JSON-serializing a full `GridSnapshot` (~1MB, ~60ms for a realistic 200x50 terminal, measured — see `ipc::protocol::tests::grid_snapshot_json_size_for_a_realistic_terminal_matches_the_known_cost`) *inline* on the async task, stalling every connection on the daemon for that whole duration on every dirty tick, not just the watched pane; and the TUI's own poll interval plus the daemon's dirty-check poll (both 80-100ms) stacked additively on every keystroke round trip. Fixed via `spawn_blocking` (frees the single executor thread) and tightening both polls to 16ms. A follow-up correctness fix (2026-07-08): the per-session dirty flag was a *consumed* bool, so two connections watching the same agent raced to steal each other's update; replaced with a per-session generation counter (`SessionManager::generation`, an `AtomicU64` bumped on `Event::Wakeup`) that each connection compares against its own last-sent value, so every watcher sees every update. `resize_all` (below) got the same `spawn_blocking` treatment as the snapshot path, for the same reason.
-
-Re-measured 2026-07-08 with `stress.sh` upgraded to actually exercise this path (a chatty watched pane live during, not after, the load window, plus daemon CPU% sampling): the fixes above are sufficient at the target fleet size. A compact binary wire encoding for the attach stream was considered (the JSON serialize/parse cost was a real theoretical concern) and isn't currently justified — measured daemon CPU stays low and the round trip stays in the tens of milliseconds even under sustained full-rate streaming with two watchers. Rerun `scripts/stress.sh [N] [lines_per_sec]` if a future report suggests otherwise.
-
-**One structural consequence worth knowing, not fully fixing:** every agent's PTY is resized to one shared rect (`SessionManager::resize_all`) — a TUI resize locks and resizes every live `Term` serially. It no longer stalls *other* connections (moved to `spawn_blocking`, same fix as the snapshot path), but it's still O(agents) work for the resizing connection itself. Revisit (resize only the watched `Term` eagerly and others lazily) only if a future measurement at a larger N actually shows it.
+**One structural caveat:** every agent's PTY is resized to one shared rect (`SessionManager::resize_all`) — O(agents) work for the resizing connection (doesn't stall others; runs on `spawn_blocking`). Revisit only if a larger-N measurement shows it mattering. Rerun `scripts/stress.sh` after touching the daemon's hot paths.
 
 ---
 
 ## Specs & Planning Docs
 
-Implementation plans (`PHASE*.md`) and research notes live in **`.specs/`**, which is **gitignored** — they are local working documents that drive development, not part of the distributed repo. Every new spec/phase plan goes into `.specs/`; never commit one to the repo root, and never reference a spec from code or committed docs — once a phase ships, its spec is disposable and the code/AGENTS.md must stand on their own.
+Implementation plans and research notes live in **`.specs/`**, which is **gitignored** — local working documents, not part of the distributed repo. Never commit one to the repo root, and never reference a spec from code or committed docs — once a phase ships, the code/AGENTS.md must stand on their own.
 
 ---
 
 ## Best Practices
 
-- **IPC is the only shared channel.** Agent ↔ overseer communication always goes through the Unix socket. Never write to shared in-process state from an agent context.
-- **The "no grandchildren" rule lives in the IPC server,** in the `spawn` handler. Not in the TUI, not in adapters. One place, always enforced.
-- **`SessionManager` is the only terminal-backend boundary.** No `alacritty_terminal` imports outside `session/` and the pane renderer (`ui/term_pane.rs`) — this now includes the daemon's `Term` instances, never touched from `ipc/server.rs`'s attach handling except through `SessionManager`'s own methods (`grid_snapshot`, `take_dirty`, `write`, `resize_all`).
-- **Parse functions are pure.** Functions like `parse_session_line` take a `&str` and return a value — no process spawning, no I/O. This makes them trivially testable.
-- **`AgentNode` is a data model, not a handle.** It does not own a PTY. Session handles live in `SessionManager`, keyed by `AgentId`. Overseer holds no worktree state at all — that's the agent's.
-- **Status is push, not pull.** Agent hooks POST status changes to the socket; the daemon POSTs registry/output events to attach clients the same way. Overseer never infers status from PTY output, and the TUI never polls the daemon for tree state.
-- **`ui/` is a render layer only.** No business logic. All state mutations go through `App` / `AgentTree` / `SessionManager` methods.
-- **One code path per request, regardless of backend.** `App::dispatch`/`with_tree`/`write_input`/etc. branch on `Backend::{Mock, Daemon}` in exactly one place (`app.rs`) — `tui.rs` and `ui/` call the same methods either way and never match on the backend themselves (bar the one `PaneSource` translation in `run_app`, which is `ui`-shape glue, not business logic).
+- **IPC is the only shared channel.** Agent ↔ overseer communication always goes through the Unix socket — never shared in-process state from an agent context.
+- **The "no grandchildren" rule lives in the IPC server,** in the `spawn` handler. Not the TUI, not adapters. One place, always enforced.
+- **`alacritty_terminal` lives only in `session/pty.rs`.** `SessionManager`'s public method set — `launch`, `kill`, `write`, `resize_all`, `is_alive`, `scroll_display`, `scroll_to_bottom`, `display_offset`, `grid_snapshot`, `term_modes`, `generation`, `drain_exits` — is the entire terminal-backend contract; every signature uses only `GridSnapshot`/`TermModes`/std types. Swapping the backend means rewriting that one file, not chasing leaks through `ui/` and `ipc/`.
+- **Parse functions are pure.** E.g. `parse_session_line` takes a `&str`, returns a value — no process spawning, no I/O. Trivially testable.
+- **`AgentNode` is a data model, not a handle.** No PTY ownership. Session handles live in `SessionManager`, keyed by `AgentId`. Overseer holds no worktree state — that's the agent's.
+- **Status is push, not pull.** Agent hooks POST status changes; the daemon POSTs registry/output events to attach clients the same way. Overseer never infers status from PTY output; the TUI never polls for tree state.
+- **`ui/` is a render layer only.** No business logic. State mutations go through `App` / `AgentTree` / `SessionManager`.
+- **One code path per request, regardless of backend.** `App::dispatch`/`with_tree`/`write_input`/etc. branch on `Backend::{Mock, Daemon}` in exactly one place (`app.rs`) — `tui.rs`/`ui/` call the same methods either way (bar the one `pane_grid` lookup in `run_app`, which is `ui`-shape glue, not business logic).
 
 ## What to Avoid
 
-- **No MCP transport.** The choice of Unix socket + hooks is intentional — no token overhead, no plugin registry approval, works locally out of the box.
-- **Don't let children spawn children.** It's a hard server-side constraint, not a UI hint. A child calling `spawn` is rejected, full stop. The tree is exactly two levels: roots and their children.
-- **Don't hardcode adapter binary paths.** Always resolve through the adapter config so users can point to a custom binary or wrapper.
-- **Don't add agent status polling.** If hooks aren't firing, the fix is in `overseer install` (the installed hooks), not in adding a background poller. Same rule for the TUI itself — if it's missing tree updates, the fix is in the registry's broadcast or the attach connection, not a poll loop.
-- **Don't reimplement git.** No worktree creation, no branching, no merging, no `git worktree` anywhere. Agents own their isolation. Overseer's only git use is read-only display info (repo name, current branch).
-- **Don't write into the user's repo.** All agent config (skill, hooks) is installed at the user level by `overseer install`. Launch injects env only.
-- **Don't skip the confirm prompt for `d`/`D`/`Q`.** Killing a running agent's session (or the whole daemon) interrupts in-flight work — confirm first.
-- **Don't make quitting kill agents.** `q`/`Ctrl-C` must exit the TUI without touching any session or the daemon — it's a detach. `d`/`D` kills one agent, `Q` kills everything plus the daemon; both are deliberate, both confirm.
-- **Don't add a second way to end the daemon process.** `Request::Shutdown`'s handler asks `ipc::server::run`'s accept loop to stop and lets `main` return — no `std::process::exit`. A response that's still in flight when the process exits is a real bug (confirmed once via `tokio::sync::Notify::notify_waiters` losing a wake under exactly this race — use `notify_one`, which stores a permit, for any future "tell the other task to stop" signal here).
-- **Don't add a `Request::Drop`-with-a-flag for root drops.** Root-allowed drop is `Request::TuiDrop`, a distinct wire request only the TUI's key handling constructs — a caller-supplied bool on the existing `Drop` request would let any script opt out of the restriction it exists to enforce.
-- **Don't assume `alacritty_terminal` exposes raw PTY bytes.** It doesn't, not without reimplementing its mio/signalfd event loop — that's why the attach protocol streams rendered `GridSnapshot`s instead of bytes for a client-side `Term`. Re-verify against the installed version before trying the raw-byte approach again; if a future version adds a public tap, that's a contained change to `session::pty` + `ipc::protocol`, not a redesign.
+- **No MCP transport.** Unix socket + hooks is intentional — no token overhead, no plugin registry approval, works locally out of the box.
+- **Don't let children spawn children.** A hard server-side constraint, not a UI hint — a child calling `spawn` is rejected, full stop.
+- **Don't hardcode adapter binary paths.** Always resolve through adapter config so users can point to a custom binary or wrapper.
+- **Don't add agent status polling.** If hooks aren't firing, fix `overseer install`, not a background poller. Same for the TUI — missing tree updates get fixed in the registry's broadcast or the attach connection.
+- **Don't reimplement git.** No worktree creation, branching, or merging. Agents own their isolation; Overseer's only git use is read-only display info.
+- **Don't write into the user's repo.** All agent config is installed at the user level by `overseer install`. Launch injects env only.
+- **Don't skip the confirm prompt for `d`/`D`/`Q`.** Killing a session (or the whole daemon) interrupts in-flight work.
+- **Don't make quitting kill agents.** `q`/`Ctrl-C` is a detach, never touches a session or the daemon. `d`/`D` kills one agent, `Q` kills everything plus the daemon; both confirm.
+- **Don't add a second way to end the daemon process.** `Request::Shutdown` asks the accept loop to stop and lets `main` return — no `std::process::exit`. A response still in flight when the process exits is a real bug (once caused by `tokio::sync::Notify::notify_waiters` losing a wake under this exact race — use `notify_one`, which stores a permit, for any future stop-signal here).
+- **Don't add a `Request::Drop`-with-a-flag for root drops.** Root-allowed drop is `Request::TuiDrop`, a distinct wire request only the TUI's key handling constructs — a caller-supplied bool would let any script opt out of the restriction it exists to enforce.
+- **Don't assume `alacritty_terminal` exposes raw PTY bytes.** It doesn't, not without reimplementing its mio/signalfd event loop — that's why the attach protocol streams rendered `GridSnapshot`s instead. Re-verify against the installed version before retrying; a future public tap would be a contained change to `session::pty` + `ipc::protocol`, not a redesign.
