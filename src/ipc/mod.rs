@@ -355,6 +355,19 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    // ── F5: socket file mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn bound_socket_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket = start_server();
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the socket node itself must be owner-only regardless of umask");
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[test]
     fn lifecycle_error_get_unknown_agent() {
         let socket = start_server();

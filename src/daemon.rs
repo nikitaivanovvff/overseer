@@ -9,7 +9,7 @@
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,12 +40,67 @@ pub fn default_socket_path() -> PathBuf {
     default_socket_dir().join("daemon.sock")
 }
 
+/// Creates (or validates) the socket's parent directory as owner-only.
+///
+/// A naive `create_dir_all` + unconditional `set_permissions(0o700)`
+/// (the previous implementation) trusts whatever is already at this
+/// predictable, well-known path (SECURITY-AUDIT.md F3): a local attacker can
+/// pre-create `/tmp/overseer-$UID` before this user's daemon ever runs, as a
+/// directory they own (making the later chmod a denial of service once it
+/// hits `EPERM`) or as a symlink to a path they control (making the chmod
+/// silently repoint onto whatever that link targets). So a pre-existing
+/// directory is validated, never blindly chmod-ed.
 fn ensure_socket_dir(socket: &Path) -> Result<()> {
-    if let Some(dir) = socket.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to set permissions on {}", dir.display()))?;
+    let Some(dir) = socket.parent() else { return Ok(()) };
+
+    if let Some(parent) = dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
     }
+
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {
+            // `.mode()` is still subject to umask; pin it exactly rather than
+            // rely on the caller's umask happening to leave 0700 intact.
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to set permissions on {}", dir.display()))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => validate_socket_dir(dir),
+        Err(e) => Err(e).with_context(|| format!("failed to create {}", dir.display())),
+    }
+}
+
+/// Validates a pre-existing socket directory rather than trusting it: must be
+/// a real directory (not a symlink), owned by this process's own uid, and
+/// mode exactly `0700`. Refuses to start otherwise (SECURITY-AUDIT.md F3) —
+/// better to fail loudly here than hand a socket to a directory an attacker
+/// planted or still has access to.
+fn validate_socket_dir(dir: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(dir).with_context(|| format!("failed to stat {}", dir.display()))?;
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "{} is a symlink -- refusing to use it as the daemon socket directory",
+        dir.display()
+    );
+    anyhow::ensure!(meta.is_dir(), "{} exists and is not a directory", dir.display());
+
+    let uid = unsafe { libc::getuid() };
+    anyhow::ensure!(
+        meta.uid() == uid,
+        "{} is owned by uid {} (this process is uid {uid}) -- refusing to use a socket directory this user doesn't own",
+        dir.display(),
+        meta.uid()
+    );
+
+    let mode = meta.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode == 0o700,
+        "{} has mode {mode:03o} (expected 0700) -- refusing to use a socket directory with looser permissions",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -227,6 +282,45 @@ mod tests {
         let dir = socket.parent().unwrap();
         let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── F3: validating (not blindly trusting) a pre-existing socket dir ──────
+
+    #[test]
+    fn ensure_socket_dir_is_idempotent_across_daemon_restarts() {
+        let socket = unique_test_socket("restart");
+        ensure_socket_dir(&socket).expect("first run creates it");
+        ensure_socket_dir(&socket).expect("second run must re-validate and accept its own directory");
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn ensure_socket_dir_rejects_a_symlinked_directory() {
+        let socket = unique_test_socket("symlink");
+        let dir = socket.parent().unwrap().to_path_buf();
+        let real_target = unique_test_socket("symlink-target");
+        let real_dir = real_target.parent().unwrap();
+        fs::create_dir_all(real_dir).unwrap();
+
+        std::os::unix::fs::symlink(real_dir, &dir).expect("failed to create test symlink");
+
+        let result = ensure_socket_dir(&socket);
+        assert!(result.is_err(), "a symlinked socket dir must be rejected, not chmod-ed through");
+
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_dir_all(real_dir);
+    }
+
+    #[test]
+    fn ensure_socket_dir_rejects_a_preexisting_dir_with_looser_permissions() {
+        let socket = unique_test_socket("looseperm");
+        let dir = socket.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let result = ensure_socket_dir(&socket);
+        assert!(result.is_err(), "a pre-existing world-writable socket dir must be rejected");
         let _ = std::fs::remove_dir_all(dir);
     }
 

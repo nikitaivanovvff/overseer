@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -107,6 +107,12 @@ pub async fn run(
     }
 
     let listener = UnixListener::bind(&socket)?;
+    // The bound socket node otherwise inherits whatever the process umask
+    // allows -- the parent directory's 0700 mode (`daemon::ensure_socket_dir`)
+    // is the only thing actually restricting cross-user access today.
+    // Pin the node itself to owner-only too, in case that directory is ever
+    // undermined (SECURITY-AUDIT.md F5).
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     if let Some(tx) = ready {
         let _ = tx.send(());
     }
