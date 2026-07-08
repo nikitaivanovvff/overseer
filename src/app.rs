@@ -165,24 +165,21 @@ impl App {
         }
     }
 
-    /// The `TermMode` bits `session::keys::encode_key`/`encode_paste` need to
-    /// encode a keystroke/paste correctly (application-cursor arrows,
-    /// bracketed paste). Mock mode reads its local `Term` directly; daemon
-    /// mode rebuilds it from the last received `GridSnapshot`'s flags.
-    pub fn term_mode(&self, id: &AgentId) -> alacritty_terminal::term::TermMode {
+    /// The `TermModes` bits `session::keys::encode_key`/`encode_paste` need
+    /// to encode a keystroke/paste correctly (application-cursor arrows,
+    /// bracketed paste). Mock mode reads its local `Term` directly (via
+    /// `SessionManager::term_modes`); daemon mode rebuilds the same struct
+    /// from the last received `GridSnapshot`'s two bools.
+    pub fn term_modes(&self, id: &AgentId) -> crate::session::keys::TermModes {
         match &self.backend {
-            Backend::Mock(ctx) => {
-                ctx.0.sessions.with_term(id, |term| *term.mode()).unwrap_or_default()
-            }
+            Backend::Mock(ctx) => ctx.0.sessions.term_modes(id),
             Backend::Daemon(state) => state
                 .grid
                 .as_ref()
                 .filter(|(gid, _)| gid == id)
-                .map(|(_, grid)| {
-                    crate::session::keys::term_mode_from_flags(
-                        grid.app_cursor_mode,
-                        grid.bracketed_paste_mode,
-                    )
+                .map(|(_, grid)| crate::session::keys::TermModes {
+                    app_cursor: grid.app_cursor_mode,
+                    bracketed_paste: grid.bracketed_paste_mode,
                 })
                 .unwrap_or_default(),
         }
@@ -237,15 +234,20 @@ impl App {
         }
     }
 
-    /// The watched agent's most recently received rendered grid, for
-    /// `ui::term_pane` to paint in daemon mode. `None` in mock mode (or
-    /// before the first grid arrives).
-    pub fn watched_grid(&self, id: &AgentId) -> Option<&GridSnapshot> {
+    /// `id`'s current rendered grid, for `ui::term_pane` to paint —
+    /// `GridSnapshot` is the only render currency in both modes. Mock mode
+    /// asks `SessionManager` directly (same method the daemon's own attach
+    /// loop calls server-side); daemon mode returns the last grid streamed
+    /// for this connection's watched agent, `None` before the first one
+    /// arrives (or if `id` isn't the watched agent).
+    pub fn pane_grid(&self, id: &AgentId) -> Option<GridSnapshot> {
         match &self.backend {
-            Backend::Mock(_) => None,
-            Backend::Daemon(state) => {
-                state.grid.as_ref().filter(|(gid, _)| gid == id).map(|(_, grid)| grid)
-            }
+            Backend::Mock(ctx) => ctx.0.sessions.grid_snapshot(id),
+            Backend::Daemon(state) => state
+                .grid
+                .as_ref()
+                .filter(|(gid, _)| gid == id)
+                .map(|(_, grid)| grid.clone()),
         }
     }
 

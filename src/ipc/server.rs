@@ -269,12 +269,12 @@ async fn handle_attach(
     });
 
     // Streams the watched agent's rendered terminal grid, throttled to a
-    // content-generation poll (see `session::pty::EventProxy` —
-    // `alacritty_terminal` 0.26 has no raw-byte tap without reimplementing
-    // its event loop, so this is the "hard part" from DAEMON.md's design,
-    // adapted). Compares against this connection's own `last_sent_gen`
-    // rather than consuming a shared flag (F3), so a second connection
-    // watching the same agent doesn't starve this one.
+    // content-generation poll (see `session::pty::EventProxy` — the terminal
+    // emulator crate has no raw-byte tap without reimplementing its event
+    // loop, so this polls rendered content instead of streaming raw PTY
+    // bytes). Compares against this connection's own `last_sent_gen` rather
+    // than consuming a shared flag (F3), so a second connection watching the
+    // same agent doesn't starve this one.
     let output_task = tokio::spawn({
         let write_half = write_half.clone();
         let watch = watch.clone();

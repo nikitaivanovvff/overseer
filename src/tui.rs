@@ -24,7 +24,6 @@ use crate::ipc::protocol::Request;
 use crate::ipc::AppCtx;
 use crate::session::{self, SessionManager};
 use crate::ui;
-use crate::ui::PaneSource;
 
 pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let default_panic = std::panic::take_hook();
@@ -121,8 +120,8 @@ fn run_app<B: ratatui::backend::Backend>(
         let tick = app.tick;
 
         // The selected agent drives which one streams to the pane — mock
-        // mode's `render_term_pane` reads `SessionManager` directly by id, so
-        // this only does real work in daemon mode (`App::watch` no-ops
+        // mode's `App::pane_grid` reads `SessionManager` directly by id every
+        // frame, so `watch` only does real work in daemon mode (it no-ops
         // otherwise). "Switching on cursor move" (DAEMON.md) lives here.
         let selected_id = app.with_tree(|t| t.selected()).map(|n| n.id);
         match &selected_id {
@@ -153,12 +152,7 @@ fn run_app<B: ratatui::backend::Backend>(
         let prompt = build_prompt(app);
         let input = app.input.as_ref();
         let pane_focused = app.focus == Focus::Pane;
-        let pane_source = match &app.backend {
-            Backend::Mock(ctx) => PaneSource::Local(&ctx.0.sessions),
-            Backend::Daemon(_) => {
-                PaneSource::Remote(selected_id.as_ref().and_then(|id| app.watched_grid(id)))
-            }
-        };
+        let pane_grid = selected_id.as_ref().and_then(|id| app.pane_grid(id));
         let mut pane_rect = Rect::default();
         app.with_tree(|tree| {
             terminal.draw(|f| {
@@ -168,7 +162,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     tick,
                     prompt.as_deref(),
                     input,
-                    &pane_source,
+                    pane_grid.as_ref(),
                     pane_focused,
                     theme,
                     keybindings,
@@ -396,7 +390,7 @@ fn handle_pane_key(app: &mut App, key: KeyEvent) {
         app.focus = Focus::Tree;
         return;
     };
-    let mode = app.term_mode(&id);
+    let mode = app.term_modes(&id);
     if let Some(bytes) = session::keys::encode_key(&key, mode) {
         app.write_input(&id, bytes);
     }
@@ -404,7 +398,7 @@ fn handle_pane_key(app: &mut App, key: KeyEvent) {
 
 fn forward_paste(app: &mut App, text: &str) {
     let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else { return };
-    let mode = app.term_mode(&id);
+    let mode = app.term_modes(&id);
     let bytes = session::keys::encode_paste(text, mode);
     app.write_input(&id, bytes);
 }

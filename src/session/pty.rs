@@ -19,6 +19,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
 use crate::agent::AgentId;
 use crate::ipc::protocol::{CellDto, ColorDto, GridSnapshot};
+use crate::session::keys::TermModes;
 
 /// Scrollback cap — bounds memory for long-running agents.
 const SCROLLBACK_LINES: usize = 10_000;
@@ -309,12 +310,32 @@ impl SessionManager {
         }
     }
 
-    /// Briefly locks the selected agent's `Term` for rendering (Task 2).
-    pub fn with_term<R>(&self, id: &AgentId, f: impl FnOnce(&AgentTerm) -> R) -> Option<R> {
+    /// Briefly locks the selected agent's `Term` for rendering. Private —
+    /// this is the one seam that may touch `AgentTerm` directly; every public
+    /// method on `SessionManager` built from it (`display_offset`,
+    /// `grid_snapshot`, `term_modes`) only ever hands out backend-neutral
+    /// types, which is what keeps `alacritty_terminal` from crossing this
+    /// module's boundary.
+    fn with_term<R>(&self, id: &AgentId, f: impl FnOnce(&AgentTerm) -> R) -> Option<R> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions.get(id)?;
         let term = session.term.lock();
         Some(f(&term))
+    }
+
+    /// The neutral `TermModes` mock mode's local `Term` currently has set —
+    /// the `with_term`-backed twin of `App::term_modes`'s daemon branch,
+    /// which instead derives the same struct from a streamed `GridSnapshot`'s
+    /// two bools. `Default` (both `false`) for an unknown id.
+    pub fn term_modes(&self, id: &AgentId) -> TermModes {
+        self.with_term(id, |term| {
+            let mode = term.mode();
+            TermModes {
+                app_cursor: mode.contains(TermMode::APP_CURSOR),
+                bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            }
+        })
+        .unwrap_or_default()
     }
 
     /// Scrolls `id`'s terminal history — positive `delta` moves up (further
@@ -339,6 +360,11 @@ impl SessionManager {
 
     /// How far `id`'s terminal is currently scrolled up from the live bottom
     /// (`0` = live). `0` for an unknown id too — nothing to report either way.
+    /// Part of `SessionManager`'s documented public contract even though the
+    /// pane renderer now reads the same value off `GridSnapshot::display_offset`
+    /// instead of calling this directly — kept public and exercised by this
+    /// module's own scroll tests.
+    #[allow(dead_code)]
     pub fn display_offset(&self, id: &AgentId) -> usize {
         self.with_term(id, |term| term.grid().display_offset()).unwrap_or(0)
     }
@@ -390,10 +416,9 @@ impl Default for SessionManager {
 }
 
 /// Pure — extracts a full `GridSnapshot` from `term`'s current renderable
-/// content. Mirrors `ui::term_pane::paint_term`'s cell iteration (wide-char
-/// spacers stay `None`, same flag/color handling) but builds a wire DTO
-/// instead of painting into a ratatui buffer, since the daemon can't hand a
-/// live `Term` across the process boundary.
+/// content, for `ui::term_pane::paint_grid_snapshot` to paint — the only path
+/// out of this module for terminal content, since a live `Term` can't cross
+/// the daemon's process boundary.
 fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
     let cols = term.columns();
     let lines = term.screen_lines();
@@ -443,9 +468,10 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
     }
 }
 
-/// Pure — the wire-side twin of `ui::term_pane::map_color`, targeting
-/// `ColorDto` instead of `ratatui::style::Color` so `session::pty` never
-/// needs a `ratatui` dependency.
+/// Pure — maps an alacritty color to `ColorDto`, the wire-neutral twin of
+/// `ui::term_pane::map_dto_color`'s reverse mapping. Targets `ColorDto`
+/// instead of `ratatui::style::Color` so `session::pty` never needs a
+/// `ratatui` dependency.
 fn dto_color(color: AnsiColor) -> ColorDto {
     match color {
         AnsiColor::Spec(rgb) => ColorDto::Rgb(rgb.r, rgb.g, rgb.b),
@@ -470,6 +496,43 @@ fn dto_color(color: AnsiColor) -> ColorDto {
             _ => ColorDto::Reset,
         },
     }
+}
+
+/// Test-support only: the "bytes → `GridSnapshot`" helper that lets
+/// `ui::term_pane`'s tests assert against painted `GridSnapshot`s (same
+/// fidelity as feeding a real `Term`) without an `alacritty_terminal` import
+/// of their own. Feeds `bytes` through a throwaway `Term`, applies a scroll
+/// (`Scroll::Delta(scroll_delta)`, then `Scroll::Bottom` if `then_bottom`),
+/// and returns the resulting snapshot.
+#[cfg(test)]
+pub(crate) fn snapshot_from_bytes_scrolled(
+    cols: usize,
+    lines: usize,
+    bytes: &[u8],
+    scroll_delta: i32,
+    then_bottom: bool,
+) -> GridSnapshot {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    let size = GridSize { cols, lines };
+    let mut term = Term::new(TermConfig::default(), &size, VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, bytes);
+    if scroll_delta != 0 {
+        term.scroll_display(Scroll::Delta(scroll_delta));
+    }
+    if then_bottom {
+        term.scroll_display(Scroll::Bottom);
+    }
+    grid_snapshot_from_term(&term)
+}
+
+/// Test-support only: `snapshot_from_bytes_scrolled` with no scrolling — the
+/// live/unscrolled snapshot.
+#[cfg(test)]
+pub(crate) fn snapshot_from_bytes(cols: usize, lines: usize, bytes: &[u8]) -> GridSnapshot {
+    snapshot_from_bytes_scrolled(cols, lines, bytes, 0, false)
 }
 
 #[cfg(test)]

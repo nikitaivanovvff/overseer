@@ -155,9 +155,8 @@ pub enum AttachEvent {
 
 /// A rendered terminal color, wire-compatible mirror of `ratatui::style::Color`'s
 /// variants (minus its own `Reset`-adjacent aliasing) so the daemon can convert
-/// from `alacritty_terminal`'s `AnsiColor` without either side depending on the
-/// other's color type. See `session::pty::dto_color` / `ui::term_pane`'s
-/// `impl From<ColorDto> for Color`.
+/// from the terminal emulator's own color type without either side depending
+/// on the other's. See `session::pty::dto_color` / `ui::term_pane::map_dto_color`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorDto {
     Reset,
@@ -181,9 +180,10 @@ pub enum ColorDto {
     Indexed(u8),
 }
 
-/// One rendered grid cell — the wire counterpart of `ui::term_pane::paint_term`'s
-/// per-cell styling, minus the wide-char-spacer bookkeeping (a spacer cell is
-/// simply `None` in `GridSnapshot::cells`).
+/// One rendered grid cell — the wire counterpart of
+/// `ui::term_pane::paint_grid_snapshot`'s per-cell styling, minus the
+/// wide-char-spacer bookkeeping (a spacer cell is simply `None` in
+/// `GridSnapshot::cells`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CellDto {
     pub ch: char,
@@ -196,9 +196,9 @@ pub struct CellDto {
 }
 
 /// A full rendered snapshot of one agent's terminal, streamed in place of raw
-/// PTY bytes (see `session::pty` for why: `alacritty_terminal` 0.26 doesn't
+/// PTY bytes (see `session::pty` for why: the terminal emulator crate doesn't
 /// expose raw incoming bytes without reimplementing its mio/signalfd event
-/// loop). The client paints this directly — no local `Term` needed.
+/// loop). The client paints this directly — no local terminal state needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridSnapshot {
     pub cols: u16,

@@ -1,7 +1,3 @@
-use alacritty_terminal::event::EventListener;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -12,36 +8,22 @@ use ratatui::{
 
 use crate::agent::{AgentStatus, FlatNode};
 use crate::ipc::protocol::{ColorDto, GridSnapshot};
-use crate::session::SessionManager;
-
-/// Where `render_term_pane` gets the selected agent's terminal content from.
-/// Mock mode holds a live `Term` locally (`Local`); real (daemon-attached)
-/// mode only ever has the last `GridSnapshot` the daemon streamed for the
-/// watched agent (`Remote`) — there's no local `Term` to read from across
-/// the process boundary (see `session::pty` for why raw bytes aren't
-/// streamed instead).
-pub enum PaneSource<'a> {
-    Local(&'a SessionManager),
-    Remote(Option<&'a GridSnapshot>),
-}
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
-/// half of the tree|pane split. `focused` draws the cursor
-/// and a distinct border; read-only preview otherwise. Returns the inner
+/// half of the tree|pane split. `grid` is the selected agent's current
+/// rendered content, `None` if it has none yet (or isn't running); `--mock`
+/// and daemon-attached modes both feed this from `App::pane_grid` — `ui/`
+/// never sees anything backend-specific. `focused` draws the cursor and a
+/// distinct border; read-only preview otherwise. Returns the inner
 /// (border-excluded) rect actually painted, so callers can size the PTY to it.
 pub fn render_term_pane(
     frame: &mut Frame,
     area: Rect,
-    source: &PaneSource,
+    grid: Option<&GridSnapshot>,
     selected: Option<&FlatNode>,
     focused: bool,
 ) -> Rect {
-    let id = selected.map(|n| &n.id);
-    let offset = match (source, id) {
-        (PaneSource::Local(sessions), Some(id)) => sessions.display_offset(id),
-        (PaneSource::Remote(Some(grid)), Some(_)) => grid.display_offset,
-        _ => 0,
-    };
+    let offset = grid.map(|g| g.display_offset).unwrap_or(0);
     // A session that exits naturally (not via `d`/`D`) keeps its last
     // rendered content around for review — by design (AGENTS.md Cleanup),
     // not a bug — but with no marker at all, a pane the user is still
@@ -54,25 +36,14 @@ pub fn render_term_pane(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(id) = id else {
+    if selected.is_none() {
         frame.render_widget(placeholder("no agent selected"), inner);
         return inner;
-    };
+    }
 
-    let painted = match source {
-        PaneSource::Local(sessions) => {
-            sessions.with_term(id, |term| paint_term(term, inner, frame.buffer_mut(), focused)).is_some()
-        }
-        PaneSource::Remote(grid) => match grid {
-            Some(grid) => {
-                paint_grid_snapshot(grid, inner, frame.buffer_mut(), focused);
-                true
-            }
-            None => false,
-        },
-    };
-    if !painted {
-        frame.render_widget(placeholder("agent not running"), inner);
+    match grid {
+        Some(grid) => paint_grid_snapshot(grid, inner, frame.buffer_mut(), focused),
+        None => frame.render_widget(placeholder("agent not running"), inner),
     }
     inner
 }
@@ -99,99 +70,10 @@ fn pane_title(focused: bool, display_offset: usize, alive: bool) -> String {
     }
 }
 
-/// Pure grid->buffer painter — the direct unit-test seam: feed
-/// canned escape sequences into a `Term`, call this, assert buffer cells.
-/// Generic over `EventListener` so tests can use `VoidListener` without
-/// constructing a real `EventProxy`.
-pub fn paint_term<T: EventListener>(term: &Term<T>, area: Rect, buf: &mut Buffer, show_cursor: bool) {
-    let content = term.renderable_content();
-    let cols = area.width as usize;
-    let lines = area.height as usize;
-
-    for cell in content.display_iter {
-        let point = cell.point;
-        if point.line.0 < 0 {
-            continue;
-        }
-        let row = point.line.0 as usize;
-        let col = point.column.0;
-        if row >= lines || col >= cols {
-            continue;
-        }
-
-        // Wide chars occupy two grid cells; the spacer cell renders nothing
-        // (drawing it would double-print and shear the following column).
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-
-        let x = area.x + col as u16;
-        let y = area.y + row as u16;
-        let ch = if cell.c == '\0' { ' ' } else { cell.c };
-        let mut style = Style::default().fg(map_color(cell.fg)).bg(map_color(cell.bg));
-
-        if cell.flags.contains(Flags::BOLD) {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if cell.flags.contains(Flags::ITALIC) {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        if cell.flags.contains(Flags::UNDERLINE) {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
-        if cell.flags.contains(Flags::INVERSE) {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-
-        let target = &mut buf[(x, y)];
-        target.set_char(ch);
-        target.set_style(style);
-    }
-
-    if show_cursor {
-        let cursor = content.cursor.point;
-        if cursor.line.0 >= 0 {
-            let row = cursor.line.0 as usize;
-            let col = cursor.column.0;
-            if row < lines && col < cols {
-                let x = area.x + col as u16;
-                let y = area.y + row as u16;
-                buf[(x, y)].set_style(Style::default().add_modifier(Modifier::REVERSED));
-            }
-        }
-    }
-}
-
-fn map_color(color: AnsiColor) -> Color {
-    match color {
-        AnsiColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
-        AnsiColor::Indexed(idx) => Color::Indexed(idx),
-        AnsiColor::Named(named) => match named {
-            NamedColor::Black => Color::Black,
-            NamedColor::Red => Color::Red,
-            NamedColor::Green => Color::Green,
-            NamedColor::Yellow => Color::Yellow,
-            NamedColor::Blue => Color::Blue,
-            NamedColor::Magenta => Color::Magenta,
-            NamedColor::Cyan => Color::Cyan,
-            NamedColor::White => Color::White,
-            NamedColor::BrightBlack => Color::DarkGray,
-            NamedColor::BrightRed => Color::LightRed,
-            NamedColor::BrightGreen => Color::LightGreen,
-            NamedColor::BrightYellow => Color::LightYellow,
-            NamedColor::BrightBlue => Color::LightBlue,
-            NamedColor::BrightMagenta => Color::LightMagenta,
-            NamedColor::BrightCyan => Color::LightCyan,
-            NamedColor::BrightWhite => Color::White,
-            _ => Color::Reset,
-        },
-    }
-}
-
-/// The wire-side twin of `map_color`, above — converts the daemon's
-/// `ColorDto` (built server-side by `session::pty::dto_color`) back into a
-/// `ratatui::style::Color`. A mechanical 1:1 mapping since `ColorDto` was
-/// deliberately shaped to mirror `Color`'s own variants.
+/// Converts the daemon's `ColorDto` (built server-side by
+/// `session::pty::dto_color`) into a `ratatui::style::Color`. A mechanical
+/// 1:1 mapping since `ColorDto` was deliberately shaped to mirror `Color`'s
+/// own variants.
 fn map_dto_color(color: ColorDto) -> Color {
     match color {
         ColorDto::Reset => Color::Reset,
@@ -216,9 +98,10 @@ fn map_dto_color(color: ColorDto) -> Color {
     }
 }
 
-/// Paints a `GridSnapshot` (the daemon's rendered-grid DTO) into `buf` —
-/// the `Remote`-source twin of `paint_term`, same cell-by-cell styling, just
-/// reading from a plain data snapshot instead of a live `Term`.
+/// Paints a `GridSnapshot` into `buf`, cell by cell — the only painter in
+/// `ui/`, for both `--mock` and daemon-attached modes (`GridSnapshot` is the
+/// only render currency; see `session::pty::grid_snapshot_from_term` for how
+/// it's built).
 pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, show_cursor: bool) {
     let cols = area.width as usize;
     let lines = area.height as usize;
@@ -262,43 +145,14 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::term::Config as TermConfig;
-    use alacritty_terminal::vte::ansi::Processor;
-
-    #[derive(Clone, Copy)]
-    struct TestSize {
-        cols: usize,
-        lines: usize,
-    }
-
-    impl Dimensions for TestSize {
-        fn total_lines(&self) -> usize {
-            self.lines
-        }
-        fn screen_lines(&self) -> usize {
-            self.lines
-        }
-        fn columns(&self) -> usize {
-            self.cols
-        }
-    }
-
-    fn term_from(bytes: &[u8], cols: usize, lines: usize) -> Term<VoidListener> {
-        let size = TestSize { cols, lines };
-        let mut term = Term::new(TermConfig::default(), &size, VoidListener);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, bytes);
-        term
-    }
+    use crate::session::snapshot_from_bytes;
 
     #[test]
     fn plain_text_renders_into_top_left() {
-        let term = term_from(b"hi", 10, 3);
+        let grid = snapshot_from_bytes(10, 3, b"hi");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_term(&term, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false);
         assert_eq!(buf[(0, 0)].symbol(), "h");
         assert_eq!(buf[(1, 0)].symbol(), "i");
         assert_eq!(buf[(2, 0)].symbol(), " ");
@@ -307,10 +161,10 @@ mod tests {
     #[test]
     fn sgr_bold_and_color_are_mapped() {
         // \x1b[1;31m = bold + red foreground
-        let term = term_from(b"\x1b[1;31mX", 10, 3);
+        let grid = snapshot_from_bytes(10, 3, b"\x1b[1;31mX");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_term(&term, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false);
         let cell = &buf[(0, 0)];
         assert_eq!(cell.symbol(), "X");
         assert_eq!(cell.fg, Color::Red);
@@ -320,10 +174,10 @@ mod tests {
     #[test]
     fn wide_char_spacer_is_not_drawn_over() {
         // U+4F60 ("你") is a double-width CJK character.
-        let term = term_from("你".as_bytes(), 10, 3);
+        let grid = snapshot_from_bytes(10, 3, "你".as_bytes());
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_term(&term, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false);
         assert_eq!(buf[(0, 0)].symbol(), "你");
         // The spacer cell must stay untouched (default blank), not a stray
         // second glyph — this is the classic wide-char column-shear bug.
@@ -332,36 +186,36 @@ mod tests {
 
     #[test]
     fn cursor_is_drawn_only_when_requested() {
-        let term = term_from(b"a", 10, 3);
+        let grid = snapshot_from_bytes(10, 3, b"a");
         let area = Rect::new(0, 0, 10, 3);
 
         let mut buf_no_cursor = Buffer::empty(area);
-        paint_term(&term, area, &mut buf_no_cursor, false);
+        paint_grid_snapshot(&grid, area, &mut buf_no_cursor, false);
         assert!(!buf_no_cursor[(1, 0)].modifier.contains(Modifier::REVERSED));
 
         let mut buf_cursor = Buffer::empty(area);
-        paint_term(&term, area, &mut buf_cursor, true);
+        paint_grid_snapshot(&grid, area, &mut buf_cursor, true);
         assert!(buf_cursor[(1, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
     fn newline_moves_to_next_row() {
-        let term = term_from(b"a\r\nb", 10, 3);
+        let grid = snapshot_from_bytes(10, 3, b"a\r\nb");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_term(&term, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false);
         assert_eq!(buf[(0, 0)].symbol(), "a");
         assert_eq!(buf[(0, 1)].symbol(), "b");
     }
 
     #[test]
     fn content_outside_area_bounds_is_clipped_not_panicking() {
-        // A 3-column-tall/wide area smaller than the term's own grid: cells
-        // beyond `area` must be skipped, not indexed out of bounds.
-        let term = term_from(b"hello world this overflows", 30, 3);
+        // A 3-column-tall/wide area smaller than the grid's own dimensions:
+        // cells beyond `area` must be skipped, not indexed out of bounds.
+        let grid = snapshot_from_bytes(30, 3, b"hello world this overflows");
         let area = Rect::new(0, 0, 5, 1);
         let mut buf = Buffer::empty(area);
-        paint_term(&term, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false);
         assert_eq!(buf[(0, 0)].symbol(), "h");
         assert_eq!(buf[(4, 0)].symbol(), "o");
     }
@@ -370,7 +224,7 @@ mod tests {
 
     #[test]
     fn scroll_display_shows_older_lines_then_bottom_restores_live_content() {
-        use alacritty_terminal::grid::Scroll;
+        use crate::session::snapshot_from_bytes_scrolled;
 
         // 5 lines of visible height, but print far more so there's real
         // scrollback history to move into.
@@ -378,22 +232,22 @@ mod tests {
         for i in 0..20 {
             bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
         }
-        let mut term = term_from(&bytes, 10, 5);
 
         let area = Rect::new(0, 0, 10, 5);
+        let live = snapshot_from_bytes(10, 5, &bytes);
         let mut live_buf = Buffer::empty(area);
-        paint_term(&term, area, &mut live_buf, false);
+        paint_grid_snapshot(&live, area, &mut live_buf, false);
         let live_top: String = (0..5).map(|c| live_buf[(c, 0)].symbol()).collect();
 
-        term.scroll_display(Scroll::Delta(5));
+        let scrolled = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, false);
         let mut scrolled_buf = Buffer::empty(area);
-        paint_term(&term, area, &mut scrolled_buf, false);
+        paint_grid_snapshot(&scrolled, area, &mut scrolled_buf, false);
         let scrolled_top: String = (0..5).map(|c| scrolled_buf[(c, 0)].symbol()).collect();
         assert_ne!(scrolled_top, live_top, "scrolling up must show older content");
 
-        term.scroll_display(Scroll::Bottom);
+        let restored = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, true);
         let mut restored_buf = Buffer::empty(area);
-        paint_term(&term, area, &mut restored_buf, false);
+        paint_grid_snapshot(&restored, area, &mut restored_buf, false);
         let restored_top: String = (0..5).map(|c| restored_buf[(c, 0)].symbol()).collect();
         assert_eq!(restored_top, live_top, "scrolling back to bottom must restore the live view");
     }

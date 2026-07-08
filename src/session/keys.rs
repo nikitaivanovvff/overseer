@@ -1,31 +1,25 @@
-use alacritty_terminal::term::TermMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Reconstructs the two `TermMode` bits `encode_key`/`encode_paste` actually
-/// consult, from the flags a `GridSnapshot` carries across the wire. Daemon
-/// (real) mode has no local `Term` to call `.mode()` on directly — this is
-/// the one place that gap is bridged, keeping `app.rs`/`tui.rs` from needing
-/// their own `alacritty_terminal` import (AGENTS.md: that stays confined to
-/// `session/` and the pane renderer).
-pub fn term_mode_from_flags(app_cursor: bool, bracketed_paste: bool) -> TermMode {
-    let mut mode = TermMode::empty();
-    if app_cursor {
-        mode.insert(TermMode::APP_CURSOR);
-    }
-    if bracketed_paste {
-        mode.insert(TermMode::BRACKETED_PASTE);
-    }
-    mode
+/// The two terminal-mode bits `encode_key`/`encode_paste` actually consult,
+/// decoupled from alacritty's own `TermMode` bitflags so nothing outside
+/// `session/pty.rs` needs that crate (AGENTS.md: alacritty stays confined to
+/// `session/pty.rs`). Mock mode builds this from a local `Term`'s mode
+/// (`SessionManager::term_modes`); daemon mode builds it from the two bools a
+/// `GridSnapshot` carries across the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermModes {
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
 }
 
 /// Encodes a crossterm key event into the bytes to write to a PTY, respecting
 /// `mode` (application cursor keys). `None` for events with no PTY-meaningful
 /// encoding (e.g. a bare modifier press). This is the one component with no
 /// crate to lean on — every case here is deliberate.
-pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
+pub fn encode_key(key: &KeyEvent, mode: TermModes) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    let app_cursor = mode.app_cursor;
 
     let base: Vec<u8> = match key.code {
         KeyCode::Char(c) => encode_char(c, ctrl)?,
@@ -64,10 +58,10 @@ pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
 }
 
 /// Encodes pasted text, wrapping it in bracketed-paste markers when the
-/// agent's `Term` has that mode enabled (so e.g. Claude Code's editor doesn't
-/// treat pasted newlines as individual Enter presses).
-pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
-    if mode.contains(TermMode::BRACKETED_PASTE) {
+/// agent's terminal has that mode enabled (so e.g. Claude Code's editor
+/// doesn't treat pasted newlines as individual Enter presses).
+pub fn encode_paste(text: &str, mode: TermModes) -> Vec<u8> {
+    if mode.bracketed_paste {
         let mut out = Vec::with_capacity(text.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(text.as_bytes());
@@ -133,21 +127,6 @@ fn encode_function_key(n: u8) -> Option<&'static [u8]> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn term_mode_from_flags_both_false_is_empty() {
-        assert_eq!(term_mode_from_flags(false, false), TermMode::empty());
-    }
-
-    #[test]
-    fn term_mode_from_flags_sets_only_the_requested_bits() {
-        assert_eq!(term_mode_from_flags(true, false), TermMode::APP_CURSOR);
-        assert_eq!(term_mode_from_flags(false, true), TermMode::BRACKETED_PASTE);
-        assert_eq!(
-            term_mode_from_flags(true, true),
-            TermMode::APP_CURSOR | TermMode::BRACKETED_PASTE
-        );
-    }
-
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -158,29 +137,29 @@ mod tests {
 
     #[test]
     fn plain_char_encodes_as_utf8() {
-        assert_eq!(encode_key(&key(KeyCode::Char('a')), TermMode::empty()), Some(b"a".to_vec()));
-        assert_eq!(encode_key(&key(KeyCode::Char('é')), TermMode::empty()), Some("é".as_bytes().to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Char('a')), TermModes::default()), Some(b"a".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Char('é')), TermModes::default()), Some("é".as_bytes().to_vec()));
     }
 
     #[test]
     fn enter_esc_tab_backspace() {
-        assert_eq!(encode_key(&key(KeyCode::Enter), TermMode::empty()), Some(vec![b'\r']));
-        assert_eq!(encode_key(&key(KeyCode::Esc), TermMode::empty()), Some(vec![0x1b]));
-        assert_eq!(encode_key(&key(KeyCode::Tab), TermMode::empty()), Some(vec![b'\t']));
-        assert_eq!(encode_key(&key(KeyCode::Backspace), TermMode::empty()), Some(vec![0x7f]));
+        assert_eq!(encode_key(&key(KeyCode::Enter), TermModes::default()), Some(vec![b'\r']));
+        assert_eq!(encode_key(&key(KeyCode::Esc), TermModes::default()), Some(vec![0x1b]));
+        assert_eq!(encode_key(&key(KeyCode::Tab), TermModes::default()), Some(vec![b'\t']));
+        assert_eq!(encode_key(&key(KeyCode::Backspace), TermModes::default()), Some(vec![0x7f]));
     }
 
     #[test]
     fn arrows_use_csi_in_normal_mode() {
-        assert_eq!(encode_key(&key(KeyCode::Up), TermMode::empty()), Some(vec![0x1b, b'[', b'A']));
-        assert_eq!(encode_key(&key(KeyCode::Down), TermMode::empty()), Some(vec![0x1b, b'[', b'B']));
-        assert_eq!(encode_key(&key(KeyCode::Right), TermMode::empty()), Some(vec![0x1b, b'[', b'C']));
-        assert_eq!(encode_key(&key(KeyCode::Left), TermMode::empty()), Some(vec![0x1b, b'[', b'D']));
+        assert_eq!(encode_key(&key(KeyCode::Up), TermModes::default()), Some(vec![0x1b, b'[', b'A']));
+        assert_eq!(encode_key(&key(KeyCode::Down), TermModes::default()), Some(vec![0x1b, b'[', b'B']));
+        assert_eq!(encode_key(&key(KeyCode::Right), TermModes::default()), Some(vec![0x1b, b'[', b'C']));
+        assert_eq!(encode_key(&key(KeyCode::Left), TermModes::default()), Some(vec![0x1b, b'[', b'D']));
     }
 
     #[test]
     fn arrows_use_ss3_in_application_cursor_mode() {
-        let mode = TermMode::APP_CURSOR;
+        let mode = TermModes { app_cursor: true, bracketed_paste: false };
         assert_eq!(encode_key(&key(KeyCode::Up), mode), Some(vec![0x1b, b'O', b'A']));
         assert_eq!(encode_key(&key(KeyCode::Down), mode), Some(vec![0x1b, b'O', b'B']));
     }
@@ -189,21 +168,21 @@ mod tests {
     fn ctrl_letter_encodes_as_control_byte() {
         // Ctrl-c must reach the agent as ETX (0x03), never be swallowed here —
         // the app layer decides whether Ctrl-c is a quit or a forward.
-        assert_eq!(encode_key(&key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), TermMode::empty()), Some(vec![0x03]));
-        assert_eq!(encode_key(&key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL), TermMode::empty()), Some(vec![0x01]));
+        assert_eq!(encode_key(&key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), TermModes::default()), Some(vec![0x03]));
+        assert_eq!(encode_key(&key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL), TermModes::default()), Some(vec![0x01]));
     }
 
     #[test]
     fn ctrl_h_still_encodes_even_though_the_app_layer_intercepts_it() {
         // The encoder itself is dumb about Ctrl-h — interception is the caller's
         // job ("Ctrl-h is the only intercepted key" lives at the app layer).
-        assert_eq!(encode_key(&key_mod(KeyCode::Char('h'), KeyModifiers::CONTROL), TermMode::empty()), Some(vec![0x08]));
+        assert_eq!(encode_key(&key_mod(KeyCode::Char('h'), KeyModifiers::CONTROL), TermModes::default()), Some(vec![0x08]));
     }
 
     #[test]
     fn alt_char_gets_esc_prefix() {
         assert_eq!(
-            encode_key(&key_mod(KeyCode::Char('x'), KeyModifiers::ALT), TermMode::empty()),
+            encode_key(&key_mod(KeyCode::Char('x'), KeyModifiers::ALT), TermModes::default()),
             Some(vec![0x1b, b'x'])
         );
     }
@@ -211,25 +190,26 @@ mod tests {
     #[test]
     fn alt_does_not_prefix_arrows() {
         assert_eq!(
-            encode_key(&key_mod(KeyCode::Up, KeyModifiers::ALT), TermMode::empty()),
+            encode_key(&key_mod(KeyCode::Up, KeyModifiers::ALT), TermModes::default()),
             Some(vec![0x1b, b'[', b'A'])
         );
     }
 
     #[test]
     fn unhandled_keys_return_none() {
-        assert_eq!(encode_key(&key(KeyCode::CapsLock), TermMode::empty()), None);
+        assert_eq!(encode_key(&key(KeyCode::CapsLock), TermModes::default()), None);
     }
 
     #[test]
     fn paste_wraps_in_bracketed_markers_when_mode_enabled() {
-        let bytes = encode_paste("hello\nworld", TermMode::BRACKETED_PASTE);
+        let mode = TermModes { app_cursor: false, bracketed_paste: true };
+        let bytes = encode_paste("hello\nworld", mode);
         assert_eq!(bytes, b"\x1b[200~hello\nworld\x1b[201~".to_vec());
     }
 
     #[test]
     fn paste_is_raw_text_when_bracketed_paste_disabled() {
-        let bytes = encode_paste("hello\nworld", TermMode::empty());
+        let bytes = encode_paste("hello\nworld", TermModes::default());
         assert_eq!(bytes, b"hello\nworld".to_vec());
     }
 }

@@ -15,8 +15,9 @@ use std::collections::HashSet;
 use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction};
 use crate::config::{Action, Keybindings, Theme};
+use crate::ipc::protocol::GridSnapshot;
 
-pub use term_pane::{render_term_pane, PaneSource};
+pub use term_pane::render_term_pane;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -63,7 +64,7 @@ pub fn render(
     tick: u64,
     prompt: Option<&str>,
     input: Option<&InputState>,
-    pane_source: &PaneSource,
+    pane_grid: Option<&GridSnapshot>,
     pane_focused: bool,
     theme: &Theme,
     keybindings: &Keybindings,
@@ -122,7 +123,7 @@ pub fn render(
 
     render_agent_tree(frame, display_cursor, tick, left[0], &display_flat, matched.as_ref(), theme);
     render_agent_detail(frame, left[1], &selected, theme);
-    let pane_rect = render_term_pane(frame, columns[1], pane_source, selected.as_ref(), pane_focused);
+    let pane_rect = render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything — a bordered, centered modal instead of
