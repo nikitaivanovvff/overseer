@@ -614,6 +614,57 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    // ── F9: connection concurrency ceiling ────────────────────────────────────
+
+    #[test]
+    fn connections_beyond_the_concurrency_ceiling_are_dropped_immediately() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        let socket = start_server();
+
+        // Fill every permit, plus a few past the ceiling -- those extras
+        // must get closed rather than queued up (SECURITY-AUDIT.md F9). The
+        // OS-level connect succeeds regardless of the daemon's own limit
+        // (it's just the listen backlog); it's the daemon's accept loop that
+        // must refuse to service them.
+        let extra = 4;
+        let mut conns: Vec<UnixStream> = (0..server::MAX_CONCURRENT_CONNECTIONS + extra)
+            .map(|_| UnixStream::connect(&socket).expect("OS-level connect always succeeds"))
+            .collect();
+
+        // Only check the ones opened past the ceiling. The daemon's
+        // single-threaded accept loop needs a moment to actually dequeue and
+        // acquire a permit for everything ahead of them, so poll for the
+        // expected EOF instead of assuming a fixed catch-up delay.
+        let extras = &mut conns[server::MAX_CONCURRENT_CONNECTIONS..];
+        for stream in extras.iter_mut() {
+            stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        }
+        let mut rejected = vec![false; extras.len()];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && rejected.iter().any(|done| !done) {
+            for (stream, done) in extras.iter_mut().zip(rejected.iter_mut()) {
+                if *done {
+                    continue;
+                }
+                let mut buf = [0u8; 1];
+                if matches!(stream.read(&mut buf), Ok(0)) {
+                    *done = true;
+                }
+            }
+        }
+
+        assert!(
+            rejected.iter().all(|done| *done),
+            "every connection past the concurrency ceiling should eventually be closed"
+        );
+
+        conns.clear();
+        let _ = std::fs::remove_file(&socket);
+    }
+
     // ── size limits (F1/F2) ───────────────────────────────────────────────────
 
     #[test]

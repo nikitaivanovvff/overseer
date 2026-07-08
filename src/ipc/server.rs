@@ -25,6 +25,31 @@ use crate::session::SessionManager;
 /// envelope — while still capping the worst case tightly.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Max concurrent connections the daemon will service at once
+/// (SECURITY-AUDIT.md F9). `pub(super)` so `ipc::mod`'s integration tests can
+/// reference the real value instead of duplicating the number.
+///
+/// Shrunk under `cfg(test)`: exercising the real ceiling means opening more
+/// simultaneous *unaccepted* connections than macOS's default `somaxconn`
+/// (128) comfortably allows, which makes a 256-connection version of the
+/// test flaky under parallel `cargo test` load (`ECONNREFUSED` from the
+/// kernel's listen backlog, not a bug in the daemon) — the gating logic
+/// itself doesn't care what the number is.
+#[cfg(not(test))]
+pub(super) const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+#[cfg(test)]
+pub(super) const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
+/// How long `handle_conn` will wait for a line before giving up on a
+/// connection that opened but never sent anything (SECURITY-AUDIT.md F9) —
+/// a slow-loris-style hold that ties up a connection slot (and, before F9,
+/// had no ceiling on how many could pile up) for no purpose. Only guards the
+/// one-shot request loop: once a connection upgrades via `Request::Attach`,
+/// sitting idle between `Watch`/`Scroll` requests while just receiving
+/// streamed output is the normal, expected steady state, so `handle_attach`
+/// deliberately does not reuse this timeout.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Reads one newline-terminated line into `buf` (replacing its contents),
 /// capped at `MAX_LINE_BYTES` total bytes read (F1). Mirrors
 /// `AsyncBufReadExt::read_line`'s `Ok(0)` == clean EOF convention. Returns an
@@ -121,6 +146,14 @@ pub async fn run(
         tokio::spawn(session_watcher(ctx.clone()));
     }
 
+    // Bounds in-flight connections (SECURITY-AUDIT.md F9): without this, any
+    // client can open unlimited concurrent connections, each spawning tasks
+    // (attach connections spawn two long-lived forwarders plus a 16ms
+    // poller) with nothing to stop the count growing until the daemon
+    // degrades. 256 is far above any real usage (one TUI attach + a handful
+    // of one-shot hook calls at a time) but still a hard ceiling.
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     loop {
         tokio::select! {
             conn = listener.accept() => {
@@ -134,8 +167,14 @@ pub async fn run(
                         }
                     }
                 };
+                // At the ceiling: drop the connection immediately rather than
+                // spawn a task that would just queue up behind the others.
+                let Ok(permit) = conn_semaphore.clone().try_acquire_owned() else { continue };
                 let ctx = ctx.clone();
-                tokio::spawn(handle_conn(stream, ctx));
+                tokio::spawn(async move {
+                    handle_conn(stream, ctx).await;
+                    drop(permit);
+                });
             }
             // `overseer shutdown`'s handler notifies this only after its own
             // response has already been written back to its caller — see
@@ -156,7 +195,14 @@ async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
 
     loop {
         line.clear();
-        match read_line_capped(&mut reader, &mut line).await {
+        let read_result = match tokio::time::timeout(IDLE_READ_TIMEOUT, read_line_capped(&mut reader, &mut line)).await
+        {
+            Ok(result) => result,
+            // Idle too long with no complete line -- same disposition as any
+            // other read failure below: drop the connection.
+            Err(_) => break,
+        };
+        match read_result {
             Ok(0) => break,
             Ok(_) => {
                 match serde_json::from_slice::<Request>(trim_ascii_whitespace(&line)) {
@@ -568,6 +614,48 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut buf).await;
         assert!(result.is_err(), "an unterminated line past the cap must error, not keep growing");
         write_task.abort();
+    }
+
+    // ── F9: idle-read timeout ──────────────────────────────────────────────────
+
+    fn make_app_ctx() -> Arc<AppCtx> {
+        Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            sessions: Arc::new(crate::session::SessionManager::dry_run()),
+            socket: PathBuf::from("/tmp/test.sock"),
+            git: Arc::new(crate::git::GitClient::dry_run()),
+            config: Arc::new(Config::default()),
+            watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// A connection that opens but never sends a complete line must be
+    /// dropped once `IDLE_READ_TIMEOUT` elapses -- the slow-loris scenario
+    /// F9 exists to bound. Uses a paused clock (`start_paused`) so the test
+    /// doesn't actually wait out the real 30s timeout.
+    #[tokio::test(start_paused = true)]
+    async fn handle_conn_drops_an_idle_connection_after_the_timeout() {
+        let (mut client, server_side) = tokio::net::UnixStream::pair().unwrap();
+        let ctx = make_app_ctx();
+
+        let task = tokio::spawn(handle_conn(server_side, ctx));
+        // Let the spawned task run far enough to register its read timer
+        // before the clock jumps -- otherwise `advance` can race ahead of
+        // the timer even existing yet.
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("handle_conn should return once the idle timeout elapses")
+            .unwrap();
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "server should have closed its end once the idle timeout fired");
     }
 
     #[test]

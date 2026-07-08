@@ -24,3 +24,6 @@ alacritty_terminal = "0.26"
 toml = "0.8"
 unicode-segmentation = "1"
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
