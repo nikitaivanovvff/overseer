@@ -22,7 +22,7 @@ You (the user)
 
 You spawn the root, run your own agent inside it, and talk to it directly; it fans out children on your behalf. Each agent is a PTY Overseer launched (or, for the root, a bare shell it launched) and a row you can jump into. Branch/worktree isolation is the **agent's** job, not Overseer's.
 
-Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>` (`overseer teach` is a hidden alias). Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens, nothing written into your repo.
+Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens, nothing written into your repo.
 
 The registry and every agent's PTY live in a **daemon** process, not the TUI — an `overseer` launch attaches as a client (auto-spawning one if it isn't running). Quitting the TUI detaches; the daemon and every agent keep running, and a later launch reattaches to exactly what was there before (see "Daemon + Attach Protocol").
 
@@ -94,7 +94,7 @@ Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `
 
 | Command | Args | Description |
 |---------|------|-------------|
-| `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. `teach` is a hidden alias. |
+| `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. |
 | `overseer daemon` | — | Runs the daemon itself: binds the socket, serves requests, streams attach events, watches session exits. Hidden from `--help` — not a user workflow, the TUI spawns one automatically. |
 | `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. |
 | `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context % — Claude-specific; opencode's plugin and pi's extension push plain `overseer status <s>`, no `--from-hook`, since their own events are already precise. |
