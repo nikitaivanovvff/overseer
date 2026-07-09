@@ -52,8 +52,24 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::R
 
 /// Connects, sends one request, and returns one response.
 pub fn send(socket: &Path, req: &Request) -> anyhow::Result<Response> {
-    let mut stream = connect(socket)?;
+    send_on(connect(socket)?, req)
+}
 
+/// Same as `send`, but bounds the connection's read/write with `timeout` —
+/// used by `overseer kill`'s graceful-first attempt, where an unresponsive
+/// (wedged) daemon must not hang the caller indefinitely. `send` itself
+/// stays timeout-free: every other caller (ordinary CLI subcommands, the
+/// TUI's own attach setup) already assumes a healthy daemon, and a hang
+/// there is a real bug worth surfacing as a hang, not something to paper
+/// over with a silent timeout.
+pub fn send_with_timeout(socket: &Path, req: &Request, timeout: Duration) -> anyhow::Result<Response> {
+    let stream = connect(socket)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    send_on(stream, req)
+}
+
+fn send_on(mut stream: UnixStream, req: &Request) -> anyhow::Result<Response> {
     let req_json = serde_json::to_string(req)?;
     stream.write_all(req_json.as_bytes())?;
     stream.write_all(b"\n")?;

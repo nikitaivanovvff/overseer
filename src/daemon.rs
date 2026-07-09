@@ -104,8 +104,40 @@ fn validate_socket_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn lockfile_path(socket: &Path) -> PathBuf {
+pub(crate) fn lockfile_path(socket: &Path) -> PathBuf {
     socket.with_file_name("daemon.pid")
+}
+
+/// Reads the pid `DaemonLock::acquire` last wrote into `socket`'s lockfile,
+/// if any. Best-effort: a missing file and unparseable content are both just
+/// "no known pid" to the caller (`overseer kill`) — neither is an error on
+/// its own, since a lockfile that predates any daemon run, or one left with
+/// stale/partial content, is an expected state, not a bug.
+pub(crate) fn read_lockfile_pid(socket: &Path) -> Option<i32> {
+    fs::read_to_string(lockfile_path(socket)).ok()?.trim().parse().ok()
+}
+
+/// True if some process currently holds `socket`'s daemon lock — the exact
+/// mechanism `DaemonLock::acquire` itself uses to detect a live daemon, but
+/// as a read-only probe: this never takes ownership of the lock or writes to
+/// the file the way `acquire` does on success. `overseer kill` uses this to
+/// tell "daemon wedged but alive" (escalate to a forceful kill) apart from
+/// "daemon already dead, only stale files left behind" (nothing left to
+/// kill) — the pid recorded in the file can't answer that on its own, since
+/// a dead daemon's lockfile still has its old pid on disk, and by the time
+/// this runs that pid number could even have been recycled by an unrelated
+/// process.
+pub(crate) fn lock_is_held(socket: &Path) -> bool {
+    let Ok(file) = File::open(lockfile_path(socket)) else { return false };
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // Acquired it ourselves -- release right away, this call is only a
+        // probe, not a bid to become the daemon.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
 }
 
 /// An exclusive `flock` on the lockfile next to `socket`, held for the life of
@@ -271,6 +303,57 @@ mod tests {
         drop(first);
         let third = DaemonLock::acquire(&socket);
         assert!(third.is_ok(), "lock must be released when the holder drops");
+
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    // ── read_lockfile_pid / lock_is_held (overseer kill's liveness probe) ────
+
+    #[test]
+    fn read_lockfile_pid_returns_none_when_no_lockfile_exists() {
+        let socket = unique_test_socket("nopid");
+        assert_eq!(read_lockfile_pid(&socket), None);
+    }
+
+    #[test]
+    fn read_lockfile_pid_reads_back_what_acquire_wrote() {
+        let socket = unique_test_socket("readpid");
+        ensure_socket_dir(&socket).unwrap();
+        let lock = DaemonLock::acquire(&socket).unwrap();
+        assert_eq!(read_lockfile_pid(&socket), Some(std::process::id() as i32));
+        drop(lock);
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn lock_is_held_false_when_no_lockfile_exists() {
+        let socket = unique_test_socket("noheld");
+        assert!(!lock_is_held(&socket));
+    }
+
+    #[test]
+    fn lock_is_held_true_while_a_daemon_holds_it_false_after_it_drops() {
+        let socket = unique_test_socket("held");
+        ensure_socket_dir(&socket).unwrap();
+        let lock = DaemonLock::acquire(&socket).unwrap();
+        assert!(lock_is_held(&socket), "must report held while the lock is live");
+
+        drop(lock);
+        assert!(!lock_is_held(&socket), "must report not-held once the holder drops");
+
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn lock_is_held_probe_does_not_itself_take_the_lock() {
+        // A probe that accidentally left the lock held would make every
+        // subsequent daemon startup attempt fail forever.
+        let socket = unique_test_socket("noclobber");
+        ensure_socket_dir(&socket).unwrap();
+        assert!(!lock_is_held(&socket));
+
+        let acquired = DaemonLock::acquire(&socket);
+        assert!(acquired.is_ok(), "a real daemon must still be able to acquire the lock after a probe");
 
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }

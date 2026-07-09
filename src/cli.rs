@@ -104,6 +104,16 @@ pub enum Command {
     /// The TUI's own `Q` keybind confirms and sends this same request — this
     /// is the CLI path for scripting it or when the TUI isn't running.
     Shutdown,
+    /// Last-resort forceful cleanup for a daemon `shutdown` can't reach:
+    /// wedged/deadlocked and never replying, or already crashed with a
+    /// stale socket/lockfile left behind. Tries the same graceful
+    /// `Request::Shutdown` first, bounded by a short timeout — only
+    /// escalates to signal-killing the daemon process (and any orphaned
+    /// agent PTY processes it leaves behind, found by process ancestry
+    /// since Overseer keeps no on-disk agent-pid registry) if that doesn't
+    /// get a response in time. Reach for `shutdown` (or `Q` in the TUI)
+    /// first; this is the fallback for when that's already failed you.
+    Kill,
     /// Submit `--text` into the agent's PTY as a prompt, press Enter, and
     /// exit — the scriptable counterpart to typing into a pane in the TUI.
     /// Lets a root agent (or a cron job/script) nudge an idle or blocked
@@ -281,6 +291,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
         Command::Shutdown => Ok(Some(Request::Shutdown)),
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
         Command::Daemon => unreachable!("Daemon is handled before run_client"),
+        Command::Kill => unreachable!("Kill is handled before run_client"),
         Command::Prompt { .. } => unreachable!("Prompt is handled before build_request in run_client"),
     }
 }
@@ -319,6 +330,13 @@ mod tests {
     fn build_request_list_returns_list() {
         let req = build_request(Command::List).unwrap().unwrap();
         assert!(matches!(req, Request::List));
+    }
+
+    #[test]
+    fn cli_parses_kill_command() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["overseer", "kill"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Command::Kill)));
     }
 
     #[test]
