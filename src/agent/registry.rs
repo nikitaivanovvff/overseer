@@ -171,6 +171,15 @@ impl AgentRegistry {
     /// (same value, idempotent). Whatever ends up here is what `Request::Spawn`
     /// defaults an omitted `--adapter` to (its own children run the same
     /// harness unless told otherwise) — see `ipc::handlers`.
+    ///
+    /// A `Done`/`Error` agent's own automatic idle-downgrade (the `Stop`-hook
+    /// `idle` push, or a `Notification` idle-nag) must not clobber it back to
+    /// `Idle` — an agent that already reported completion shouldn't silently
+    /// un-complete itself the moment its turn ends. This is *not* a general
+    /// lock: `Running`/`Blocked` still apply unconditionally, so a human or
+    /// root re-prompting a done/errored agent's pane still moves it forward
+    /// (`UserPromptSubmit`'s `running` push and onward). Only the specific
+    /// `Idle` push is suppressed, and only against `Done`/`Error`.
     pub fn set_status(
         &self,
         id: &AgentId,
@@ -179,31 +188,39 @@ impl AgentRegistry {
         context_pct: Option<u8>,
         adapter: Option<String>,
     ) -> Result<(), RegistryError> {
-        let new_context_pct = {
+        let (new_status, new_context_pct) = {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) => {
-                    // Compare *before* overwriting — a repeated same-status
-                    // push (e.g. PostToolUse spam while `running`) must not
-                    // reset the clock (ATTENTION.md).
-                    if node.status != status {
-                        node.status_since = std::time::Instant::now();
+                    let suppress_idle_downgrade = status == AgentStatus::Idle
+                        && matches!(node.status, AgentStatus::Done | AgentStatus::Error);
+                    if !suppress_idle_downgrade {
+                        // Compare *before* overwriting — a repeated same-status
+                        // push (e.g. PostToolUse spam while `running`) must not
+                        // reset the clock (ATTENTION.md).
+                        if node.status != status {
+                            node.status_since = std::time::Instant::now();
+                        }
+                        node.status = status;
                     }
-                    node.status = status.clone();
                     if let Some(pct) = context_pct {
                         node.context_pct = Some(pct);
                     }
                     if let Some(adapter) = adapter {
                         node.adapter = adapter;
                     }
-                    node.context_pct
+                    (node.status.clone(), node.context_pct)
                 }
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
+        // Broadcast the node's actual resulting status, not necessarily the
+        // pushed one — a suppressed idle-downgrade (above) must not tell
+        // attach clients (which apply this as the definitive value, see
+        // `app::apply_event`) that the status became `Idle` when it didn't.
         let _ = self.events.send(RegistryEvent::StatusChanged {
             agent_id: id.clone(),
-            status,
+            status: new_status,
             message,
             context_pct: new_context_pct,
         });
@@ -374,6 +391,90 @@ mod tests {
         reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None).unwrap();
         reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
+    }
+
+    // ── Done/Error must survive an automatic idle-downgrade ──────────────────
+
+    #[test]
+    fn done_survives_a_later_idle_push() {
+        // Mirrors `sweep_does_not_downgrade_an_already_done_agent_to_error`
+        // in ipc::server, but for the hook-driven idle-push path (the
+        // Stop-hook / idle-nag), not the PTY-exit sweep.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+
+        // The agent's own Stop hook fires moments later and pushes idle —
+        // that must not clobber the done it already explicitly reported.
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+
+        assert_eq!(
+            reg.get(&result.id).unwrap().status,
+            AgentStatus::Done,
+            "an explicit done must survive a later automatic idle push"
+        );
+    }
+
+    #[test]
+    fn done_agent_still_moves_to_running_on_new_work() {
+        // The escape hatch: Done/Error is only sticky against the automatic
+        // idle-downgrade, not against genuine new work resuming.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None).unwrap();
+
+        assert_eq!(
+            reg.get(&result.id).unwrap().status,
+            AgentStatus::Running,
+            "a re-prompted done agent must still be able to move to running"
+        );
+    }
+
+    #[test]
+    fn error_survives_a_later_idle_push() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Error, None, None, None).unwrap();
+
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+
+        assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn suppressed_idle_downgrade_still_updates_context_pct_and_adapter() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+
+        reg.set_status(&result.id, AgentStatus::Idle, None, Some(77), Some("pi".to_string())).unwrap();
+
+        let node = reg.get(&result.id).unwrap();
+        assert_eq!(node.status, AgentStatus::Done, "status stays Done");
+        assert_eq!(node.context_pct, Some(77), "context_pct still applies even when the status push is suppressed");
+        assert_eq!(node.adapter, "pi", "adapter still applies even when the status push is suppressed");
+    }
+
+    #[test]
+    fn suppressed_idle_downgrade_broadcasts_the_actual_status_not_idle() {
+        // Attach clients apply the broadcast status as the definitive value
+        // (see app::apply_event) — broadcasting the suppressed `Idle` here
+        // would reproduce the same clobber bug on the client side.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+
+        let mut rx = reg.subscribe();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+
+        match rx.try_recv().unwrap() {
+            RegistryEvent::StatusChanged { status, .. } => {
+                assert_eq!(status, AgentStatus::Done, "broadcast must reflect the node's real status, not the suppressed push");
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
     }
 
     // ── status_since (ATTENTION.md) ───────────────────────────────────────────
