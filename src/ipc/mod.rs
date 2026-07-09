@@ -814,4 +814,48 @@ mod tests {
 
         let _ = std::fs::remove_file(&socket);
     }
+
+    // ── send_with_timeout (overseer kill's graceful-first attempt) ────────────
+
+    #[test]
+    fn send_with_timeout_behaves_like_send_against_a_healthy_server() {
+        let socket = start_server();
+        let resp = client::send_with_timeout(&socket, &Request::List, std::time::Duration::from_secs(5))
+            .expect("send_with_timeout should succeed against a healthy, responsive server");
+        assert!(resp.ok);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// The core scenario `overseer kill` exists for: a listener that accepts
+    /// the connection (so `connect()` succeeds) but never reads or writes
+    /// anything back — the same shape a daemon wedged inside a deadlocked
+    /// handler would present. `send_with_timeout` must return an error once
+    /// `timeout` elapses rather than hang forever the way plain `send` would.
+    #[test]
+    fn send_with_timeout_errors_out_against_a_connection_that_never_responds() {
+        let id = &uuid::Uuid::new_v4().to_string()[..8];
+        let socket = PathBuf::from(format!("/tmp/ovsr-wedged-{id}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let held = std::thread::spawn(move || {
+            // Accept and hold the connection open, replying to nothing —
+            // simulates a daemon that took the connection but is wedged
+            // before ever reaching its own read/dispatch/write.
+            let _conn = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+
+        let start = std::time::Instant::now();
+        let result =
+            client::send_with_timeout(&socket, &Request::List, std::time::Duration::from_millis(200));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a connection that never responds must time out, not hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout should bound the wait to roughly `timeout`, took {elapsed:?}"
+        );
+
+        drop(held); // detach -- the sleeping thread outlives the test harmlessly
+        let _ = std::fs::remove_file(&socket);
+    }
 }
