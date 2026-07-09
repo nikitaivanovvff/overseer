@@ -45,13 +45,14 @@ pub enum Command {
         #[arg(long)]
         adapter: Option<String>,
     },
+    /// List all agents.
     List,
+    /// Get agent detail.
     Agent {
         id: String,
     },
     /// Install the adapter skill(s) + hooks at the user level (runs once, no
-    /// socket needed). `teach` is kept as a hidden alias for muscle memory.
-    #[command(alias = "teach")]
+    /// socket needed).
     Install {
         /// Adapter name to install (e.g. "claude").
         agent: String,
