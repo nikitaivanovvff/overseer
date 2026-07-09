@@ -185,6 +185,20 @@ impl AgentTree {
         self.flatten().into_iter().nth(self.cursor)
     }
 
+    /// Moves the cursor to the node with the given id, if it's currently
+    /// visible (present in `flatten()`'s expand/collapse-aware order) —
+    /// no-op otherwise (e.g. a stale id from a previous frame). Used by
+    /// mouse click handling, which resolves a screen row to an id via the
+    /// same (possibly search-filtered) row order the renderer drew, then
+    /// hands that id here to move the *real* cursor, mirroring how `/`
+    /// search's `Enter` also only ever moves the real cursor by id/position,
+    /// never by a filtered-list index directly.
+    pub fn select_by_id(&mut self, id: &AgentId) {
+        if let Some(pos) = self.flatten().iter().position(|n| &n.id == id) {
+            self.cursor = pos;
+        }
+    }
+
     pub fn with_mock_data() -> Self {
         let mut root1 = mock_root("implement-auth", "overseer");
         root1.context_pct = Some(45);
@@ -530,6 +544,23 @@ mod tests {
     fn test_selected_on_empty_is_none() {
         let tree = AgentTree::new();
         assert!(tree.selected().is_none());
+    }
+
+    #[test]
+    fn test_select_by_id_moves_cursor_to_matching_node() {
+        let mut tree = make_tree();
+        // flatten order: root, child-a, grandchild, child-b.
+        let child_b_id = tree.flatten()[3].id.clone();
+        tree.select_by_id(&child_b_id);
+        assert_eq!(tree.selected().unwrap().id, child_b_id);
+    }
+
+    #[test]
+    fn test_select_by_id_unknown_id_is_noop() {
+        let mut tree = make_tree();
+        tree.cursor = 1;
+        tree.select_by_id(&AgentId::new());
+        assert_eq!(tree.cursor, 1, "unknown id must not move the cursor");
     }
 
     #[test]

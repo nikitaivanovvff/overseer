@@ -52,11 +52,29 @@ pub(crate) fn status_style(status: &AgentStatus, theme: &Theme) -> Style {
 /// takes the rest.
 const TREE_COLUMN_PCT: u16 = 25;
 
+/// What one frame's `render` drew, returned for the caller to act on next
+/// frame: PTY sizing (`pane_rect`) and mouse click hit-testing
+/// (`tree_rect`/`tree_rows`) both need to know exactly what's on screen,
+/// which only `render` itself can say for certain (the ~25/75 split and any
+/// active search filter both live here).
+pub struct RenderLayout {
+    /// The pane's inner rect, for sizing every agent's PTY to it.
+    pub pane_rect: Rect,
+    /// The tree list's outer rect (border included), for mapping a mouse
+    /// click's (column, row) to a row index.
+    pub tree_rect: Rect,
+    /// The ids of the rows actually drawn in the tree, top to bottom —
+    /// already search-filtered if a query was active, so row `i` here is
+    /// exactly what the user saw at that screen position.
+    pub tree_rows: Vec<AgentId>,
+}
+
 /// Renders the whole window: the tree|pane split plus a full-width status
 /// bar. `frame.area()` is now the entire terminal — there is no longer a
 /// separate tmux pane on the right; `render_term_pane` draws the selected
 /// agent's live grid directly into this same ratatui frame. Returns the
-/// pane's inner rect so the caller can size every agent's PTY to it.
+/// drawn layout so the caller can size every agent's PTY to it and hit-test
+/// mouse clicks against the tree.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
@@ -69,7 +87,7 @@ pub fn render(
     theme: &Theme,
     keybindings: &Keybindings,
     show_help: bool,
-) -> Rect {
+) -> RenderLayout {
     let area = frame.area();
     let (running, blocked, total) = tree.agent_counts();
     let status_line = build_status_line(running, blocked, total, prompt, theme);
@@ -121,7 +139,9 @@ pub fn render(
         None => (flat, tree.cursor, None),
     };
 
-    render_agent_tree(frame, display_cursor, tick, left[0], &display_flat, matched.as_ref(), theme);
+    let tree_rect = left[0];
+    let tree_rows: Vec<AgentId> = display_flat.iter().map(|n| n.id.clone()).collect();
+    render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme);
     render_agent_detail(frame, left[1], &selected, theme);
     let pane_rect = render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
@@ -138,7 +158,7 @@ pub fn render(
         render_help_popup(frame, area, keybindings);
     }
 
-    pane_rect
+    RenderLayout { pane_rect, tree_rect, tree_rows }
 }
 
 /// Pure. Every agent whose name matches `query` (`matched`), plus every node
@@ -224,6 +244,25 @@ fn status_bar_height(text: &str, area_width: u16) -> u16 {
         }
     }
     lines
+}
+
+/// Maps a mouse click's screen `(column, row)` to the id of the tree row it
+/// landed on, given the layout the last `render` call drew. `tree_rect` is
+/// the `List`'s outer rect (border included) and `tree_rows` is the exact
+/// top-to-bottom id order `render_agent_tree` drew into it (already
+/// search-filtered/fold-aware, since it's read straight off `RenderLayout`
+/// rather than recomputed here). `None` for a click on the border or past
+/// the last row. Pure — no `Frame` needed — so it's directly unit-testable.
+pub fn hit_test_tree(tree_rect: Rect, tree_rows: &[AgentId], column: u16, row: u16) -> Option<AgentId> {
+    let inner_x0 = tree_rect.x.saturating_add(1);
+    let inner_x1 = tree_rect.x.saturating_add(tree_rect.width).saturating_sub(1);
+    let inner_y0 = tree_rect.y.saturating_add(1);
+    let inner_y1 = tree_rect.y.saturating_add(tree_rect.height).saturating_sub(1);
+    if column < inner_x0 || column >= inner_x1 || row < inner_y0 || row >= inner_y1 {
+        return None;
+    }
+    let row_index = (row - inner_y0) as usize;
+    tree_rows.get(row_index).cloned()
 }
 
 fn render_agent_tree(
@@ -972,6 +1011,89 @@ mod tests {
 
         assert!(visible.contains(&matching_id));
         assert!(!visible.contains(&unrelated_id));
+    }
+
+    // ── hit_test_tree ──────────────────────────────────────────────────────────
+
+    fn click_tree() -> AgentTree {
+        let mut root = node("implement-auth", vec![]);
+        let mut child_a = node("auth-module", vec![node("grandchild", vec![])]);
+        child_a.role = AgentRole::Child;
+        child_a.expanded = false; // folded: its grandchild is hidden from flatten()
+        let mut child_b = node("write-tests", vec![]);
+        child_b.role = AgentRole::Child;
+        root.children.push(child_a);
+        root.children.push(child_b);
+        let mut tree = AgentTree::new();
+        tree.add_root(root);
+        tree
+    }
+
+    fn ids(flat: &[FlatNode]) -> Vec<AgentId> {
+        flat.iter().map(|n| n.id.clone()).collect()
+    }
+
+    #[test]
+    fn hit_test_tree_selects_the_row_clicked_with_a_fold_active() {
+        let tree = click_tree();
+        let flat = tree.flatten();
+        // Folded: root, auth-module, write-tests — the grandchild never
+        // appears, so a naive "index into the full unfiltered tree" would be
+        // off by one here if it didn't respect the fold.
+        assert_eq!(flat.len(), 3);
+        let rows = ids(&flat);
+        let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+
+        // Row 0 ("implement-auth") sits at screen row 1 (row 0 is the top border).
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 1), Some(rows[0].clone()));
+        // Row 1 ("auth-module").
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 2), Some(rows[1].clone()));
+        // Row 2 ("write-tests").
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 3), Some(rows[2].clone()));
+    }
+
+    #[test]
+    fn hit_test_tree_selects_the_row_clicked_during_search() {
+        let tree = click_tree();
+        let flat = tree.flatten();
+        // Simulates what `render` passes when a search query is active: only
+        // the matching rows (here, dropping "auth-module" at index 1), same
+        // as `display_flat` after filtering by `visible`.
+        let filtered: Vec<FlatNode> = flat.iter().filter(|n| n.name != "auth-module").cloned().collect();
+        assert_eq!(filtered.len(), 2);
+        let rows = ids(&filtered);
+        let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+
+        // Screen row 2 is now "write-tests" (row 1 in the filtered list),
+        // not "auth-module" — hit-testing must follow the rows actually
+        // drawn, not the full tree's positions.
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 2), Some(rows[1].clone()));
+        assert_ne!(hit_test_tree(tree_rect, &rows, 5, 2), Some(flat[1].id.clone()));
+    }
+
+    #[test]
+    fn hit_test_tree_click_on_border_is_none() {
+        let rows = ids(&click_tree().flatten());
+        let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 0), None, "top border row");
+        assert_eq!(hit_test_tree(tree_rect, &rows, 0, 1), None, "left border column");
+        assert_eq!(hit_test_tree(tree_rect, &rows, 29, 1), None, "right border column");
+    }
+
+    #[test]
+    fn hit_test_tree_click_past_the_last_row_is_none() {
+        let rows = ids(&click_tree().flatten());
+        let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+        // Only 3 rows are drawn (screen rows 1..=3); row 4 is blank list space.
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 4), None);
+    }
+
+    #[test]
+    fn hit_test_tree_click_outside_tree_rect_entirely_is_none() {
+        let rows = ids(&click_tree().flatten());
+        let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+        // e.g. a click that landed on the pane instead of the tree.
+        assert_eq!(hit_test_tree(tree_rect, &rows, 50, 1), None);
     }
 
     // ── help_rows (PHASE5B.md Task 3) ─────────────────────────────────────────

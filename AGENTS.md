@@ -273,6 +273,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | Key (default) | Action |
 |-----|--------|
 | `j` / `k` | Navigate agent tree (tree focus only) |
+| Left-click a tree row | Select + jump in, same as `Enter`/`o` on that row (tree focus only — additive, mouse capture is enabled but nothing is mouse-only) |
 | `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
