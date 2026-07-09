@@ -600,6 +600,43 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    /// `client::prompt` (backing `overseer prompt`) opens its own attach
+    /// connection, discards the mandatory initial `Snapshot`, and sends the
+    /// text as one `Write` followed by a separate `\r` `Write` — exercise it
+    /// end-to-end against a real test server rather than just asserting on
+    /// the wire shape. `SessionManager::dry_run` has no live PTY to observe
+    /// the bytes landing in, so this proves the sequence completes cleanly
+    /// (no desync, no hang, no error) and leaves the server servicing other
+    /// connections afterward, mirroring `oversized_write_on_an_attach_connection_
+    /// is_dropped_not_acted_on`'s style of proof for the same reason.
+    #[test]
+    fn client_prompt_sends_text_then_a_separate_enter_write() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+
+        client::prompt(&socket, &root_id, "you have uncommitted work, please finish")
+            .expect("prompt should complete without error");
+
+        // The daemon must still be alive and servicing other connections
+        // afterward — prove it with an ordinary one-shot round trip.
+        let resp = send(&socket, Request::Agent { agent_id: root_id.clone() });
+        assert!(resp.ok, "daemon should survive a prompt call: {:?}", resp.error);
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn client_prompt_rejects_text_over_the_max_write_size() {
+        let socket = start_server();
+        let root_id = start_root(&socket);
+
+        let oversized = "x".repeat(crate::ipc::protocol::MAX_WRITE_DATA_BYTES + 1);
+        let result = client::prompt(&socket, &root_id, &oversized);
+        assert!(result.is_err(), "prompt text over the max size should be rejected before sending");
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[test]
     fn one_shot_connections_keep_working_alongside_an_open_attach_connection() {
         let socket = start_server();

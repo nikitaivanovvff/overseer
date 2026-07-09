@@ -104,6 +104,23 @@ pub enum Command {
     /// The TUI's own `Q` keybind confirms and sends this same request — this
     /// is the CLI path for scripting it or when the TUI isn't running.
     Shutdown,
+    /// Submit `--text` into the agent's PTY as a prompt, press Enter, and
+    /// exit — the scriptable counterpart to typing into a pane in the TUI.
+    /// Lets a root agent (or a cron job/script) nudge an idle or blocked
+    /// child without a real interactive terminal (AGENTS.md "Attention
+    /// Surfacing" leaves re-prompting to a human or the root deciding —
+    /// this is how that decision gets carried out non-interactively). Not a
+    /// new capability: any agent holding `OVERSEER_SOCKET` could already
+    /// write into any other agent's PTY via the wire protocol's `Write`
+    /// (AGENTS.md "Security") — this just gives that a documented, one-shot
+    /// command instead of a hand-rolled socket script.
+    Prompt {
+        /// Agent id to prompt.
+        id: String,
+        /// The text to submit as a prompt.
+        #[arg(long)]
+        text: String,
+    },
 }
 
 /// Pushable statuses only — `Spawning` is set at registration time, never
@@ -136,6 +153,18 @@ pub fn resolve_socket(cli_socket: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn run_client(socket: PathBuf, cmd: Command) -> Result<()> {
+    // `Prompt` doesn't map to a single `Request` — it's a short stateful
+    // sequence (attach, discard the snapshot, two writes) handled entirely
+    // by `ipc::client::prompt`, so it's intercepted here rather than routed
+    // through `build_request`/`ipc::client::send`'s one-request/response flow.
+    let cmd = match cmd {
+        Command::Prompt { id, text } => {
+            let agent_id = id.parse::<AgentId>().map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
+            return ipc::client::prompt(&socket, &agent_id, &text);
+        }
+        other => other,
+    };
+
     let req = match build_request(cmd)? {
         Some(r) => r,
         None => return Ok(()), // silent no-op (Status outside an Overseer session)
@@ -252,6 +281,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
         Command::Shutdown => Ok(Some(Request::Shutdown)),
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
         Command::Daemon => unreachable!("Daemon is handled before run_client"),
+        Command::Prompt { .. } => unreachable!("Prompt is handled before build_request in run_client"),
     }
 }
 
@@ -351,6 +381,37 @@ mod tests {
     fn build_request_drop_invalid_id_is_error() {
         let cmd = Command::Drop { id: "not-a-uuid".to_string(), recursive: false };
         assert!(build_request(cmd).is_err());
+    }
+
+    // ── prompt (CLI parsing) ────────────────────────────────────────────────
+    //
+    // `Prompt` doesn't go through `build_request` (see `run_client`'s early
+    // return), so it's exercised via clap parsing directly instead of the
+    // `build_request`-based pattern the other commands use above. The
+    // client-side attach/write sequence itself is covered by
+    // `ipc::client::prompt`'s integration test in `ipc::tests`.
+
+    #[test]
+    fn cli_parses_prompt_command() {
+        use clap::Parser;
+        let id = AgentId::new();
+        let cli =
+            Cli::try_parse_from(["overseer", "prompt", &id.0.to_string(), "--text", "keep going"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Command::Prompt { id: parsed_id, text })
+                if parsed_id == id.0.to_string() && text == "keep going"
+        ));
+    }
+
+    #[test]
+    fn cli_prompt_requires_text_flag() {
+        use clap::Parser;
+        let id = AgentId::new();
+        assert!(
+            Cli::try_parse_from(["overseer", "prompt", &id.0.to_string()]).is_err(),
+            "prompt without --text should fail to parse"
+        );
     }
 
     // ── read_context_pct ──────────────────────────────────────────────────────
