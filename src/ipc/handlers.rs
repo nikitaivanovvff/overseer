@@ -53,8 +53,10 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
             });
 
-            let repo = ctx.git.repo_name(&cwd).unwrap_or_else(|_| "unknown".to_string());
-            let branch = ctx.git.current_branch(&cwd).unwrap_or_else(|_| "main".to_string());
+            let (Ok(repo), Ok(branch)) = (ctx.git.repo_name(&cwd), ctx.git.current_branch(&cwd))
+            else {
+                return Response::err(format!("not a git repository: {}", cwd.display()));
+            };
 
             let req = SpawnRequest {
                 role: AgentRole::Root,
@@ -190,11 +192,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_ctx() -> AppCtx {
+        make_ctx_with_git(GitClient::dry_run())
+    }
+
+    fn make_ctx_with_git(git: GitClient) -> AppCtx {
         AppCtx {
             registry: Arc::new(AgentRegistry::new()),
             sessions: Arc::new(SessionManager::dry_run()),
             socket: PathBuf::from("/tmp/test.sock"),
-            git: Arc::new(GitClient::dry_run()),
+            git: Arc::new(git),
             config: Arc::new(crate::config::Config::default()),
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -297,6 +303,34 @@ mod tests {
         assert_eq!(agents[0].name, "test-repo");
         assert_eq!(agents[0].adapter, "shell");
         assert_eq!(agents[0].status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn dispatch_start_non_git_cwd_is_error_and_registers_nothing() {
+        // Real (non-dry-run) GitClient against a freshly created, non-git
+        // temp directory reproduces the daemon-observed bug: a bare-shell
+        // root must not be registered under a bogus "unknown" name when the
+        // target directory isn't a git repo at all.
+        let dir = std::env::temp_dir().join(format!("overseer-test-non-git-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ctx = make_ctx_with_git(GitClient::new());
+        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()) });
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!resp.ok, "Start on a non-git cwd must fail, got: {:?}", resp.data);
+        let error = resp.error.unwrap_or_default();
+        assert!(error.contains("not a git repository"), "unexpected error: {error}");
+
+        // No root should have been registered for the rejected cwd.
+        let list_resp = dispatch(&ctx, Request::List);
+        match list_resp.data {
+            Some(OkBody::Agents { agents }) => {
+                assert!(agents.is_empty(), "expected no registered agents, got: {agents:?}")
+            }
+            other => panic!("expected Agents, got {other:?}"),
+        }
     }
 
     fn start_root(ctx: &AppCtx) -> AgentId {

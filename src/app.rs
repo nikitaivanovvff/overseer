@@ -761,7 +761,10 @@ mod tests {
     #[test]
     fn mock_mode_dispatch_registers_a_root_in_process() {
         let app = test_app();
-        let resp = app.dispatch(Request::Start { cwd: Some(PathBuf::from("/tmp")) });
+        // Must be a real git repo: `test_app` wires up a real (non-dry-run)
+        // `GitClient`, and `Start` now rejects a non-git cwd outright.
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resp = app.dispatch(Request::Start { cwd: Some(cwd) });
         assert!(resp.ok, "dispatch failed: {:?}", resp.error);
     }
 
