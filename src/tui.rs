@@ -959,6 +959,40 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_forward_to_the_agent_while_pane_is_focused_not_scroll() {
+        // Some terminals (macOS Terminal.app notably) translate mouse-wheel
+        // scroll into synthetic Up/Down key sequences instead of a real
+        // xterm mouse report — and those synthetic sequences are byte-for-
+        // byte indistinguishable here from a genuine Up/Down keypress
+        // (`session::keys::encode_key` already forwards both as real xterm
+        // escape sequences, see its own tests). Many agent TUIs rely on
+        // plain arrow keys for their own history/menu navigation, so
+        // binding them to scroll here would silently break that for every
+        // agent whenever the pane is focused — not just on the terminals
+        // this was meant to help. `handle_pane_key` deliberately leaves
+        // Up/Down unhandled, same as every other non-`Ctrl-h` key; this
+        // pins that decision against a future "helpful" regression. See
+        // AGENTS.md "Scrollback" for the caveat this leaves affected users
+        // with (drop to tree focus for a keyboard-only fallback).
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
+        assert_eq!(app.focus, Focus::Pane);
+
+        handle_pane_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        handle_pane_key(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(app.focus, Focus::Pane, "arrow keys must not change focus");
+        assert_eq!(
+            ctx.sessions.display_offset(&id),
+            0,
+            "arrow keys must not scroll — they forward to the agent's PTY untouched"
+        );
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
     fn jump_in_clears_a_stale_not_running_message_on_a_later_success() {
         // Regression test: a failed jump-in (e.g. selecting a root right at
         // spawn time, before its first status push lands) used to leave
