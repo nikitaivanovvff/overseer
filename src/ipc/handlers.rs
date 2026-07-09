@@ -34,8 +34,8 @@ pub struct AppCtx {
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
 pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     match req {
-        Request::Status { agent_id, status, message, context_pct, adapter } => {
-            match ctx.registry.set_status(&agent_id, status, message, context_pct, adapter) {
+        Request::Status { agent_id, status, message, context_pct, adapter, pushed_at } => {
+            match ctx.registry.set_status(&agent_id, status, message, context_pct, adapter, pushed_at) {
                 Ok(()) => Response::ok(None),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -216,6 +216,7 @@ mod tests {
             message: None,
             context_pct: None,
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, req);
         assert!(!resp.ok);
@@ -232,6 +233,7 @@ mod tests {
             message: None,
             context_pct: Some(17),
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, status_req);
         assert!(resp.ok);

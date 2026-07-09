@@ -118,6 +118,7 @@ impl AgentRegistry {
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
+                    last_status_pushed_at: None,
                 };
                 let dto = AgentDto::from_node(&node, None);
                 guard.add_root(node);
@@ -143,6 +144,7 @@ impl AgentRegistry {
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
+                    last_status_pushed_at: None,
                 };
                 let dto = AgentDto::from_node(&node, Some(parent_id.clone()));
                 if guard.insert_child(&parent_id, node) {
@@ -180,6 +182,29 @@ impl AgentRegistry {
     /// root re-prompting a done/errored agent's pane still moves it forward
     /// (`UserPromptSubmit`'s `running` push and onward). Only the specific
     /// `Idle` push is suppressed, and only against `Done`/`Error`.
+    ///
+    /// This is deliberately *not* generalized into the `pushed_at` staleness
+    /// guard below, even though both are "precedence" rules: the idle-nag
+    /// almost always fires chronologically *after* the done/error push it
+    /// must not clobber (e.g. a `Stop` hook firing moments after the turn
+    /// that reported `done`), so it isn't a stale/out-of-order push at all —
+    /// it's a later, genuinely-later push that must still lose because of
+    /// *what* it is, not *when* it arrived. Staleness rejection wouldn't
+    /// catch this case (see `STATUS-RACE.md`).
+    ///
+    /// `pushed_at` guards against a different failure mode: two *separate*
+    /// hook fires (each its own short-lived OS process, its own socket
+    /// connection — see `ipc::server`) racing on scheduling/connection setup
+    /// so the one that fired *earlier* arrives at the daemon *later*. Without
+    /// this, last-write-wins on arrival order would let a stale push (e.g. a
+    /// `blocked` push queued behind a slow `Notification` hook) silently
+    /// clobber a fresher status (e.g. `running`, from a `PostToolUse` hook
+    /// that fired later but connected faster) — see `STATUS-RACE.md`. A push
+    /// whose `pushed_at` is older than the last *accepted* push for this node
+    /// is dropped in full (status, `context_pct`, `adapter`, broadcast — all
+    /// of it, since a push's other fields are just as stale as its status).
+    /// `None` on the node (nothing accepted yet, e.g. fresh off `register`)
+    /// never rejects — there's nothing to compare against yet.
     pub fn set_status(
         &self,
         id: &AgentId,
@@ -187,32 +212,43 @@ impl AgentRegistry {
         message: Option<String>,
         context_pct: Option<u8>,
         adapter: Option<String>,
+        pushed_at: std::time::SystemTime,
     ) -> Result<(), RegistryError> {
-        let (new_status, new_context_pct) = {
+        let applied = {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) => {
-                    let suppress_idle_downgrade = status == AgentStatus::Idle
-                        && matches!(node.status, AgentStatus::Done | AgentStatus::Error);
-                    if !suppress_idle_downgrade {
-                        // Compare *before* overwriting — a repeated same-status
-                        // push (e.g. PostToolUse spam while `running`) must not
-                        // reset the clock (ATTENTION.md).
-                        if node.status != status {
-                            node.status_since = std::time::Instant::now();
+                    let is_stale = node.last_status_pushed_at.is_some_and(|last| pushed_at < last);
+                    if is_stale {
+                        None
+                    } else {
+                        node.last_status_pushed_at = Some(pushed_at);
+
+                        let suppress_idle_downgrade = status == AgentStatus::Idle
+                            && matches!(node.status, AgentStatus::Done | AgentStatus::Error);
+                        if !suppress_idle_downgrade {
+                            // Compare *before* overwriting — a repeated same-status
+                            // push (e.g. PostToolUse spam while `running`) must not
+                            // reset the clock (ATTENTION.md).
+                            if node.status != status {
+                                node.status_since = std::time::Instant::now();
+                            }
+                            node.status = status;
                         }
-                        node.status = status;
+                        if let Some(pct) = context_pct {
+                            node.context_pct = Some(pct);
+                        }
+                        if let Some(adapter) = adapter {
+                            node.adapter = adapter;
+                        }
+                        Some((node.status.clone(), node.context_pct))
                     }
-                    if let Some(pct) = context_pct {
-                        node.context_pct = Some(pct);
-                    }
-                    if let Some(adapter) = adapter {
-                        node.adapter = adapter;
-                    }
-                    (node.status.clone(), node.context_pct)
                 }
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
+        };
+        let Some((new_status, new_context_pct)) = applied else {
+            return Ok(());
         };
         // Broadcast the node's actual resulting status, not necessarily the
         // pushed one — a suppressed idle-downgrade (above) must not tell
@@ -371,7 +407,7 @@ mod tests {
     fn set_status_unknown_id_returns_error() {
         let reg = AgentRegistry::new();
         let err = reg
-            .set_status(&AgentId::new(), AgentStatus::Done, None, None, None)
+            .set_status(&AgentId::new(), AgentStatus::Done, None, None, None, std::time::SystemTime::now())
             .unwrap_err();
         assert!(matches!(err, RegistryError::UnknownAgent(_)));
     }
@@ -380,7 +416,7 @@ mod tests {
     fn set_status_with_context_pct_updates_it() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None, std::time::SystemTime::now()).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
     }
 
@@ -388,8 +424,8 @@ mod tests {
     fn set_status_without_context_pct_keeps_existing_value() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None).unwrap();
-        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None, std::time::SystemTime::now()).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now()).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
     }
 
@@ -402,11 +438,11 @@ mod tests {
         // Stop-hook / idle-nag), not the PTY-exit sweep.
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
         // The agent's own Stop hook fires moments later and pushes idle —
         // that must not clobber the done it already explicitly reported.
-        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now()).unwrap();
 
         assert_eq!(
             reg.get(&result.id).unwrap().status,
@@ -421,9 +457,9 @@ mod tests {
         // idle-downgrade, not against genuine new work resuming.
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
-        reg.set_status(&result.id, AgentStatus::Running, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, std::time::SystemTime::now()).unwrap();
 
         assert_eq!(
             reg.get(&result.id).unwrap().status,
@@ -436,9 +472,9 @@ mod tests {
     fn error_survives_a_later_idle_push() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Error, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Error, None, None, None, std::time::SystemTime::now()).unwrap();
 
-        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now()).unwrap();
 
         assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Error);
     }
@@ -447,9 +483,9 @@ mod tests {
     fn suppressed_idle_downgrade_still_updates_context_pct_and_adapter() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
-        reg.set_status(&result.id, AgentStatus::Idle, None, Some(77), Some("pi".to_string())).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, Some(77), Some("pi".to_string()), std::time::SystemTime::now()).unwrap();
 
         let node = reg.get(&result.id).unwrap();
         assert_eq!(node.status, AgentStatus::Done, "status stays Done");
@@ -464,10 +500,10 @@ mod tests {
         // would reproduce the same clobber bug on the client side.
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Done, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
         let mut rx = reg.subscribe();
-        reg.set_status(&result.id, AgentStatus::Idle, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now()).unwrap();
 
         match rx.try_recv().unwrap() {
             RegistryEvent::StatusChanged { status, .. } => {
@@ -486,7 +522,7 @@ mod tests {
         let result = reg.register(make_register_root("agent")).unwrap();
         let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
 
-        reg.set_status(&result.id, AgentStatus::Running, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, std::time::SystemTime::now()).unwrap();
 
         let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
         assert_eq!(before, after, "a repeated same-status push (e.g. PostToolUse spam) must not reset the clock");
@@ -499,7 +535,7 @@ mod tests {
         let before = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, std::time::SystemTime::now()).unwrap();
 
         let after = reg.with_tree(|t| t.find(&result.id).unwrap().status_since);
         assert!(after > before, "an actual status change must reset the clock");
@@ -654,10 +690,10 @@ mod tests {
     fn set_status_broadcasts_status_changed_with_message_and_merged_context_pct() {
         let reg = AgentRegistry::new();
         let result = reg.register(make_register_root("agent")).unwrap();
-        reg.set_status(&result.id, AgentStatus::Running, None, Some(10), None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(10), None, std::time::SystemTime::now()).unwrap();
 
         let mut rx = reg.subscribe();
-        reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None, None).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None, None, std::time::SystemTime::now()).unwrap();
         match rx.try_recv().unwrap() {
             RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
                 assert_eq!(agent_id, result.id);
@@ -675,7 +711,7 @@ mod tests {
     fn set_status_unknown_agent_does_not_broadcast() {
         let reg = AgentRegistry::new();
         let mut rx = reg.subscribe();
-        let err = reg.set_status(&AgentId::new(), AgentStatus::Done, None, None, None).unwrap_err();
+        let err = reg.set_status(&AgentId::new(), AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap_err();
         assert!(matches!(err, RegistryError::UnknownAgent(_)));
         assert!(rx.try_recv().is_err());
     }
@@ -716,5 +752,131 @@ mod tests {
         let mut rx = reg.subscribe();
         reg.announce_shutdown();
         assert!(matches!(rx.try_recv().unwrap(), RegistryEvent::Shutdown));
+    }
+
+    // ── pushed_at staleness guard (STATUS-RACE.md) ────────────────────────────
+    //
+    // Each Claude Code hook fire is its own short-lived OS process making its
+    // own fresh connection to the daemon, with no ordering between them. A
+    // push that *fired* earlier can still *arrive* later than one that fired
+    // after it (e.g. a `Notification`→`blocked` process slower to schedule
+    // than a following `PostToolUse`→`running` one). These tests simulate
+    // that by calling `set_status` with an out-of-order `pushed_at`, not by
+    // racing real connections — the guard lives entirely in the registry, so
+    // arrival order at this layer *is* `set_status` call order.
+
+    #[test]
+    fn a_push_with_an_older_timestamp_arriving_later_does_not_clobber_a_newer_status() {
+        // The exact bug: `blocked` (fired first, e.g. a permission prompt)
+        // arrives at the daemon *after* `running` (fired later, e.g. the
+        // PostToolUse right after the user approved) because its hook
+        // process was slower to schedule/connect. The `running` push must
+        // win because it was pushed later, even though it arrived first.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+        let earlier = t0 - std::time::Duration::from_millis(500);
+        let later = t0;
+
+        // `running` (pushed_at = later) arrives first.
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, later).unwrap();
+        // `blocked` (pushed_at = earlier) arrives second, but it's stale.
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, earlier).unwrap();
+
+        assert_eq!(
+            reg.get(&result.id).unwrap().status,
+            AgentStatus::Running,
+            "a push with an older pushed_at must not override a push with a newer pushed_at, regardless of arrival order"
+        );
+    }
+
+    #[test]
+    fn a_stale_push_does_not_broadcast() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+        let earlier = t0 - std::time::Duration::from_millis(500);
+
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, t0).unwrap();
+
+        let mut rx = reg.subscribe();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, earlier).unwrap();
+
+        assert!(rx.try_recv().is_err(), "a stale push must not broadcast anything");
+    }
+
+    #[test]
+    fn a_stale_push_does_not_apply_context_pct_or_adapter_either() {
+        // The whole push is stale, not just the status field -- an outdated
+        // push's context_pct/adapter are just as untrustworthy as its status.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+        let earlier = t0 - std::time::Duration::from_millis(500);
+
+        reg.set_status(&result.id, AgentStatus::Running, None, Some(50), None, t0).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, Some(90), Some("pi".to_string()), earlier).unwrap();
+
+        let node = reg.get(&result.id).unwrap();
+        assert_eq!(node.status, AgentStatus::Running);
+        assert_eq!(node.context_pct, Some(50), "stale push's context_pct must not apply");
+        assert_eq!(node.adapter, "claude", "stale push's adapter must not apply");
+    }
+
+    #[test]
+    fn a_push_with_a_newer_timestamp_still_applies_normally() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+        let later = t0 + std::time::Duration::from_millis(500);
+
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, t0).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, later).unwrap();
+
+        assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn a_push_with_the_same_timestamp_still_applies() {
+        // Not stale unless strictly older -- two pushes that happen to share
+        // a timestamp (coarse clock resolution) must not deadlock each other
+        // out.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, t0).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, t0).unwrap();
+
+        assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn first_push_ever_is_never_rejected_as_stale() {
+        // A freshly registered node has no last_status_pushed_at yet -- there's
+        // nothing to compare the first push against.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let ancient = std::time::SystemTime::UNIX_EPOCH;
+
+        reg.set_status(&result.id, AgentStatus::Blocked, None, None, None, ancient).unwrap();
+
+        assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn stale_idle_downgrade_attempt_is_rejected_by_timestamp_before_the_suppress_rule_even_applies() {
+        // Belt-and-suspenders: even without the dedicated Done/Error-vs-Idle
+        // suppress rule, an idle push that's also stale would be rejected on
+        // timestamp grounds alone.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let t0 = std::time::SystemTime::now();
+        let earlier = t0 - std::time::Duration::from_millis(500);
+
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, t0).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, earlier).unwrap();
+
+        assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Done);
     }
 }

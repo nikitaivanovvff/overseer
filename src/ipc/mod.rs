@@ -167,6 +167,7 @@ mod tests {
             message: None,
             context_pct: None,
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set child status failed");
         assert!(resp.data.is_none(), "status ack should have no data body");
@@ -178,6 +179,7 @@ mod tests {
             message: Some("all PRs merged".to_string()),
             context_pct: None,
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set root status failed");
 
@@ -218,6 +220,7 @@ mod tests {
             message: None,
             context_pct: Some(37),
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
 
@@ -234,6 +237,7 @@ mod tests {
             message: None,
             context_pct: None,
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
 
@@ -348,6 +352,7 @@ mod tests {
             message: None,
             context_pct: None,
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         assert!(!resp.ok);
         assert!(resp.error.as_deref().unwrap_or("").contains("unknown agent"));
@@ -477,6 +482,7 @@ mod tests {
             message: Some("needs you".to_string()),
             context_pct: Some(42),
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         });
         match next_event(&mut reader) {
             AttachEvent::StatusChanged { agent_id, status, message, context_pct } => {
@@ -517,6 +523,7 @@ mod tests {
                 message: None,
                 context_pct: None,
                 adapter: None,
+            pushed_at: std::time::SystemTime::now(),
             });
         }
 

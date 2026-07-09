@@ -30,4 +30,14 @@ pub struct AgentNode {
     /// `running` agent) don't reset the clock. Shipped across the wire as an
     /// age (`AgentDto::status_secs`), never as this `Instant` itself.
     pub status_since: std::time::Instant,
+    /// Wall-clock time the most recently *applied* `Request::Status` push was
+    /// captured at the client (hook-invocation time, not daemon-arrival
+    /// time) — see `AgentRegistry::set_status`'s staleness guard. `None`
+    /// until the first push arrives (registration carries no timestamp of
+    /// its own, so nothing to compare the first push against). Wall-clock
+    /// (`SystemTime`), not `Instant`, because it must be comparable across
+    /// the many independent short-lived OS processes each hook fire spawns —
+    /// a monotonic clock has no shared origin across processes. Never sent
+    /// across the wire; purely daemon-side bookkeeping.
+    pub last_status_pushed_at: Option<std::time::SystemTime>,
 }

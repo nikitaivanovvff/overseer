@@ -970,6 +970,7 @@ mod tests {
             children,
             expanded: true,
             status_since: std::time::Instant::now(),
+            last_status_pushed_at: None,
         }
     }
 

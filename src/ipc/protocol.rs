@@ -1,7 +1,7 @@
 //! Newline-delimited JSON wire protocol.
 //!
 //! One request line → one response line. Examples:
-//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null,"context_pct":62}
+//!   status:   {"cmd":"status","agent_id":"<uuid>","status":"blocked","message":null,"context_pct":62,"pushed_at":{"secs_since_epoch":1234,"nanos_since_epoch":0}}
 //!   list:     {"cmd":"list"}
 //!   agent:    {"cmd":"agent","agent_id":"<uuid>"}
 //!
@@ -64,6 +64,20 @@ pub enum Request {
         /// moment the user actually runs claude/opencode/pi inside it.
         #[serde(default)]
         adapter: Option<String>,
+        /// Wall-clock time this push was captured at, client-side, as early
+        /// as possible in the `overseer status` process's life (see
+        /// `main.rs`) — not daemon-arrival time. Every hook fire is its own
+        /// short-lived OS process making its own fresh connection with no
+        /// ordering guarantee between connections (`ipc::server` spawns an
+        /// independent task per accepted connection), so a push that fired
+        /// earlier can still arrive later than one that fired after it.
+        /// `AgentRegistry::set_status` uses this to drop a push that's older
+        /// than the newest one already applied, instead of last-write-wins
+        /// on arrival order (`STATUS-RACE.md`). Defaults to the *daemon's*
+        /// receive-time for a caller that omits it, which degenerates to the
+        /// old last-write-wins behavior for that single push only.
+        #[serde(default = "std::time::SystemTime::now")]
+        pushed_at: std::time::SystemTime,
     },
     List,
     Agent {
@@ -375,6 +389,7 @@ mod tests {
             message: None,
             context_pct: Some(42),
             adapter: None,
+            pushed_at: std::time::SystemTime::now(),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
