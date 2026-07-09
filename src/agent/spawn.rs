@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::agent::adapters::{adapter_for, identity_env, AgentAdapter, AgentIdentity, LaunchContext};
 use crate::agent::registry::{RegisterArgs, RegisterResult, RegistryError};
 use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
-use crate::config::Config;
+use crate::config::{AdapterConfig, Config};
 use crate::session::SessionManager;
 
 /// Launches `ctx` in a new PTY session using the given adapter.
@@ -28,15 +28,23 @@ pub struct SpawnRequest {
     pub parent_id: Option<AgentId>,
     pub task: String,
     /// Child-only tree-row label, distinct from `task`. Ignored for a root
-    /// (still named after the repo — see `spawn_root_shell`). Absent or
+    /// (still named after the repo — see `spawn_root`). Absent or
     /// blank falls back to `task` verbatim (`spawn_child_agent`).
     pub name: Option<String>,
+    /// Child-only: which harness to launch (required, validated against
+    /// `config.adapters`). Ignored for a root — see `root_adapter` instead.
     pub adapter_name: String,
     pub cwd: PathBuf,
     pub repo: String,
     /// Explicit branch override (used by `start --branch`-style callers). `None` lets
     /// the registry apply its default ("main" for root, "overseer/<id>" for child).
     pub branch: Option<String>,
+    /// Root-only: `Some(name)` launches that adapter directly (empty task,
+    /// same launch path a child uses) instead of a bare shell — the TUI's
+    /// two-step `n` picker's second field. `None`/blank preserves the
+    /// bare-shell default. Ignored for a child (which always uses
+    /// `adapter_name` instead).
+    pub root_adapter: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -53,8 +61,9 @@ pub enum SpawnError {
 
 /// Registers a new agent and launches its PTY session in one step.
 /// The single shared orchestration entry point for root (`start`) and child (`spawn`)
-/// launches — dispatches to a role-specific path since they no longer share a
-/// launch mechanism (root is a bare shell, child is adapter-driven).
+/// launches — dispatches to a role-specific path since root additionally branches
+/// on whether an adapter was chosen (bare shell vs. adapter-driven), while a
+/// child is always adapter-driven.
 pub fn spawn_agent(
     registry: &AgentRegistry,
     sessions: &SessionManager,
@@ -63,17 +72,33 @@ pub fn spawn_agent(
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
     match req.role.clone() {
-        AgentRole::Root => spawn_root_shell(registry, sessions, socket, req),
+        AgentRole::Root => spawn_root(registry, sessions, socket, config, req),
         AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req),
     }
 }
 
-/// Root path: no `AgentAdapter`, no configured agent binary — just a plain shell
-/// in the chosen repo, registered `Idle`. Whatever the user later runs inside
-/// (e.g. `claude`) inherits the identity env vars via the PTY's normal
+/// Root path: bare shell by default, or — if `req.root_adapter` names one —
+/// that adapter launched directly instead (the TUI's two-step `n` picker's
+/// second step, once at least one adapter is `overseer_installed()`).
+fn spawn_root(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    config: &Config,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
+    match req.root_adapter.clone().filter(|n| !n.trim().is_empty()) {
+        Some(adapter_name) => spawn_root_with_adapter(registry, sessions, socket, config, req, adapter_name),
+        None => spawn_root_bare_shell(registry, sessions, socket, req),
+    }
+}
+
+/// No `AgentAdapter`, no configured agent binary — just a plain shell in the
+/// chosen repo, registered `Idle`. Whatever the user later runs inside (e.g.
+/// `claude`) inherits the identity env vars via the PTY's normal
 /// process-environment inheritance, and the existing PostToolUse/Stop hooks pick
 /// it up from there — no new detection/polling code, this is pure push.
-fn spawn_root_shell(
+fn spawn_root_bare_shell(
     registry: &AgentRegistry,
     sessions: &SessionManager,
     socket: &Path,
@@ -114,6 +139,80 @@ fn resolve_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+/// Root path when an adapter was actually chosen (picker step 2, or a
+/// hand-built `Request::Start { adapter: Some(_), .. }`) — the same
+/// adapter-driven launch a child uses, just role=Root, no parent, empty task.
+/// Byte-identical to a human typing e.g. `claude` into today's bare shell
+/// (AGENTS.md), so no `SessionStart`/hook changes were needed: the adapter's
+/// own install hook already branches on `$OVERSEER_ROLE` to push `idle` for a
+/// root vs. `running` for a child, regardless of who launched it. Registers
+/// `Spawning` (not `Idle`) for the same reason a child does — the PTY is
+/// launching but the harness hasn't reported activity yet.
+fn spawn_root_with_adapter(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    config: &Config,
+    req: SpawnRequest,
+    adapter_name: String,
+) -> Result<RegisterResult, SpawnError> {
+    let (adapter, adapter_config) = resolve_adapter(config, &adapter_name)?;
+
+    let args = RegisterArgs {
+        id: None,
+        name: req.repo.clone(), // still named after the repo, same as the bare-shell root
+        role: AgentRole::Root,
+        parent_id: None,
+        adapter: adapter_name,
+        repo: req.repo.clone(),
+        cwd: req.cwd.clone(),
+        branch: req.branch,
+        initial_status: AgentStatus::Spawning,
+    };
+    let result = registry.register(args)?;
+
+    let launch_ctx = LaunchContext {
+        agent_id: result.id.clone(),
+        role: AgentRole::Root,
+        parent_id: None,
+        socket: socket.to_path_buf(),
+        cwd: req.cwd,
+        repo: req.repo,
+        command: adapter_config.command.clone(),
+        extra_args: adapter_config.extra_args.clone(),
+        task: String::new(), // a root has no task, same as the bare-shell path
+    };
+
+    if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
+        registry.remove(&result.id);
+        return Err(SpawnError::Launch(e));
+    }
+    Ok(result)
+}
+
+/// Looks up `adapter_name`'s `AgentAdapter` impl + its resolved `config.adapters`
+/// entry (command/extra_args) — the shared resolution both `spawn_child_agent`
+/// and `spawn_root_with_adapter` need before they can launch. `is_installed()`
+/// (not `overseer_installed()`) is the check here: this guards against a launch
+/// that would crash outright (HARNESSES.md), not against "did the user ever run
+/// `overseer install`" — the TUI's own picker already filters on the latter
+/// before this is ever reached from that path.
+fn resolve_adapter<'a>(
+    config: &'a Config,
+    adapter_name: &str,
+) -> Result<(Box<dyn AgentAdapter>, &'a AdapterConfig), SpawnError> {
+    let adapter = adapter_for(adapter_name)
+        .ok_or_else(|| SpawnError::UnknownAdapter(adapter_name.to_string()))?;
+    if !adapter.is_installed() {
+        return Err(SpawnError::AdapterNotInstalled(adapter_name.to_string()));
+    }
+    let adapter_config = config
+        .adapters
+        .get(adapter_name)
+        .ok_or_else(|| SpawnError::UnknownAdapter(adapter_name.to_string()))?;
+    Ok((adapter, adapter_config))
+}
+
 /// Child path — adapter-driven, registers `Running` since it auto-launches
 /// immediately. `command`/`extra_args` come from the resolved config entry for
 /// `req.adapter_name`, not the adapter name itself — a user can point "claude" at
@@ -126,15 +225,7 @@ fn spawn_child_agent(
     config: &Config,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
-    let adapter = adapter_for(&req.adapter_name)
-        .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
-    if !adapter.is_installed() {
-        return Err(SpawnError::AdapterNotInstalled(req.adapter_name.clone()));
-    }
-    let adapter_config = config
-        .adapters
-        .get(&req.adapter_name)
-        .ok_or_else(|| SpawnError::UnknownAdapter(req.adapter_name.clone()))?;
+    let (adapter, adapter_config) = resolve_adapter(config, &req.adapter_name)?;
 
     let name = req
         .name
@@ -217,6 +308,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             repo: "overseer".to_string(),
             branch: None,
+            root_adapter: None,
         }
     }
 
@@ -514,6 +606,95 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SpawnError::Launch(_)));
         // The failed launch must not leave a phantom "Running" node behind.
+        assert!(registry.snapshot().is_empty());
+    }
+
+    // ── root-adapter launch (the `n` picker's second step) ───────────────────
+
+    fn root_request_with_adapter(adapter: &str) -> SpawnRequest {
+        let mut req = base_request(AgentRole::Root, None);
+        req.root_adapter = Some(adapter.to_string());
+        req
+    }
+
+    #[test]
+    fn spawn_agent_root_with_adapter_registers_spawning_with_that_adapter_label() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let result = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            root_request_with_adapter("claude"),
+        )
+        .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        // Not "shell" and not Idle — this root launched a real adapter
+        // directly, same as a child would, so it starts in the same
+        // "launching, hasn't reported activity yet" state a child does.
+        assert_eq!(dto.adapter, "claude");
+        assert_eq!(dto.status, AgentStatus::Spawning);
+    }
+
+    #[test]
+    fn spawn_agent_root_with_adapter_still_names_node_after_repo_not_task() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let mut req = root_request_with_adapter("claude");
+        req.task = "this text should never become the name".to_string();
+        req.repo = "distinct-repo-name".to_string();
+        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
+            .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        assert_eq!(dto.name, "distinct-repo-name");
+    }
+
+    #[test]
+    fn spawn_agent_root_with_blank_adapter_falls_back_to_bare_shell() {
+        // An empty/whitespace-only `root_adapter` means "no adapter was
+        // actually chosen" — same as `None`, not "launch an adapter named ''".
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let mut req = base_request(AgentRole::Root, None);
+        req.root_adapter = Some("   ".to_string());
+        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
+            .unwrap();
+        let dto = registry.get(&result.id).unwrap();
+        assert_eq!(dto.adapter, "shell");
+        assert_eq!(dto.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn spawn_agent_root_with_unknown_adapter_errors_and_registers_nothing() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let config = Config::default();
+        let err = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            root_request_with_adapter("nonexistent"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "nonexistent"));
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn spawn_agent_root_with_adapter_rolls_back_registration_on_launch_failure() {
+        let registry = AgentRegistry::new();
+        let failing_sessions = SessionManager::dry_run_failing_launch();
+        let config = Config::default();
+        let err = spawn_agent(
+            &registry,
+            &failing_sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            root_request_with_adapter("claude"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SpawnError::Launch(_)));
         assert!(registry.snapshot().is_empty());
     }
 }

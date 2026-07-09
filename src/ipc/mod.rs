@@ -62,7 +62,7 @@ mod tests {
     /// names it "test-repo" — there's no `Register` primitive left to pick an
     /// arbitrary root name).
     fn start_root(socket: &Path) -> AgentId {
-        let resp = send(socket, Request::Start { cwd: None });
+        let resp = send(socket, Request::Start { cwd: None, adapter: None });
         assert!(resp.ok, "start root failed: {:?}", resp.error);
         match resp.data {
             Some(OkBody::Registered { agent_id, .. }) => agent_id,
@@ -299,7 +299,7 @@ mod tests {
     fn integration_start_registers_and_returns_id() {
         let socket = start_server();
 
-        let resp = send(&socket, Request::Start { cwd: None });
+        let resp = send(&socket, Request::Start { cwd: None, adapter: None });
         assert!(resp.ok, "Start failed: {:?}", resp.error);
         let (agent_id, branch) = match resp.data {
             Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
