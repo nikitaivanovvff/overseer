@@ -371,6 +371,7 @@ fn jump_in(app: &mut App) {
         // to the live bottom on jump-in.
         app.scroll_to_bottom(&id);
         app.focus = Focus::Pane;
+        app.status_message = None;
     } else {
         app.status_message = Some("agent is not running".to_string());
     }
@@ -824,6 +825,37 @@ mod tests {
         assert_eq!(ctx.sessions.display_offset(&id), 0, "jumping in must reset scroll to bottom");
 
         ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn jump_in_clears_a_stale_not_running_message_on_a_later_success() {
+        // Regression test: a failed jump-in (e.g. selecting a root right at
+        // spawn time, before its first status push lands) used to leave
+        // "agent is not running" in the footer forever, since only the
+        // failure branch touched `status_message` — a later successful
+        // jump-in, on the same or a different agent, never cleared it.
+        let dead_id = AgentId::new();
+        let live_id = AgentId::new();
+        let sessions =
+            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
+        let (mut app, ctx) = app_with_sessions(sessions);
+        register_agent(&ctx, Some(dead_id));
+        register_agent(&ctx, Some(live_id));
+
+        // First agent in the tree is not alive: jump-in fails and sets the message.
+        jump_in(&mut app);
+        assert_eq!(app.status_message.as_deref(), Some("agent is not running"));
+        assert_eq!(app.focus, Focus::Tree);
+
+        // Move to the live agent and jump in successfully.
+        app.with_tree_mut(|t| t.move_down());
+        jump_in(&mut app);
+
+        assert_eq!(app.focus, Focus::Pane);
+        assert!(
+            app.status_message.is_none(),
+            "a successful jump-in must clear a stale failure message from an earlier attempt"
+        );
     }
 
     // ── keybindings config (PHASE5B.md Task 2) ───────────────────────────────
