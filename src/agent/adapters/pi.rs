@@ -79,7 +79,14 @@ export default function (pi) {{
   }}
   const push = (status) => execFile(OVERSEER_BIN, ["status", status], () => {{}});
 
-  pi.on("session_start", () => execFile(OVERSEER_BIN, ["status", "running", "--adapter", "pi"], () => {{}}));
+  // Root (bare shell the human ran pi inside) is waiting on the human to
+  // prompt it, not doing anything yet -- pushes idle. A spawned child
+  // already has its task as the initial prompt and is working the instant
+  // it launches -- pushes running.
+  pi.on("session_start", () => {{
+    const initial = process.env.OVERSEER_ROLE === "root" ? "idle" : "running";
+    execFile(OVERSEER_BIN, ["status", initial, "--adapter", "pi"], () => {{}});
+  }});
   pi.on("agent_start", () => push("running"));
   pi.on("agent_end", () => push("idle"));
   // session_shutdown: nothing -- the exit watcher owns error, not a lifecycle push.
@@ -219,6 +226,14 @@ mod tests {
         assert!(content.contains(r#""session_start""#));
         assert!(content.contains(r#""agent_start""#));
         assert!(content.contains(r#""agent_end""#));
+    }
+
+    #[test]
+    fn extension_session_start_pushes_idle_for_root_running_for_child() {
+        let content = make_adapter().extension_content();
+        assert!(content.contains(r#"OVERSEER_ROLE === "root""#));
+        assert!(content.contains(r#""idle""#));
+        assert!(content.contains(r#""running""#));
     }
 
     #[test]

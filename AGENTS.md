@@ -181,8 +181,8 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | Hook | Pushes | Why |
 |------|--------|-----|
-| `SessionStart` | `running` | Closes the gap between "user runs claude" and the first tool call; also prints a pointer at the role-specific skill. |
-| `UserPromptSubmit` | `running` | Covers the user prompting inside a pane after the agent had gone `idle`. |
+| `SessionStart` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | A root is a bare shell the human ran `claude` inside themselves — freshly started, it's waiting on the human to type a prompt, so `running` here would be misleading before the first prompt is even submitted; `UserPromptSubmit` is what flips it. A child's task is delivered as its initial prompt, so it's already working the instant it launches (registered `Spawning` — see "Spawn Data Flow") — this is what flips it to `running`. Both branches self-identify the adapter and print a pointer at the role-specific skill. |
+| `UserPromptSubmit` | `running` | The point real work actually begins — covers both a session's first prompt and the user prompting again after the agent had gone `idle`. |
 | `PostToolUse` | `running` | Actively working. |
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
 | `Notification` | `blocked`, downgraded to `idle` for the ~60s idle nag | Fires for both a real permission prompt and the nag; `--from-hook` classifies which via the payload's message text. |
@@ -191,7 +191,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | opencode event | Pushes | Why |
 |------|--------|-----|
-| `session.created` | `running` | A session just started. |
+| `session.created` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | A root is a bare shell waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. Same reasoning as Claude's `SessionStart`. |
 | `session.status` (`status.type === "busy"`) | `running` | The actual "agent is actively working" signal — confirmed live; better grounded than proxying through `tool.execute.after`, which only fires around tool calls. |
 | `session.idle` | `idle` | Finished responding. |
 | `permission.ask` *(a separate hook, not the generic event bus)* | `blocked` | The moment a permission prompt appears. Never sets the hook's own `output.status` — Overseer only observes, the human still decides. |
@@ -202,7 +202,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | pi event | Pushes | Why |
 |------|--------|-----|
-| `session_start` | `running` | Mirrors Claude's `SessionStart` — closes the startup gap. |
+| `session_start` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | Mirrors Claude's `SessionStart`: a root is waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. |
 | `agent_start` | `running` | A turn begins. |
 | `agent_end` | `idle` | A turn ends. |
 | `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |

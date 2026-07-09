@@ -67,7 +67,12 @@ export const OverseerPlugin = async () => {{
   return {{
     event: async ({{ event }}) => {{
       if (event.type === "session.created") {{
-        execFile(OVERSEER_BIN, ["status", "running", "--adapter", "opencode"], () => {{}});
+        // Root (bare shell the human ran opencode inside) is waiting on the
+        // human to prompt it, not doing anything yet -- pushes idle. A
+        // spawned child already has its task as the initial prompt and is
+        // working the instant it launches -- pushes running.
+        const initial = process.env.OVERSEER_ROLE === "root" ? "idle" : "running";
+        execFile(OVERSEER_BIN, ["status", initial, "--adapter", "opencode"], () => {{}});
       }} else if (event.type === "session.status" && event.properties?.status?.type === "busy") {{
         push("running");
       }} else if (event.type === "session.idle") {{
@@ -234,9 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn plugin_maps_session_created_and_busy_status_to_running() {
+    fn plugin_maps_session_created_to_idle_for_root_running_for_child() {
         let content = make_adapter().plugin_content();
         assert!(content.contains(r#""session.created""#));
+        assert!(content.contains(r#"OVERSEER_ROLE === "root""#));
+        assert!(content.contains(r#""idle""#));
         assert!(content.contains(r#""busy""#));
     }
 
