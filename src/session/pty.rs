@@ -75,6 +75,19 @@ impl EventListener for EventProxy {
             }
             Event::ChildExit(status) => {
                 self.alive.store(false, Ordering::Relaxed);
+                // Diagnostic breadcrumb for an otherwise-silent PTY death (a
+                // real user report: a root's shell exiting unexpectedly with
+                // no on-screen error) — printed to stderr, which the detached
+                // daemon redirects to daemon.log, so the next occurrence
+                // leaves an actual exit code/signal to look at instead of
+                // nothing.
+                use std::os::unix::process::ExitStatusExt;
+                eprintln!(
+                    "overseer: agent {} PTY child exited: {status:?} (code={:?}, signal={:?})",
+                    self.id.short(),
+                    status.code(),
+                    status.signal(),
+                );
                 self.exits
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

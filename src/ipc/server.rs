@@ -564,6 +564,14 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
         } else {
             (AgentStatus::Error, Some("agent process exited".to_string()))
         };
+        if let Some(agent) = registry.get(&id) {
+            eprintln!(
+                "overseer: agent {} '{}' ({:?}) swept to {status:?} (clean_exit={success})",
+                id.short(),
+                agent.name,
+                agent.role,
+            );
+        }
         let _ = registry.set_status(&id, status, message, None, None);
     }
 }
