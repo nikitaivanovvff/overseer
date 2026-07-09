@@ -288,6 +288,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | `Ctrl-u` / `Ctrl-d` | Scroll the selected agent's pane up/down half a page (tree focus only, fixed — see "Scrollback" below) |
 | `Ctrl-y` / `Ctrl-e` | Scroll one line up/down (nvim semantics: `e` = down; fixed) |
 | `G` | Jump the selected agent's pane back to the live bottom (fixed) |
+| mouse wheel (over pane) | Scroll the selected agent's pane — works in tree focus *and* pane focus, unlike the keys above (see "Scrollback" below) |
 
 ### Search
 
@@ -299,9 +300,9 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 
 ### Scrollback
 
-While tree-focused, `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G` scroll the *selected* agent's pane — a read-only preview in that state, so these never collide with a real agent TUI's own use of the same keys (readline's `Ctrl-u` kill-line). Unavailable once a pane is focused (`Ctrl-h` remains the only key a focused pane intercepts).
+While tree-focused, `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/`Ctrl-e`/`G` scroll the *selected* agent's pane — a read-only preview in that state, so these never collide with a real agent TUI's own use of the same keys (readline's `Ctrl-u` kill-line). These keys stay off-limits once a pane is focused (`Ctrl-h` remains the only key a focused pane intercepts) — but the mouse wheel scrolls the pane in *both* states, focused included. Scroll it over the pane (`MouseEventKind::ScrollUp`/`ScrollDown`, `handle_mouse_event` in `tui.rs`) and it moves the selected agent's history, 3 lines per notch, whether you're previewing from the tree or jumped in. This isn't stealing anything from the agent's own TUI: `EnableMouseCapture` is armed on Overseer's own controlling terminal, and each agent runs in its own PTY (`session::pty`) that only ever receives bytes Overseer explicitly writes to it — no mouse forwarding exists, so a scroll event was never reaching the agent in the first place. Scrolling outside the pane's rect (e.g. over the tree) is ignored.
 
-The scrolled offset resets to the live bottom on cursor move and on jump-in, so you never interact with a pane mid-scroll. The pane border shows the state: `" agent [scrolled ↑N — G to follow] "`, reverting to `" agent "` at the bottom.
+The scrolled offset resets to the live bottom on cursor move and on jump-in, so you never *start* interacting with a pane mid-scroll — but once focused, scrolling back down (mouse wheel) is what gets you back to the tail, since `G` forwards straight to the agent while focused. The pane border shows the state throughout: `" agent [scrolled ↑N — G to follow] "` while tree-focused, `" agent [FOCUSED, scrolled ↑N — scroll to follow] "` while focused and scrolled, reverting to `" agent "` / `" agent [FOCUSED — Ctrl-h to leave] "` at the live bottom.
 
 Scrolling happens where the real terminal state lives — the daemon (`SessionManager::scroll_display`/`scroll_to_bottom`/`display_offset`). A daemon-attached TUI sends `Request::Scroll { delta }` / `Request::ScrollToBottom` on the attach connection (no `agent_id` — always the connection's watched agent), and gets back a fresh `GridSnapshot` immediately (scrolling doesn't touch the PTY, so it never bumps the generation counter the normal output poll relies on). `--mock` calls `SessionManager` directly, no round trip.
 

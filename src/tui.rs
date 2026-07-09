@@ -11,10 +11,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::{Position, Rect}, Terminal};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::agent::AgentTree;
+use crate::agent::{AgentId, AgentTree};
 use crate::app::{App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction};
 use crate::config::{Action, Config, KeyBinding, Keybindings};
 use crate::daemon;
@@ -221,6 +221,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                     handle_tree_click(app, &layout, mouse);
                 }
+                Event::Mouse(mouse) => handle_mouse_event(app, mouse, pane_rect, selected_id.as_ref()),
                 _ => {}
             }
         }
@@ -370,6 +371,35 @@ fn key_binding_from_event(key: &KeyEvent) -> Option<KeyBinding> {
 fn start_search(app: &mut App) {
     app.status_message = None;
     app.input = Some(InputState { action: PendingAction::Search, buffer: String::new() });
+}
+
+/// Lines moved per wheel notch — matches the typical terminal/GUI default
+/// (3 lines), not tied to `Ctrl-y`/`Ctrl-e`'s single-line nvim semantics.
+const MOUSE_SCROLL_LINES: i32 = 3;
+
+/// Mouse wheel over the pane scrolls the selected agent's history, in
+/// *both* `Focus::Tree` (alongside the existing `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/
+/// `Ctrl-e`/`G` preview keys) and `Focus::Pane` — the jumped-in case, where
+/// no keyboard key can do this without stealing something the agent's own
+/// TUI needs (SCROLLBACK.md / AGENTS.md "Keybinding house style"). This is
+/// safe specifically because it steals nothing: `EnableMouseCapture` is
+/// armed on *our own* controlling terminal (`run_tui`, above), and the
+/// agent runs in its own PTY (`session::pty`) that only ever receives bytes
+/// Overseer explicitly writes to it (`encode_key`/`encode_paste`) — no
+/// mouse forwarding exists, so a scroll event was never reaching the
+/// agent's TUI in the first place. Scoped to `ScrollUp`/`ScrollDown` only
+/// (not clicks) and to `pane_rect` so it never fires while the mouse is
+/// over the tree half.
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent, pane_rect: Rect, selected_id: Option<&AgentId>) {
+    if !pane_rect.contains(Position::new(mouse.column, mouse.row)) {
+        return;
+    }
+    let Some(id) = selected_id else { return };
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll(id, MOUSE_SCROLL_LINES),
+        MouseEventKind::ScrollDown => app.scroll(id, -MOUSE_SCROLL_LINES),
+        _ => {}
+    }
 }
 
 fn scroll_selected(app: &mut App, delta: i32) {
@@ -849,6 +879,83 @@ mod tests {
         assert_eq!(ctx.sessions.display_offset(&id), 0, "jumping in must reset scroll to bottom");
 
         ctx.sessions.kill(&id);
+    }
+
+    // ── mouse wheel scrollback (SCROLLBACK.md) ───────────────────────────────
+    //
+    // Covers the one path keyboard scrollback deliberately can't: scrolling
+    // while `Focus::Pane` (jumped in). Keys stay off-limits there (see
+    // `handle_pane_key`'s doc comment — everything but `Ctrl-h` forwards to
+    // the agent untouched), but the mouse wheel never reached the agent to
+    // begin with (no mouse forwarding exists, unlike keys/paste), so routing
+    // it to local scroll control steals nothing.
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn mouse_scroll_up_moves_into_history_while_pane_is_focused() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
+        assert_eq!(app.focus, Focus::Pane);
+
+        let pane_rect = Rect::new(0, 0, 80, 20);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn mouse_scroll_down_moves_back_toward_live() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
+
+        let pane_rect = Rect::new(0, 0, 80, 20);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollDown, 10, 10), pane_rect, Some(&id));
+
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn mouse_scroll_outside_the_pane_rect_is_ignored() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
+
+        // Pane occupies columns/rows [0,80)x[0,20) — (90, 25) is outside it
+        // (e.g. over the tree half or the status bar).
+        let pane_rect = Rect::new(0, 0, 80, 20);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 90, 25), pane_rect, Some(&id));
+
+        assert_eq!(ctx.sessions.display_offset(&id), 0, "scroll outside the pane must not move it");
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn mouse_scroll_also_works_from_tree_focus_preview() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        assert_eq!(app.focus, Focus::Tree);
+
+        let pane_rect = Rect::new(0, 0, 80, 20);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn mouse_scroll_with_no_selection_does_not_panic() {
+        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
+        let pane_rect = Rect::new(0, 0, 80, 20);
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, None);
     }
 
     #[test]

@@ -52,16 +52,25 @@ fn placeholder(text: &'static str) -> Paragraph<'static> {
     Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
 }
 
-/// Pure — the pane border's title. Focused wins over scrolled (jump-in
-/// always resets scroll to bottom first, per SCROLLBACK.md, so a pane is
-/// never simultaneously focused and scrolled in practice, but focused still
-/// takes priority here rather than relying on that invariant holding).
-/// `alive` wins over everything else that isn't the escape hint: a dead
-/// session's pane otherwise looks identical to a live one that's just
-/// momentarily quiet, which read as a frozen terminal to a real user who
-/// typed `exit` while jumped in and got no further feedback at all.
+/// Pure — the pane border's title. `alive` wins over everything else that
+/// isn't the escape hint: a dead session's pane otherwise looks identical to
+/// a live one that's just momentarily quiet, which read as a frozen
+/// terminal to a real user who typed `exit` while jumped in and got no
+/// further feedback at all.
+///
+/// Focused and scrolled are no longer mutually exclusive (SCROLLBACK.md):
+/// the mouse wheel scrolls a focused pane too, so a jumped-in agent can sit
+/// mid-scrollback — the title must say so, or scrolled-but-focused looks
+/// identical to live-and-focused with no way to tell you're not looking at
+/// the tail. `G` isn't offered as the way back while focused since it's a
+/// key that forwards straight to the agent there (only `Ctrl-h` is
+/// intercepted) — "scroll to follow" describes the one thing that *is*
+/// guaranteed to work in both states.
 fn pane_title(focused: bool, display_offset: usize, alive: bool) -> String {
     match (focused, alive) {
+        (true, true) if display_offset > 0 => {
+            format!(" agent [FOCUSED, scrolled ↑{display_offset} — scroll to follow] ")
+        }
         (true, true) => " agent [FOCUSED — Ctrl-h to leave] ".to_string(),
         (true, false) => " agent [exited — Ctrl-h to leave] ".to_string(),
         (false, false) => " agent [exited] ".to_string(),
@@ -270,8 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn pane_title_focused_wins_over_scrolled() {
-        assert_eq!(pane_title(true, 42, true), " agent [FOCUSED — Ctrl-h to leave] ");
+    fn pane_title_shows_scrolled_offset_while_focused() {
+        // Focused and scrolled are simultaneous now that the mouse wheel
+        // scrolls a focused pane (SCROLLBACK.md) — both must show, with a
+        // "scroll to follow" hint rather than "G to follow" since `G`
+        // forwards to the agent while focused, not back to the tail.
+        assert_eq!(pane_title(true, 42, true), " agent [FOCUSED, scrolled ↑42 — scroll to follow] ");
     }
 
     #[test]
