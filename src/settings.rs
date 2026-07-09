@@ -4,10 +4,48 @@
 /// `--uninstall` can remove only ours without touching user settings.
 use serde_json::{json, Value};
 
+/// Substrings that have appeared together in every generation of the
+/// Overseer-authored SessionStart printf command, from before the
+/// `_overseer: true` tagging convention existed through the current
+/// role-specific-skill text. An entry matching both, untagged, is a relic
+/// from an install predating the tag — not something a user wrote, since
+/// no user hook would reference our own skill-following instructions.
+///
+/// Confirmed present in every historical variant (see git log on this file
+/// and on src/agent/adapters/claude.rs):
+///   - "...Follow the overseer skill.\n" "$OVERSEER_ROLE" || true
+///   - "...Follow the overseer skill.\n" "$OVERSEER_ROLE"; {post_tool_cmd}; } || true
+///   - "...Follow the overseer skill.\n" "$OVERSEER_ROLE"; {running_cmd}; } || true
+///   - "...Follow the overseer-%s skill.\n" "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {running_cmd}; } || true
+///   - "...Follow the overseer-%s skill.\n" "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {session_start_status_cmd}; } || true
+const LEGACY_SIGNATURE_PARTS: [&str; 2] = ["OVERSEER_AGENT_ID", "Follow the overseer"];
+
+/// True if `entry` is an Overseer-authored hook entry: either tagged with
+/// `_overseer: true` (current convention), or — for installs that predate
+/// that tag — carrying the legacy command signature every generation of our
+/// hook text has contained. Only opencode/pi are exempt from the legacy
+/// check since they never emitted JSON hook entries like this.
+fn is_overseer_entry(entry: &Value) -> bool {
+    if entry.get("_overseer").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
+        return false;
+    };
+    hooks.iter().any(|h| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .map(|cmd| LEGACY_SIGNATURE_PARTS.iter().all(|part| cmd.contains(part)))
+            .unwrap_or(false)
+    })
+}
+
 /// Deep-merges `overlay` hooks into `existing` settings.
 ///
 /// For each hook event in `overlay["hooks"]`:
-/// - Removes any existing entries with `_overseer: true` (idempotent re-run).
+/// - Removes any existing entries with `_overseer: true`, plus any untagged
+///   entries matching the legacy Overseer signature (idempotent re-run, and
+///   convergent for installs from before the tagging convention existed).
 /// - Appends the overlay entries.
 ///
 /// Unrelated keys in `existing` are untouched.
@@ -38,11 +76,8 @@ pub fn merge_hooks(existing: &mut Value, overlay: &Value) {
             .cloned()
             .unwrap_or_default();
 
-        // Drop our old entries, keep the user's.
-        let mut kept: Vec<Value> = current
-            .into_iter()
-            .filter(|e| e.get("_overseer").and_then(|v| v.as_bool()) != Some(true))
-            .collect();
+        // Drop our old entries (tagged or legacy-signature), keep the user's.
+        let mut kept: Vec<Value> = current.into_iter().filter(|e| !is_overseer_entry(e)).collect();
         kept.extend(new_arr.clone());
         existing_hooks.insert(event.clone(), Value::Array(kept));
     }
@@ -78,8 +113,10 @@ pub fn remove_json_array(existing: &mut Value, key: &str, entries: &[String]) {
     }
 }
 
-/// Removes all Overseer-managed hook entries (those with `_overseer: true`) from
-/// `settings`. Hook event keys that become empty arrays are removed entirely.
+/// Removes all Overseer-managed hook entries from `settings`: those tagged
+/// `_overseer: true`, plus untagged legacy entries matching the pre-tagging
+/// signature (see `is_overseer_entry`). Hook event keys that become empty
+/// arrays are removed entirely.
 pub fn remove_hooks(settings: &mut Value) {
     let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return;
@@ -88,7 +125,7 @@ pub fn remove_hooks(settings: &mut Value) {
     let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
         if let Some(arr) = hooks.get_mut(&event).and_then(|v| v.as_array_mut()) {
-            arr.retain(|e| e.get("_overseer").and_then(|v| v.as_bool()) != Some(true));
+            arr.retain(|e| !is_overseer_entry(e));
         }
         // Remove the key if the array is now empty.
         let is_empty = hooks
@@ -199,6 +236,76 @@ mod tests {
         assert!(cmd.contains("/new/"), "old entry was not replaced");
     }
 
+    /// The very first hook command we ever shipped, from before the
+    /// `_overseer: true` tag existed — no `status` push, single shared skill.
+    fn legacy_untagged_entry() -> Value {
+        json!({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": r#"[ -n "$OVERSEER_AGENT_ID" ] && printf 'You are managed by Overseer (role: %s). Follow the overseer skill.\n' "$OVERSEER_ROLE" || true"#
+            }]
+        })
+    }
+
+    #[test]
+    fn merge_removes_untagged_legacy_overseer_duplicates() {
+        let mut settings = json!({
+            "hooks": {
+                "SessionStart": [legacy_untagged_entry(), legacy_untagged_entry()]
+            }
+        });
+        merge_hooks(&mut settings, &overlay_session_start());
+        let arr = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "legacy untagged duplicates should be dropped, not accumulated");
+        assert!(
+            arr[0].get("_overseer") == Some(&json!(true)),
+            "surviving entry should be the freshly tagged one"
+        );
+    }
+
+    #[test]
+    fn merge_leaves_genuine_user_hook_alone() {
+        // Unrelated to Overseer entirely: untagged, and doesn't mention either
+        // signature substring, so it must survive the legacy-signature filter
+        // exactly like it already survives the `_overseer` tag filter.
+        let unrelated_user_hook = user_entry("echo hello && ./scripts/lint.sh");
+        let mut settings = json!({
+            "hooks": {
+                "PostToolUse": [unrelated_user_hook.clone()]
+            }
+        });
+        merge_hooks(&mut settings, &overlay());
+        let arr = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        // User entry preserved, plus the overseer entry appended.
+        assert_eq!(arr.len(), 2, "user entry must survive merge: {arr:?}");
+        assert!(arr.contains(&unrelated_user_hook));
+    }
+
+    #[test]
+    fn merge_still_replaces_currently_tagged_entry() {
+        let mut settings = json!({
+            "hooks": {
+                "SessionStart": [overseer_entry("status running --from-hook --adapter claude")]
+            }
+        });
+        merge_hooks(&mut settings, &overlay_session_start());
+        let arr = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "stale tagged entry should be replaced, not duplicated");
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("OVERSEER_ROLE"), "should be the fresh role-branching command: {cmd}");
+    }
+
+    fn overlay_session_start() -> Value {
+        json!({
+            "hooks": {
+                "SessionStart": [overseer_entry(
+                    r#"[ -n "$OVERSEER_AGENT_ID" ] && { printf 'You are managed by Overseer (role: %s). Follow the overseer-%s skill.\n' "$OVERSEER_ROLE" "$OVERSEER_ROLE"; if [ "$OVERSEER_ROLE" = "root" ]; then overseer status idle; else overseer status running; fi; } || true"#
+                )]
+            }
+        })
+    }
+
     // --- remove_hooks ---
 
     #[test]
@@ -230,6 +337,19 @@ mod tests {
         let mut settings = json!({});
         remove_hooks(&mut settings); // must not panic
         assert!(settings.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_also_cleans_untagged_legacy_entries() {
+        let mut settings = json!({
+            "hooks": {
+                "SessionStart": [legacy_untagged_entry(), user_entry("echo hi")]
+            }
+        });
+        remove_hooks(&mut settings);
+        let arr = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "legacy entry should be gone, user entry kept");
+        assert_eq!(arr[0]["hooks"][0]["command"], "echo hi");
     }
 
     #[test]
