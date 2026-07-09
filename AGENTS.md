@@ -155,7 +155,7 @@ pub trait AgentAdapter: Send + Sync {
 
 `InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
-- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those.
+- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those. Also recognizes and cleans up pre-tagging-era Overseer hooks: entries lacking the tag but matching the legacy command signature (containing both `OVERSEER_AGENT_ID` and `Follow the overseer`) are treated as ours too, so upgrading from an install that predates the tag converges instead of leaving orphaned duplicates behind (see `is_overseer_entry` in `src/settings.rs`).
 - `JsonArrayMerge { key, entries }` — generic: merges/removes string `entries` into/from a named top-level JSON array (opencode's `instructions`); uninstall removes exactly `entries` back out.
 
 `legacy_paths()` names a previous install layout to delete outright rather than leave to rot. Nothing is ever written into the user's repo, for any adapter.
