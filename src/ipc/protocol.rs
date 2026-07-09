@@ -83,11 +83,16 @@ pub enum Request {
     Agent {
         agent_id: AgentId,
     },
-    /// Server-side launch: register a root agent and start a bare shell for it in
-    /// its own PTY, in `cwd` (defaults to the server's own cwd). No adapter is
-    /// launched — the user runs their own agent inside it whenever ready.
+    /// Server-side launch: register a root agent and start it in its own PTY, in
+    /// `cwd` (defaults to the server's own cwd). `adapter` is `None` for the
+    /// default bare shell — the user runs their own agent inside it whenever
+    /// ready — or `Some(name)` to launch that adapter directly instead (empty
+    /// task, same launch path a child uses), the TUI's two-step `n` picker's
+    /// second step once at least one adapter is `overseer_installed()`.
     Start {
         cwd: Option<std::path::PathBuf>,
+        #[serde(default)]
+        adapter: Option<String>,
     },
     /// Register + launch a child of `parent_id`. Rejected if the parent is itself a
     /// child (flat tree: roots + children only — enforced here, and only here).
@@ -458,11 +463,25 @@ mod tests {
 
     #[test]
     fn request_start_round_trip() {
-        let req = Request::Start { cwd: Some(std::path::PathBuf::from("/tmp/myrepo")) };
+        let req = Request::Start {
+            cwd: Some(std::path::PathBuf::from("/tmp/myrepo")),
+            adapter: Some("claude".to_string()),
+        };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"cmd\":\"start\""), "should serialize as 'start'");
         let back: Request = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, Request::Start { cwd } if cwd == Some(std::path::PathBuf::from("/tmp/myrepo"))));
+        assert!(matches!(back, Request::Start { cwd, adapter }
+            if cwd == Some(std::path::PathBuf::from("/tmp/myrepo")) && adapter == Some("claude".to_string())));
+    }
+
+    #[test]
+    fn request_start_adapter_defaults_to_none_when_absent() {
+        // Older callers (or a hand-written request) may omit `adapter`
+        // entirely — it must deserialize as `None`, preserving today's
+        // bare-shell behavior exactly.
+        let raw = r#"{"cmd":"start","cwd":null}"#;
+        let req: Request = serde_json::from_str(raw).unwrap();
+        assert!(matches!(req, Request::Start { adapter: None, .. }));
     }
 
     #[test]

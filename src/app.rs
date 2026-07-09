@@ -14,7 +14,10 @@ use crate::ipc::AppCtx;
 /// What a text-input prompt (`n` / `s` / `/`) is being collected for.
 #[derive(Debug, Clone)]
 pub enum PendingAction {
-    SpawnRoot,
+    /// `adapter` is the harness chosen in step 1 of `n` (`None` for "bare
+    /// terminal", or if the picker was skipped outright because nothing was
+    /// `overseer_installed()` — see `PickerState`).
+    SpawnRoot { adapter: Option<String> },
     SpawnChild { parent_id: AgentId },
     /// Fuzzy agent search (PHASE5B.md) — unlike the spawn prompts, this one
     /// re-filters the tree live as `buffer` changes rather than waiting for
@@ -26,6 +29,24 @@ pub enum PendingAction {
 pub struct InputState {
     pub action: PendingAction,
     pub buffer: String,
+}
+
+/// One selectable entry in the root-spawn picker (`n`, step 1 of 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerOption {
+    Adapter(String),
+    BareTerminal,
+}
+
+/// Active while the root-spawn adapter picker is open — step 1 of `n`,
+/// reached only when at least one adapter is `overseer_installed()` (see
+/// `adapters::installed_adapter_names`). When nothing is installed, `n`
+/// skips straight to `InputState`'s repo-path prompt with
+/// `PendingAction::SpawnRoot { adapter: None }`, exactly as it did before
+/// this picker existed — a fresh/first-time user sees no behavior change.
+pub struct PickerState {
+    pub options: Vec<PickerOption>,
+    pub selected: usize,
 }
 
 /// What a y/n confirmation prompt is asking about.
@@ -83,6 +104,8 @@ pub struct App {
     pub tick: u64,
     pub input: Option<InputState>,
     pub confirm: Option<ConfirmState>,
+    /// `n` step 1 (root-spawn adapter picker) — see `PickerState`.
+    pub picker: Option<PickerState>,
     pub status_message: Option<String>,
     pub focus: Focus,
     /// `?` popup (PHASE5B.md) — any key closes it; doesn't interact with
@@ -105,6 +128,7 @@ impl App {
             tick: 0,
             input: None,
             confirm: None,
+            picker: None,
             status_message: None,
             focus: Focus::Tree,
             show_help: false,
@@ -767,7 +791,7 @@ mod tests {
         // Must be a real git repo: `test_app` wires up a real (non-dry-run)
         // `GitClient`, and `Start` now rejects a non-git cwd outright.
         let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let resp = app.dispatch(Request::Start { cwd: Some(cwd) });
+        let resp = app.dispatch(Request::Start { cwd: Some(cwd), adapter: None });
         assert!(resp.ok, "dispatch failed: {:?}", resp.error);
     }
 

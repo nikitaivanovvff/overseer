@@ -127,6 +127,34 @@ pub trait AgentAdapter: Send + Sync {
         true
     }
 
+    /// Whether the user has actually run `overseer install` for this adapter
+    /// — checked with real I/O (`Path::exists`), same as `is_installed`, but
+    /// a different question: `is_installed` only answers "will `spawn_command`
+    /// launch without crashing" (true for most adapters even with zero
+    /// Overseer content on disk); this answers "did an install actually
+    /// happen here." Used by the root-spawn picker (`n`) to decide which
+    /// harnesses to offer.
+    ///
+    /// Default: every `install_files()` entry with `MergeStrategy::Overwrite`
+    /// must exist under `user_config_dir()`. Those are the files install
+    /// writes outright and only Overseer would ever create (a skill file, a
+    /// plugin script, an extension) — unlike a `JsonMerge`/`JsonArrayMerge`
+    /// target (e.g. claude's `settings.json`), which can pre-exist for
+    /// reasons that have nothing to do with Overseer, so its mere presence
+    /// isn't good evidence of an install. Works uniformly for all three
+    /// adapters (each has at least one `Overwrite` file) with no override
+    /// needed; vacuously `false` if an adapter somehow has none.
+    fn overseer_installed(&self) -> bool {
+        let Some(dir) = self.user_config_dir() else { return false };
+        let artifacts: Vec<PathBuf> = self
+            .install_files()
+            .into_iter()
+            .filter(|f| matches!(f.merge, MergeStrategy::Overwrite))
+            .map(|f| f.path)
+            .collect();
+        !artifacts.is_empty() && artifacts.iter().all(|path| dir.join(path).exists())
+    }
+
     // --- launch (runtime, pure) ---
 
     /// Returns the command to run inside the agent's PTY (program + args; no cwd/env).
@@ -144,6 +172,23 @@ pub fn adapter_for(name: &str) -> Option<Box<dyn AgentAdapter>> {
         "pi" => Some(Box::new(pi::PiAdapter::new())),
         _ => None,
     }
+}
+
+/// Every name `adapter_for` recognizes, in a fixed order — what the
+/// root-spawn picker (`n`) iterates over to find installed harnesses.
+pub const ADAPTER_NAMES: [&str; 3] = ["claude", "opencode", "pi"];
+
+/// Every `ADAPTER_NAMES` entry whose `overseer_installed()` is true, in
+/// `ADAPTER_NAMES` order — the root-spawn picker's (`n`) adapter options,
+/// before the literal "bare terminal" entry is appended.
+pub fn installed_adapter_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for name in ADAPTER_NAMES {
+        if adapter_for(name).is_some_and(|a| a.overseer_installed()) {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -182,6 +227,42 @@ mod tests {
         let env = identity_env(&identity);
         assert_eq!(env.get("OVERSEER_ROLE").map(String::as_str), Some("child"));
         assert_eq!(env.get("OVERSEER_PARENT_ID"), Some(&parent.0.to_string()));
+    }
+
+    // ── installed_adapter_names ───────────────────────────────────────────────
+
+    /// Points every adapter's config-dir env var at a fresh, empty temp
+    /// dir at once — one `set_all` call, since a single-key `EnvGuard`
+    /// can't be held three times over on one thread (see `test_env`'s doc
+    /// comment).
+    fn with_no_adapters_installed() -> crate::test_env::EnvGuard {
+        let dir = std::env::temp_dir().join(format!("overseer-no-adapters-test-{}", uuid::Uuid::new_v4()));
+        crate::test_env::EnvGuard::set_all(&[
+            ("CLAUDE_CONFIG_DIR", dir.join("claude").to_str().unwrap()),
+            ("XDG_CONFIG_HOME", dir.join("xdg").to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", dir.join("pi").to_str().unwrap()),
+        ])
+    }
+
+    #[test]
+    fn installed_adapter_names_empty_when_nothing_installed() {
+        let _env = with_no_adapters_installed();
+        assert_eq!(installed_adapter_names(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn installed_adapter_names_finds_claude_alone_in_adapter_names_order() {
+        let _env = with_no_adapters_installed();
+        let claude_dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap();
+        let adapter = adapter_for("claude").unwrap();
+        for file in adapter.install_files() {
+            if matches!(file.merge, MergeStrategy::Overwrite) {
+                let full = std::path::Path::new(&claude_dir).join(&file.path);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(&full, "x").unwrap();
+            }
+        }
+        assert_eq!(installed_adapter_names(), vec!["claude".to_string()]);
     }
 
     #[test]

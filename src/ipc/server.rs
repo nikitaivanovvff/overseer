@@ -704,6 +704,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 repo: "overseer".to_string(),
                 branch: None,
+                root_adapter: None,
             },
         )
         .unwrap()

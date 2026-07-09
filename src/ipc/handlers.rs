@@ -48,7 +48,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             None => Response::err(format!("unknown agent: {}", agent_id.short())),
         },
 
-        Request::Start { cwd } => {
+        Request::Start { cwd, adapter } => {
             let cwd = cwd.unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
             });
@@ -71,12 +71,13 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             let req = SpawnRequest {
                 role: AgentRole::Root,
                 parent_id: None,
-                task: String::new(),         // ignored for Root — no adapter is launched
+                task: String::new(),         // ignored for Root — a chosen adapter still gets no task
                 name: None,                  // ignored for Root — always named after the repo
-                adapter_name: String::new(), // ignored for Root — always a bare shell
+                adapter_name: String::new(), // ignored for Root — see root_adapter instead
                 cwd,
                 repo,
                 branch: Some(branch),
+                root_adapter: adapter,
             };
 
             match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
@@ -126,6 +127,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 cwd,
                 repo: parent.repo,
                 branch: None,
+                root_adapter: None,
             };
 
             match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
@@ -293,7 +295,7 @@ mod tests {
     #[test]
     fn dispatch_start_registers_root_and_returns_agent_id() {
         let ctx = make_ctx();
-        let resp = dispatch(&ctx, Request::Start { cwd: None });
+        let resp = dispatch(&ctx, Request::Start { cwd: None, adapter: None });
         assert!(resp.ok, "Start failed: {:?}", resp.error);
         let (agent_id, branch) = match resp.data {
             Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
@@ -317,6 +319,41 @@ mod tests {
         assert_eq!(agents[0].status, AgentStatus::Idle);
     }
 
+    // ── Start with an adapter (the `n` picker's second step) ──────────────────
+
+    #[test]
+    fn dispatch_start_with_adapter_launches_it_directly_instead_of_a_bare_shell() {
+        let ctx = make_ctx();
+        let resp = dispatch(&ctx, Request::Start { cwd: None, adapter: Some("claude".to_string()) });
+        assert!(resp.ok, "Start with an adapter failed: {:?}", resp.error);
+        let agent_id = match resp.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+
+        let dto = match dispatch(&ctx, Request::Agent { agent_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        // Not "shell"/Idle — a real adapter was launched directly, same
+        // "launching, hasn't reported activity yet" state a child starts in.
+        assert_eq!(dto.adapter, "claude");
+        assert_eq!(dto.status, AgentStatus::Spawning);
+        // Still named after the repo, same as the bare-shell root.
+        assert_eq!(dto.name, "test-repo");
+    }
+
+    #[test]
+    fn dispatch_start_with_unknown_adapter_errors_and_registers_nothing() {
+        let ctx = make_ctx();
+        let resp = dispatch(&ctx, Request::Start { cwd: None, adapter: Some("nonexistent".to_string()) });
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("unknown adapter"));
+
+        let list_resp = dispatch(&ctx, Request::List);
+        assert!(matches!(list_resp.data, Some(OkBody::Agents { agents }) if agents.is_empty()));
+    }
+
     #[test]
     fn dispatch_start_nonexistent_cwd_is_error_and_registers_nothing() {
         // A typo'd path must still hard-fail -- it must not silently register
@@ -324,7 +361,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("overseer-test-missing-{}", AgentId::new()));
 
         let ctx = make_ctx_with_git(GitClient::new());
-        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()) });
+        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()), adapter: None });
 
         assert!(!resp.ok, "Start on a nonexistent cwd must fail, got: {:?}", resp.data);
         let error = resp.error.unwrap_or_default();
@@ -351,7 +388,7 @@ mod tests {
         let expected_name = dir.file_name().unwrap().to_string_lossy().to_string();
 
         let ctx = make_ctx_with_git(GitClient::new());
-        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()) });
+        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()), adapter: None });
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -375,7 +412,7 @@ mod tests {
     }
 
     fn start_root(ctx: &AppCtx) -> AgentId {
-        let resp = dispatch(ctx, Request::Start { cwd: None });
+        let resp = dispatch(ctx, Request::Start { cwd: None, adapter: None });
         match resp.data {
             Some(OkBody::Registered { agent_id, .. }) => agent_id,
             other => panic!("expected Registered, got {other:?}"),

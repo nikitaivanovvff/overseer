@@ -344,4 +344,49 @@ mod tests {
         let env = a.env_inject(&ctx);
         assert!(!env.contains_key("OVERSEER_TASK"));
     }
+
+    // ── overseer_installed ────────────────────────────────────────────────────
+
+    fn temp_config_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("overseer-opencode-installed-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn overseer_installed_false_on_a_fresh_config_dir() {
+        let dir = temp_config_dir();
+        let _env = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", dir.to_str().unwrap());
+        // XDG_CONFIG_HOME joins "opencode" itself (`user_config_dir`) — assert
+        // against the adapter's own resolved dir, not `dir` directly.
+        assert!(!make_adapter().overseer_installed());
+    }
+
+    #[test]
+    fn overseer_installed_false_with_only_the_plugin_written() {
+        let xdg = temp_config_dir();
+        let _env = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", xdg.to_str().unwrap());
+        let a = make_adapter();
+        let config_dir = a.user_config_dir().unwrap();
+        let plugin = config_dir.join(PLUGIN_PATH);
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, "x").unwrap();
+        assert!(!a.overseer_installed(), "instruction docs still missing");
+        std::fs::remove_dir_all(&xdg).ok();
+    }
+
+    #[test]
+    fn overseer_installed_true_once_plugin_and_both_instructions_exist_without_config_jsonc() {
+        let xdg = temp_config_dir();
+        let _env = crate::test_env::EnvGuard::set("XDG_CONFIG_HOME", xdg.to_str().unwrap());
+        let a = make_adapter();
+        let config_dir = a.user_config_dir().unwrap();
+        for path in [PLUGIN_PATH, ROOT_INSTRUCTIONS_PATH, CHILD_INSTRUCTIONS_PATH] {
+            let full = config_dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "x").unwrap();
+        }
+        // opencode.jsonc (JsonArrayMerge) deliberately left unwritten — same
+        // "can pre-exist for unrelated reasons" rationale as claude's settings.json.
+        assert!(a.overseer_installed());
+        std::fs::remove_dir_all(&xdg).ok();
+    }
 }
