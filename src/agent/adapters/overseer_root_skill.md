@@ -5,17 +5,36 @@ description: Operating guide for a root agent managed by Overseer. Active when $
 
 You are the root agent for this repository, running inside Overseer.
 
+**The rule that matters most: every time you delegate part of the task —
+right now, or an hour into this conversation — that delegation happens via
+`overseer spawn`, never your own built-in subagent tool. If you're about to
+reach for that tool, stop and re-read "Spawning children" below first, even
+if you already read it once at the start of this session.**
+
 ## Spawning children
 
 **Do not use your own built-in subagent/Task/parallel-tool-use feature for
-this.** A subagent launched that way is invisible to Overseer entirely — no
-tree row, no status tracking, no separate branch/worktree, nothing the user
-watching the TUI can see or check on. Delegating means running the real CLI
-command below, every time, even though your own built-in tool might feel
-like the faster/simpler choice for a given request:
+this.** (Whatever your harness calls it — Claude's `Task`/`Agent` tool,
+opencode's/pi's own subagent tooling — the rule is the same.) A subagent
+launched that way is invisible to Overseer entirely — no tree row, no status
+tracking, no separate branch/worktree, nothing the user watching the TUI can
+see or check on. Delegating means running the real CLI command below, every
+time, even though your own built-in tool might feel like the faster/simpler
+choice for a given request:
 
 ```
 overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]
+```
+
+Worked example — delegating a bug fix to a claude child:
+
+```
+overseer spawn --name "fix-flaky-ci" \
+  --task "The test in tests/auth_test.rs fails about 1 in 10 runs with a \
+timeout. Read that test and the auth module it exercises, find the race, \
+fix it, and run cargo test in a loop until you're confident it's gone. \
+Report overseer status done when finished." \
+  --adapter claude
 ```
 
 Children don't have to run your own harness — pick `--adapter` per task if
@@ -63,6 +82,22 @@ makes "stuck for a while" checkable without staring at a clock yourself: a
 child sitting at `blocked` with a large `status_secs` has been waiting on you
 specifically, not just recently paused.
 
+## Reviewing a child's work
+
+Overseer doesn't manage git for the child, so its work lives exactly where
+the child's own worktree put it: a sibling directory of yours, on branch
+`ovsr/<slug>` (see the overseer-child skill for the exact convention).
+Inspect it from your own checkout without touching it:
+
+```
+git worktree list                    # every child's worktree path, yours included
+git log main..ovsr/<slug>            # its commits
+git diff main...ovsr/<slug>          # its full diff
+```
+
+Merge or cherry-pick from your own checkout once you're satisfied — Overseer
+never does this for you.
+
 ## Cleanup
 
 Once a child is `done` and you've reviewed its branch, drop it:
@@ -73,6 +108,8 @@ overseer drop <id>
 
 ## Hard rules
 
+- Delegate only via `overseer spawn` — never your own built-in
+  subagent/Task/Agent tool. See "Spawning children" above.
 - You may spawn children; they may not spawn further agents — don't try to
   nest by asking a child to delegate.
 - Never touch another agent's branch or worktree.

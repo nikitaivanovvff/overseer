@@ -277,6 +277,15 @@ mod tests {
     }
 
     #[test]
+    fn child_instructions_document_the_worktree_convention_with_a_worked_example() {
+        // A one-sentence "set up your own git worktree/branch" with no
+        // example was the reported gap: an agent given nothing more had to
+        // be manually corrected into a naming convention by hand each time.
+        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("git worktree add"), "must show a runnable worktree command");
+        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("ovsr/<slug>"), "must state the branch naming convention");
+    }
+
+    #[test]
     fn spawn_command_always_passes_the_extension_flag() {
         let a = make_adapter();
         let cmd = a.spawn_command(&make_root_ctx());
