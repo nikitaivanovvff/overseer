@@ -57,6 +57,15 @@ impl Default for GitClient {
     }
 }
 
+/// Falls back to the cwd's own basename when it isn't a git repo at all, so a
+/// root spawned there still gets an honest name instead of a faked one.
+/// Doesn't invoke git, so it lives outside `GitClient`.
+pub fn dir_basename(cwd: &Path) -> String {
+    cwd.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| cwd.display().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +80,17 @@ mod tests {
     fn dry_run_current_branch() {
         let g = GitClient::dry_run();
         assert_eq!(g.current_branch(Path::new("/any/path")).unwrap(), "test-branch");
+    }
+
+    #[test]
+    fn dir_basename_returns_last_path_segment() {
+        assert_eq!(dir_basename(Path::new("/tmp/some-project")), "some-project");
+    }
+
+    #[test]
+    fn dir_basename_falls_back_to_full_path_when_no_file_name() {
+        // "/" has no file_name() component -- must not panic, and must still
+        // return something honest rather than an empty string.
+        assert_eq!(dir_basename(Path::new("/")), "/");
     }
 }

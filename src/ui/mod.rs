@@ -447,7 +447,10 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
             ]),
             Line::from(vec![
                 Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.branch.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    if node.branch.is_empty() { "—".to_string() } else { node.branch.clone() },
+                    Style::default().fg(Color::Yellow),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("ctx:    ", Style::default().fg(Color::DarkGray)),
@@ -1163,5 +1166,43 @@ mod tests {
         // Generous ceiling -- this is a canary for an accidental O(n^2), not a
         // tight perf budget; a real regression would blow well past this.
         assert!(elapsed.as_millis() < 2000, "flatten+format got suspiciously slow: {elapsed:?}");
+    }
+
+    // ── render_agent_detail ──────────────────────────────────────────────────
+
+    #[test]
+    fn render_agent_detail_shows_dash_for_empty_branch() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let flat_node = FlatNode {
+            id: AgentId::new(),
+            name: "scratch".to_string(),
+            status: AgentStatus::Idle,
+            role: AgentRole::Root,
+            repo: "scratch".to_string(),
+            branch: String::new(), // non-git root: no fake branch name
+            context_pct: None,
+            has_children: false,
+            prefix: String::new(),
+            status_since: std::time::Instant::now(),
+        };
+        let theme = Theme::default();
+        let selected = Some(flat_node);
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_agent_detail(frame, frame.area(), &selected, &theme);
+            })
+            .unwrap();
+
+        let content: String =
+            terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            content.contains("branch: —"),
+            "expected a dash placeholder for an empty branch, got: {content}"
+        );
     }
 }

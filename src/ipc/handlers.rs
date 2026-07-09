@@ -5,7 +5,7 @@ use crate::agent::drop::drop_agent;
 use crate::agent::spawn::{spawn_agent, SpawnRequest};
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
-use crate::git::GitClient;
+use crate::git::{dir_basename, GitClient};
 use crate::ipc::protocol::{OkBody, Request, Response, MAX_SPAWN_TASK_BYTES};
 use crate::session::SessionManager;
 
@@ -53,9 +53,19 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
             });
 
-            let (Ok(repo), Ok(branch)) = (ctx.git.repo_name(&cwd), ctx.git.current_branch(&cwd))
-            else {
-                return Response::err(format!("not a git repository: {}", cwd.display()));
+            // A typo'd or missing path must still hard-fail -- unlike a git
+            // failure below, there's no honest name to fall back to here.
+            if !cwd.is_dir() {
+                return Response::err(format!("not a directory: {}", cwd.display()));
+            }
+
+            // Not every root lives in a git repo. Fall back to the directory's
+            // own basename and an explicit empty branch rather than silently
+            // registering a phantom root under faked values (e.g. repo="unknown",
+            // branch="main") -- see 8e10c71, which this relaxes.
+            let (repo, branch) = match (ctx.git.repo_name(&cwd), ctx.git.current_branch(&cwd)) {
+                (Ok(repo), Ok(branch)) => (repo, branch),
+                _ => (dir_basename(&cwd), String::new()),
             };
 
             let req = SpawnRequest {
@@ -306,28 +316,57 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_start_non_git_cwd_is_error_and_registers_nothing() {
-        // Real (non-dry-run) GitClient against a freshly created, non-git
-        // temp directory reproduces the daemon-observed bug: a bare-shell
-        // root must not be registered under a bogus "unknown" name when the
-        // target directory isn't a git repo at all.
-        let dir = std::env::temp_dir().join(format!("overseer-test-non-git-{}", AgentId::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn dispatch_start_nonexistent_cwd_is_error_and_registers_nothing() {
+        // A typo'd path must still hard-fail -- it must not silently register
+        // a phantom root under a directory-basename name either.
+        let dir = std::env::temp_dir().join(format!("overseer-test-missing-{}", AgentId::new()));
 
         let ctx = make_ctx_with_git(GitClient::new());
         let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()) });
 
-        std::fs::remove_dir_all(&dir).ok();
-
-        assert!(!resp.ok, "Start on a non-git cwd must fail, got: {:?}", resp.data);
+        assert!(!resp.ok, "Start on a nonexistent cwd must fail, got: {:?}", resp.data);
         let error = resp.error.unwrap_or_default();
-        assert!(error.contains("not a git repository"), "unexpected error: {error}");
+        assert!(error.contains("not a directory"), "unexpected error: {error}");
 
         // No root should have been registered for the rejected cwd.
         let list_resp = dispatch(&ctx, Request::List);
         match list_resp.data {
             Some(OkBody::Agents { agents }) => {
                 assert!(agents.is_empty(), "expected no registered agents, got: {agents:?}")
+            }
+            other => panic!("expected Agents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_start_non_git_dir_registers_with_dir_name_and_empty_branch() {
+        // Real (non-dry-run) GitClient against a freshly created, non-git
+        // temp directory: this must now succeed, honestly, under the
+        // directory's own basename and an explicit empty branch -- not a
+        // bogus "unknown"/"main" pair, and not rejected outright either.
+        let dir = std::env::temp_dir().join(format!("overseer-test-non-git-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected_name = dir.file_name().unwrap().to_string_lossy().to_string();
+
+        let ctx = make_ctx_with_git(GitClient::new());
+        let resp = dispatch(&ctx, Request::Start { cwd: Some(dir.clone()) });
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(resp.ok, "Start on a non-git dir should succeed, got: {:?}", resp.error);
+        let (agent_id, branch) = match resp.data {
+            Some(OkBody::Registered { agent_id, branch }) => (agent_id, branch),
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        assert_eq!(branch, "", "non-git root must get an explicit empty branch, not a faked one");
+
+        let list_resp = dispatch(&ctx, Request::List);
+        match list_resp.data {
+            Some(OkBody::Agents { agents }) => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].id, agent_id);
+                assert_eq!(agents[0].name, expected_name);
+                assert_eq!(agents[0].repo, expected_name);
             }
             other => panic!("expected Agents, got {other:?}"),
         }
