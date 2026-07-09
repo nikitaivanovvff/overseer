@@ -163,7 +163,7 @@ pub fn resolve_socket(cli_socket: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(crate::daemon::default_socket_path)
 }
 
-pub fn run_client(socket: PathBuf, cmd: Command) -> Result<()> {
+pub fn run_client(socket: PathBuf, cmd: Command, pushed_at: std::time::SystemTime) -> Result<()> {
     // `Prompt` doesn't map to a single `Request` — it's a short stateful
     // sequence (attach, discard the snapshot, two writes) handled entirely
     // by `ipc::client::prompt`, so it's intercepted here rather than routed
@@ -176,7 +176,7 @@ pub fn run_client(socket: PathBuf, cmd: Command) -> Result<()> {
         other => other,
     };
 
-    let req = match build_request(cmd)? {
+    let req = match build_request(cmd, pushed_at)? {
         Some(r) => r,
         None => return Ok(()), // silent no-op (Status outside an Overseer session)
     };
@@ -239,7 +239,12 @@ fn read_context_pct(path: &str) -> Option<u8> {
 
 /// Returns `Ok(None)` for the Status command when `$OVERSEER_AGENT_ID` is unset,
 /// indicating a non-Overseer session where the hook should be a silent no-op.
-fn build_request(cmd: Command) -> Result<Option<Request>> {
+///
+/// `pushed_at` is captured by the caller (`main.rs`, as early in the
+/// process's life as possible) rather than here, so that clap parsing and
+/// `--from-hook`'s transcript read below don't themselves widen the
+/// scheduling-jitter window the staleness guard exists to close (STATUS-RACE.md).
+fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Option<Request>> {
     match cmd {
         Command::Status { status, message, from_hook, adapter } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
@@ -262,7 +267,7 @@ fn build_request(cmd: Command) -> Result<Option<Request>> {
                     .and_then(read_context_pct);
             }
 
-            Ok(Some(Request::Status { agent_id, status, message, context_pct, adapter }))
+            Ok(Some(Request::Status { agent_id, status, message, context_pct, adapter, pushed_at }))
         }
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
@@ -306,7 +311,7 @@ mod tests {
     fn build_request_status_no_env_var_returns_none() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
         let cmd = Command::Status { status: StatusArg::Running, message: None, from_hook: false, adapter: None };
-        let result = build_request(cmd).unwrap();
+        let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_none(), "Status without OVERSEER_AGENT_ID should be a silent no-op");
     }
 
@@ -315,7 +320,7 @@ mod tests {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
         let cmd = Command::Status { status: StatusArg::Done, message: None, from_hook: false, adapter: None };
-        let result = build_request(cmd).unwrap();
+        let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Request::Status { .. }));
     }
@@ -323,13 +328,13 @@ mod tests {
     #[test]
     fn build_request_start_returns_start() {
         let cmd = Command::Start { cwd: Some(PathBuf::from("/tmp/myrepo")) };
-        let req = build_request(cmd).unwrap().unwrap();
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Start { cwd } if cwd == Some(PathBuf::from("/tmp/myrepo"))));
     }
 
     #[test]
     fn build_request_list_returns_list() {
-        let req = build_request(Command::List).unwrap().unwrap();
+        let req = build_request(Command::List, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::List));
     }
 
@@ -342,7 +347,7 @@ mod tests {
 
     #[test]
     fn build_request_shutdown_returns_shutdown() {
-        let req = build_request(Command::Shutdown).unwrap().unwrap();
+        let req = build_request(Command::Shutdown, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Shutdown));
     }
 
@@ -350,7 +355,7 @@ mod tests {
     fn build_request_spawn_without_env_var_is_error() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
         let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: Some("claude".to_string()) };
-        assert!(build_request(cmd).is_err());
+        assert!(build_request(cmd, std::time::SystemTime::now()).is_err());
     }
 
     #[test]
@@ -358,7 +363,7 @@ mod tests {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
         let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: Some("claude".to_string()) };
-        let req = build_request(cmd).unwrap().unwrap();
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { parent_id, task, .. }
             if parent_id == id && task == "write tests"));
     }
@@ -372,7 +377,7 @@ mod tests {
             name: Some("login-tests".to_string()),
             adapter: Some("claude".to_string()),
         };
-        let req = build_request(cmd).unwrap().unwrap();
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { name: Some(n), .. } if n == "login-tests"));
     }
 
@@ -384,7 +389,7 @@ mod tests {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
         let cmd = Command::Spawn { task: "write tests".to_string(), name: None, adapter: None };
-        let req = build_request(cmd).unwrap().unwrap();
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Spawn { adapter: None, .. }));
     }
 
@@ -392,14 +397,14 @@ mod tests {
     fn build_request_drop_returns_drop() {
         let id = AgentId::new();
         let cmd = Command::Drop { id: id.0.to_string(), recursive: true };
-        let req = build_request(cmd).unwrap().unwrap();
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
         assert!(matches!(req, Request::Drop { agent_id, recursive: true } if agent_id == id));
     }
 
     #[test]
     fn build_request_drop_invalid_id_is_error() {
         let cmd = Command::Drop { id: "not-a-uuid".to_string(), recursive: false };
-        assert!(build_request(cmd).is_err());
+        assert!(build_request(cmd, std::time::SystemTime::now()).is_err());
     }
 
     // ── prompt (CLI parsing) ────────────────────────────────────────────────

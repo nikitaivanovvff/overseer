@@ -554,6 +554,15 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 /// the agent itself declaring the task complete, a stronger signal than this
 /// exit-code inference — its wrapping process exiting non-zero afterward
 /// (e.g. during its own teardown) must not silently downgrade it to `error`.
+///
+/// This check is independent of (and not subsumed by)
+/// `AgentRegistry::set_status`'s `pushed_at` staleness guard: the exit is
+/// detected strictly *after* the explicit `done` push happened (the wrapping
+/// process can only exit once its final hook has already run), so a
+/// `pushed_at` of "now" here is always chronologically newer, not stale. The
+/// guard below is about *authority* (an explicit self-report outranks an
+/// inferred one), not about ordering — a different axis than the staleness
+/// guard, so both stay.
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     for (id, success) in sessions.drain_exits() {
         if registry.get(&id).is_some_and(|a| a.status == AgentStatus::Done) {
@@ -572,7 +581,7 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
                 agent.role,
             );
         }
-        let _ = registry.set_status(&id, status, message, None, None);
+        let _ = registry.set_status(&id, status, message, None, None, std::time::SystemTime::now());
     }
 }
 
@@ -732,7 +741,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
-        registry.set_status(&root_id, AgentStatus::Done, None, None, None).unwrap();
+        registry.set_status(&root_id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
         // The wrapping process exits non-zero after the agent already
         // explicitly reported done — that must not clobber it.

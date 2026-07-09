@@ -19,6 +19,7 @@ fn mock_root(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         children: Vec::new(),
         expanded: true,
         status_since: std::time::Instant::now(),
+        last_status_pushed_at: None,
     }
 }
 
@@ -39,6 +40,7 @@ fn mock_child(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         children: Vec::new(),
         expanded: true,
         status_since: std::time::Instant::now(),
+        last_status_pushed_at: None,
     }
 }
 

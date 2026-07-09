@@ -369,6 +369,9 @@ fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
         children: Vec::new(),
         expanded: true,
         status_since,
+        // Client-side tree, not the daemon's registry — staleness comparison
+        // never happens here, so there's nothing meaningful to seed.
+        last_status_pushed_at: None,
     };
     match dto.parent_id {
         None => tree.add_root(node),
