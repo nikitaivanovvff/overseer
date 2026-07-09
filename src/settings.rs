@@ -20,9 +20,32 @@ use serde_json::{json, Value};
 ///   - "...Follow the overseer-%s skill.\n" "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {session_start_status_cmd}; } || true
 const LEGACY_SIGNATURE_PARTS: [&str; 2] = ["OVERSEER_AGENT_ID", "Follow the overseer"];
 
+/// A second, independent legacy signature: found live on a real machine
+/// (2026-07-09) as *untagged* `PostToolUse`/`Stop` duplicates sitting
+/// alongside the correctly-tagged current entry — bare `overseer status
+/// running` / `overseer status done` commands with none of the current
+/// flags (`--from-hook`, etc). These predate not just the `_overseer` tag
+/// but also the `--from-hook` classification and the "no hook ever pushes
+/// done" design (AGENTS.md Cleanup) — a bare `overseer status done` firing
+/// on *every* `Stop` event raced the correctly-tagged `status idle` push
+/// and intermittently won, which is exactly what made a live root's PTY
+/// look like it had silently died (it hadn't — its status just got forced
+/// to `done`, which the UI and exit-sweep both treat as terminal). Unlike
+/// the SessionStart-flavored signature above, this one carries no
+/// human-readable text to match — the invariant that actually holds across
+/// every generation of every hook we've ever shipped is simpler: it invokes
+/// our own binary's `status` subcommand at all. No user-authored hook has
+/// reason to invoke *our* CLI's `status` subcommand, so matching on that
+/// literal invocation is both necessary and sufficient, and naturally
+/// covers any future legacy variant too without needing a new signature
+/// added every time the hook text's surrounding shape changes.
+fn invokes_overseer_status_subcommand(cmd: &str) -> bool {
+    cmd.contains("overseer status ")
+}
+
 /// True if `entry` is an Overseer-authored hook entry: either tagged with
 /// `_overseer: true` (current convention), or — for installs that predate
-/// that tag — carrying the legacy command signature every generation of our
+/// that tag — carrying a legacy command signature every generation of our
 /// hook text has contained. Only opencode/pi are exempt from the legacy
 /// check since they never emitted JSON hook entries like this.
 fn is_overseer_entry(entry: &Value) -> bool {
@@ -35,7 +58,10 @@ fn is_overseer_entry(entry: &Value) -> bool {
     hooks.iter().any(|h| {
         h.get("command")
             .and_then(|c| c.as_str())
-            .map(|cmd| LEGACY_SIGNATURE_PARTS.iter().all(|part| cmd.contains(part)))
+            .map(|cmd| {
+                LEGACY_SIGNATURE_PARTS.iter().all(|part| cmd.contains(part))
+                    || invokes_overseer_status_subcommand(cmd)
+            })
             .unwrap_or(false)
     })
 }
@@ -294,6 +320,55 @@ mod tests {
         assert_eq!(arr.len(), 1, "stale tagged entry should be replaced, not duplicated");
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("OVERSEER_ROLE"), "should be the fresh role-branching command: {cmd}");
+    }
+
+    /// The exact shape found live on a real machine: an untagged `Stop`
+    /// duplicate pushing a bare `status done` on every turn, no `--from-hook`
+    /// or any other current-generation flag — this is the one that raced a
+    /// correctly-tagged `status idle` push and intermittently won, making a
+    /// perfectly healthy root's PTY look like it had silently died.
+    fn legacy_bare_status_push_entry(cmd: &str) -> Value {
+        json!({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": format!("/Users/x/bin/overseer status {cmd}")
+            }]
+        })
+    }
+
+    #[test]
+    fn merge_removes_legacy_bare_status_push_duplicates_on_stop() {
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [
+                    legacy_bare_status_push_entry("done"),
+                    legacy_bare_status_push_entry("done"),
+                ]
+            }
+        });
+        let overlay = json!({
+            "hooks": {
+                "Stop": [overseer_entry("status idle --from-hook")]
+            }
+        });
+        merge_hooks(&mut settings, &overlay);
+        let arr = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "legacy bare `status done` duplicates must not survive alongside the tagged idle push: {arr:?}");
+        assert!(arr[0].get("_overseer") == Some(&json!(true)));
+    }
+
+    #[test]
+    fn remove_also_cleans_legacy_bare_status_push_entries() {
+        let mut settings = json!({
+            "hooks": {
+                "PostToolUse": [legacy_bare_status_push_entry("running"), user_entry("echo hi")]
+            }
+        });
+        remove_hooks(&mut settings);
+        let arr = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "legacy entry should be gone, user entry kept");
+        assert_eq!(arr[0]["hooks"][0]["command"], "echo hi");
     }
 
     fn overlay_session_start() -> Value {
