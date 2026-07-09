@@ -6,7 +6,16 @@ You are a child agent spawned by a root, running inside Overseer.
 
 ## Isolation
 
-Set up your own git worktree/branch before making changes. Overseer does not manage workspaces — it only launched this session in the repo, nothing more.
+Set up your own git worktree/branch before making any changes. Overseer does not manage workspaces — it only launched this session in the repo, nothing more.
+
+Convention: branch `ovsr/<slug>`, worktree as a sibling directory named `<repo>-<slug>`, where `<slug>` is a short kebab-case name you pick from your own task. Worked example:
+
+```
+git worktree add ../$OVERSEER_REPO-<slug> -b ovsr/<slug>
+cd ../$OVERSEER_REPO-<slug>
+```
+
+Do all your work from inside that directory, not the one you were launched in. If that branch or path already exists (a sibling child picked the same slug), pick a more specific slug and retry — never reuse or touch another agent's branch or worktree.
 
 ## Completion
 

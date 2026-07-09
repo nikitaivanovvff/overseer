@@ -63,8 +63,23 @@ impl ClaudeAdapter {
         let session_start_status_cmd = format!(
             r#"if [ "$OVERSEER_ROLE" = "root" ]; then {session_start_idle_cmd}; else {session_start_running_cmd}; fi"#
         );
+        // The printed message carries the single most-violated rule inline,
+        // per role, rather than just pointing at the skill file — this fires
+        // exactly once, at the very start of the session, and unlike
+        // opencode/pi (whose instructions load into the system prompt on
+        // every turn) a Claude skill is only re-consulted if the agent
+        // chooses to invoke it again, which a real user reported it failing
+        // to do mid-conversation. Baking the rule into the transcript itself
+        // means it survives even if the skill is never re-opened.
+        let session_start_msg_cmd = concat!(
+            r#"if [ "$OVERSEER_ROLE" = "root" ]; then "#,
+            r#"printf 'You are managed by Overseer (role: root). Follow the overseer-root skill: delegate via overseer spawn, never your own built-in subagent/Task tool.\n'; "#,
+            r#"else "#,
+            r#"printf 'You are managed by Overseer (role: child). Follow the overseer-child skill: set up your own git worktree/branch first, e.g. git worktree add ../<repo>-<slug> -b ovsr/<slug>.\n'; "#,
+            r#"fi"#
+        );
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ printf 'You are managed by Overseer (role: %s). Follow the overseer-%s skill.\n' "$OVERSEER_ROLE" "$OVERSEER_ROLE"; {session_start_status_cmd}; }} || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ {session_start_msg_cmd}; {session_start_status_cmd}; }} || true"#
         );
 
         serde_json::json!({
@@ -278,6 +293,15 @@ mod tests {
     }
 
     #[test]
+    fn child_skill_documents_the_worktree_convention_with_a_worked_example() {
+        // A one-sentence "set up your own git worktree/branch" with no
+        // example was the reported gap: an agent given nothing more had to
+        // be manually corrected into a naming convention by hand each time.
+        assert!(CHILD_SKILL_CONTENT.contains("git worktree add"), "must show a runnable worktree command");
+        assert!(CHILD_SKILL_CONTENT.contains("ovsr/<slug>"), "must state the branch naming convention");
+    }
+
+    #[test]
     fn settings_contains_post_tool_use_hook() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
@@ -335,6 +359,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("--adapter claude"), "SessionStart should self-identify: {cmd}");
+    }
+
+    #[test]
+    fn settings_session_start_message_carries_the_hard_rule_inline_per_role() {
+        // Unlike opencode/pi, whose role instructions load into the system
+        // prompt on every turn, a Claude skill is only re-consulted if the
+        // agent re-invokes it -- a real user reported it failing to do so
+        // mid-conversation. So the one-shot SessionStart message itself
+        // must carry the rule, not just point at the skill file.
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("overseer spawn, never your own built-in subagent"), "root message must inline the delegation rule: {cmd}");
+        assert!(cmd.contains("git worktree add"), "child message must inline a worked worktree example: {cmd}");
+        assert!(cmd.contains("ovsr/<slug>"), "child message must show the branch convention: {cmd}");
     }
 
     #[test]

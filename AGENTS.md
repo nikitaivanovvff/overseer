@@ -325,8 +325,9 @@ TUI re-renders with the new child visible under the parent, labeled "write-tests
 in the tree — short and recognizable even though the task text (the child's
 actual initial prompt) can run to a full paragraph. It starts working
 immediately instead of sitting at a bare prompt. The child sets up its own
-branch/worktree on startup, per the overseer-child skill, and its own
-SessionStart hook flips it from Spawning to Running moments later.
+branch/worktree on startup (`git worktree add ../<repo>-<slug> -b ovsr/<slug>`,
+per the overseer-child skill's worked example), and its own SessionStart hook
+flips it from Spawning to Running moments later.
 ```
 
 `overseer start` (launch a root) is a *different* path — no adapter, no task: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it.
