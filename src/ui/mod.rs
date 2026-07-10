@@ -1253,6 +1253,7 @@ mod tests {
             has_children: false,
             prefix: String::new(),
             status_since: std::time::Instant::now(),
+            adapter: "claude".to_string(),
         };
         let theme = Theme::default();
         let selected = Some(flat_node);

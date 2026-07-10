@@ -61,6 +61,11 @@ pub struct FlatNode {
     pub prefix: String,
     /// When `status` last actually changed — see `AgentNode::status_since`.
     pub status_since: std::time::Instant,
+    /// The harness this agent runs (claude, opencode, pi, or `shell` for a
+    /// bare-shell root) — see `AgentNode::adapter`. Carried through so the
+    /// render layer (e.g. the spawning-placeholder in `ui::term_pane`) can
+    /// name it without a second lookup back into the tree.
+    pub adapter: String,
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +268,7 @@ fn flatten_node(
         has_children: !node.children.is_empty(),
         prefix: format!("{indent}{connector}"),
         status_since: node.status_since,
+        adapter: node.adapter.clone(),
     });
 
     if node.expanded {
