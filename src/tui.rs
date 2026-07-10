@@ -225,7 +225,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 Event::Paste(text) if app.focus == Focus::Pane => forward_paste(app, &text),
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    handle_tree_click(app, &layout, mouse);
+                    handle_left_click(app, &layout, mouse);
                 }
                 Event::Mouse(mouse) => handle_mouse_event(app, mouse, pane_rect, selected_id.as_ref()),
                 _ => {}
@@ -327,29 +327,31 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: 
     true
 }
 
-/// Left-click on a tree row: select it and jump in, in one action — the
-/// mouse equivalent of clicking is "step into this agent," not just "look at
-/// it." Reuses `jump_in` rather than duplicating its alive-check/scroll-reset
-/// logic. Only handled while tree-focused with no modal open (search input,
-/// spawn input, root-spawn adapter picker, drop/shutdown confirm, help popup)
-/// — mirroring how keyboard nav (`handle_tree_key`) is only reachable in
-/// that same state; a click while any of those is up, or while a pane is
-/// focused, is a no-op so a focused pane's passthrough contract (AGENTS.md
-/// house style) never has to share mouse events with tree navigation.
-fn handle_tree_click(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
-    if app.focus != Focus::Tree
-        || app.input.is_some()
-        || app.confirm.is_some()
-        || app.picker.is_some()
-        || app.show_help
-    {
+/// Left-click is click-to-focus, window-manager style: a click in the tree
+/// half focuses the tree (selecting the row it landed on, if any), a click on
+/// the pane jumps in — mirroring `Enter`/`o` via `jump_in`, so the alive
+/// check and scroll reset live in one place. Works from *either* focus state:
+/// intercepting a click while a pane is focused steals nothing from the
+/// agent's TUI, because no mouse forwarding exists at all (same argument as
+/// the wheel — see `handle_mouse_event`). A click on an already-focused pane
+/// is a no-op rather than a re-`jump_in`, so it never resets a wheel-scrolled
+/// position back to the live bottom. Clicks while any modal is open (search
+/// input, spawn input, root-spawn adapter picker, drop/shutdown confirm, help
+/// popup) stay no-ops, mirroring how keyboard tree nav is unreachable in
+/// those states.
+fn handle_left_click(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
+    if app.input.is_some() || app.confirm.is_some() || app.picker.is_some() || app.show_help {
         return;
     }
-    let Some(id) = ui::hit_test_tree(layout.tree_rect, &layout.tree_rows, mouse.column, mouse.row) else {
-        return;
-    };
-    app.with_tree_mut(|t| t.select_by_id(&id));
-    jump_in(app);
+    let pos = Position::new(mouse.column, mouse.row);
+    if layout.tree_rect.contains(pos) {
+        if let Some(id) = ui::hit_test_tree(layout.tree_rect, &layout.tree_rows, mouse.column, mouse.row) {
+            app.with_tree_mut(|t| t.select_by_id(&id));
+        }
+        app.focus = Focus::Tree;
+    } else if layout.pane_rect.contains(pos) && app.focus != Focus::Pane {
+        jump_in(app);
+    }
 }
 
 /// Converts a live key event into the config-file vocabulary `Keybindings`
@@ -1302,16 +1304,17 @@ mod tests {
         assert_eq!(selected.id, fix_id, "Esc must not move the real cursor");
     }
 
-    // ── mouse click on a tree row ────────────────────────────────────────────
+    // ── mouse click-to-focus ─────────────────────────────────────────────────
 
     fn mouse_down(column: u16, row: u16) -> MouseEvent {
         MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE }
     }
 
-    /// A tree area with two live root agents registered — mirrors a real
-    /// frame's `RenderLayout`, but built by hand so the test doesn't need a
-    /// real terminal. Rows land at screen rows 1 and 2 (row 0 is the `List`
-    /// border `render_agent_tree` always draws).
+    /// A tree|pane layout with two live root agents registered — mirrors a
+    /// real frame's `RenderLayout`, but built by hand so the test doesn't
+    /// need a real terminal. Tree rows land at screen rows 1 and 2 (row 0 is
+    /// the `List` border `render_agent_tree` always draws); the pane sits to
+    /// the tree's right, columns [30, 80).
     fn app_with_two_live_agents_and_layout() -> (App, Arc<AppCtx>, AgentId, AgentId, ui::RenderLayout) {
         let id_a = AgentId::new();
         let id_b = AgentId::new();
@@ -1324,32 +1327,69 @@ mod tests {
         app.with_tree_mut(|t| t.cursor = 0);
 
         let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
+        let pane_rect = Rect { x: 30, y: 0, width: 50, height: 10 };
         let tree_rows = vec![id_a.clone(), id_b.clone()];
-        (app, ctx, id_a, id_b, ui::RenderLayout { pane_rect: Rect::default(), tree_rect, tree_rows })
+        (app, ctx, id_a, id_b, ui::RenderLayout { pane_rect, tree_rect, tree_rows })
     }
 
     #[test]
-    fn left_click_on_a_tree_row_selects_and_jumps_in() {
+    fn left_click_on_a_tree_row_selects_it_without_jumping_in() {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
 
         // Second row ("id_b") sits at screen row 2.
-        handle_tree_click(&mut app, &layout, mouse_down(5, 2));
+        handle_left_click(&mut app, &layout, mouse_down(5, 2));
 
         assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), Some(id_b.clone()));
-        assert_eq!(app.focus, Focus::Pane, "a click must select AND jump in, like Enter/o");
+        assert_eq!(app.focus, Focus::Tree, "a tree click focuses the tree, it doesn't jump in");
 
         ctx.sessions.kill(&id_a);
         ctx.sessions.kill(&id_b);
     }
 
     #[test]
-    fn click_outside_the_tree_area_is_a_noop() {
+    fn left_click_on_the_pane_jumps_in() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        assert_eq!(app.focus, Focus::Tree);
+
+        handle_left_click(&mut app, &layout, mouse_down(45, 5));
+
+        assert_eq!(app.focus, Focus::Pane, "a pane click must jump in, like Enter/o");
+        assert_eq!(
+            app.with_tree(|t| t.selected()).map(|n| n.id),
+            Some(id_a.clone()),
+            "a pane click must not move the tree cursor"
+        );
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn left_click_on_the_pane_with_a_dead_agent_stays_in_the_tree() {
+        let id = AgentId::new();
+        // No live sessions at all — the selected agent is dead.
+        let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
+        register_agent(&ctx, Some(id.clone()));
+        app.with_tree_mut(|t| t.cursor = 0);
+        let layout = ui::RenderLayout {
+            pane_rect: Rect { x: 30, y: 0, width: 50, height: 10 },
+            tree_rect: Rect { x: 0, y: 0, width: 30, height: 10 },
+            tree_rows: vec![id],
+        };
+
+        handle_left_click(&mut app, &layout, mouse_down(45, 5));
+
+        assert_eq!(app.focus, Focus::Tree, "can't focus a dead agent's pane");
+        assert!(app.status_message.is_some(), "same feedback as Enter on a dead agent");
+    }
+
+    #[test]
+    fn click_outside_both_rects_is_a_noop() {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
         let before = app.with_tree(|t| t.selected()).map(|n| n.id);
 
-        // Row 50 is well past the tree's 10-row rect (e.g. a click that
-        // actually landed on the pane).
-        handle_tree_click(&mut app, &layout, mouse_down(5, 50));
+        // Row 50 is well past both rects' 10-row height (e.g. the status bar).
+        handle_left_click(&mut app, &layout, mouse_down(5, 50));
 
         assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), before);
         assert_eq!(app.focus, Focus::Tree, "a miss must not jump into any pane");
@@ -1359,21 +1399,63 @@ mod tests {
     }
 
     #[test]
-    fn click_while_pane_is_focused_does_not_steal_the_agent_s_own_mouse_events() {
+    fn tree_click_while_pane_is_focused_returns_focus_to_the_tree_and_selects() {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
         app.focus = Focus::Pane; // as if the user had already jumped in
 
-        // Clicking row 2 ("id_b") while a pane is focused must be forwarded
-        // to the agent's own TUI, never intercepted as tree navigation —
-        // the focused-pane passthrough contract (AGENTS.md).
-        handle_tree_click(&mut app, &layout, mouse_down(5, 2));
+        // Click-to-focus works from a focused pane too: clicks never forward
+        // to the agent (no mouse forwarding exists), so intercepting this
+        // steals nothing — unlike keys, which stay passthrough-only.
+        handle_left_click(&mut app, &layout, mouse_down(5, 2));
 
         assert_eq!(
             app.with_tree(|t| t.selected()).map(|n| n.id),
-            Some(id_a.clone()),
-            "click must not move the tree cursor while a pane is focused"
+            Some(id_b.clone()),
+            "a tree click while jumped in must select the clicked row"
         );
+        assert_eq!(app.focus, Focus::Tree, "…and hand focus back to the tree");
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    /// The `app.focus != Focus::Pane` guard: re-clicking an already-focused
+    /// pane must not re-run `jump_in`, whose scroll reset would silently
+    /// yank a wheel-scrolled view back to the live bottom.
+    #[test]
+    fn click_on_an_already_focused_pane_does_not_reset_scroll() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
         assert_eq!(app.focus, Focus::Pane);
+
+        let pane_rect = Rect { x: 30, y: 0, width: 50, height: 10 };
+        let layout = ui::RenderLayout {
+            pane_rect,
+            tree_rect: Rect { x: 0, y: 0, width: 30, height: 10 },
+            tree_rows: vec![id.clone()],
+        };
+        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 45, 5), pane_rect, Some(&id));
+        let scrolled = ctx.sessions.display_offset(&id);
+        assert!(scrolled > 0, "wheel must have scrolled into history first");
+
+        handle_left_click(&mut app, &layout, mouse_down(45, 5));
+
+        assert_eq!(app.focus, Focus::Pane);
+        assert_eq!(ctx.sessions.display_offset(&id), scrolled, "click must not reset the scroll");
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn click_is_ignored_while_a_modal_is_open() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        app.input = Some(InputState { action: PendingAction::Search, buffer: String::new() });
+
+        handle_left_click(&mut app, &layout, mouse_down(5, 2));
+
+        assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), Some(id_a.clone()));
+        assert_eq!(app.focus, Focus::Tree);
 
         ctx.sessions.kill(&id_a);
         ctx.sessions.kill(&id_b);

@@ -28,6 +28,24 @@ The registry and every agent's PTY live in a **daemon** process, not the TUI —
 
 ---
 
+## Glossary
+
+Canonical names for the things this doc (and conversation about Overseer) refers to. When a user or doc says one of these, this is what it means — see the "TUI Layout" diagram below for where each sits on screen.
+
+| Term | Also called | What it is | Code anchor |
+|------|-------------|------------|-------------|
+| **Agent structure** pane | tree, agent tree, sidebar | The left-column list of every agent (roots with their children nested under them), titled `AGENTS`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
+| **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
+| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and context %. | `ui::render_agent_detail` |
+| **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
+| **Root** | workspace | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
+| **Child** | — | An agent a root spawned for one task; cannot spawn further agents. | `AgentRole::Child` |
+| **Harness** | adapter, agent type | The AI CLI an agent runs (claude, opencode, pi) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
+| **Jump in** | focus the pane | Moving keyboard focus into the agent pane (`Ctrl-l`/`Enter`/`o`/click); every key but `Ctrl-h` then forwards to the agent. | `tui::jump_in`, `Focus::Pane` |
+| **Daemon** | — | The background process owning the registry and every PTY; the TUI is a detachable client of it. | `src/daemon.rs` |
+
+---
+
 ## Architecture
 
 ```
@@ -277,7 +295,8 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | Key (default) | Action |
 |-----|--------|
 | `j` / `k` | Navigate agent tree (tree focus only) |
-| Left-click a tree row | Select + jump in, same as `Enter`/`o` on that row (tree focus only — additive, mouse capture is enabled but nothing is mouse-only) |
+| Left-click the tree | Focus the tree, selecting the row clicked (if any) — works while a pane is focused too, since clicks never forward to agents (no mouse forwarding exists; additive, nothing is mouse-only) |
+| Left-click the pane | Jump in, same as `Enter`/`o` (alive check + scroll reset included); a click on an *already-focused* pane is a no-op so it never resets a wheel-scrolled position |
 | `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
