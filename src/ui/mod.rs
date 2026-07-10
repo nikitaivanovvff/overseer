@@ -300,7 +300,7 @@ fn render_agent_tree(
         .collect();
 
     let block = Block::default()
-        .title(" AGENTS ")
+        .title(" WORKSPACES ")
         .borders(Borders::ALL)
         .border_style(focused_border(true, theme));
 
@@ -605,11 +605,13 @@ fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
 
 fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
     let (title, label, submit_hint) = match &input.action {
-        // Names the adapter picked in step 1, if any — "spawn root" alone
+        // Names the adapter picked in step 1, if any — "new workspace" alone
         // for the bare-terminal choice (or the no-picker skip path), same
         // wording as before this picker existed.
-        PendingAction::SpawnRoot { adapter: Some(name) } => (format!(" spawn root: {name} "), "repo path:", "spawn"),
-        PendingAction::SpawnRoot { adapter: None } => (" spawn root ".to_string(), "repo path:", "spawn"),
+        PendingAction::SpawnRoot { adapter: Some(name) } => {
+            (format!(" new workspace: {name} "), "repo path:", "spawn")
+        }
+        PendingAction::SpawnRoot { adapter: None } => (" new workspace ".to_string(), "repo path:", "spawn"),
         PendingAction::SpawnChild { .. } => (" spawn child ".to_string(), "task:", "spawn"),
         PendingAction::Search => (" search ".to_string(), "agent name:", "jump"),
     };
@@ -664,7 +666,7 @@ fn render_picker_modal(frame: &mut Frame, area: Rect, picker: &PickerState) {
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(" spawn root: choose a harness ")
+        .title(" new workspace: choose a harness ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(Color::Black));

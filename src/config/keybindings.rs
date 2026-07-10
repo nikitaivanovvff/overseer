@@ -124,7 +124,7 @@ impl Action {
             Action::NavUp => "navigate up",
             Action::ToggleExpand => "fold/unfold",
             Action::JumpIn => "jump in",
-            Action::SpawnRoot => "spawn root",
+            Action::SpawnRoot => "new workspace",
             Action::SpawnChild => "spawn child",
             Action::Drop => "drop",
             Action::DropRecursive => "recursive drop",

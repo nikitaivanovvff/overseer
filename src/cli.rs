@@ -38,8 +38,8 @@ pub enum Command {
         from_hook: bool,
         /// Self-identifies the calling session's actual harness (e.g.
         /// "claude"/"opencode"/"pi") — only each adapter's own install hook
-        /// passes this, once, at session start. Lets a bare-shell root stop
-        /// looking like "shell" the moment a real harness actually runs
+        /// passes this, once, at session start. Lets a bare-shell workspace
+        /// stop looking like "shell" the moment a real harness actually runs
         /// inside it, which is what an omitted `--adapter` on a later
         /// `overseer spawn` inherits from.
         #[arg(long)]
@@ -73,17 +73,18 @@ pub enum Command {
     /// `--help` since it's an implementation detail, not a user workflow.
     #[command(hide = true)]
     Daemon,
-    /// Start a root: a bare shell in a repo (server-side launch via the running
-    /// TUI), registered immediately and named after the repo. Run your own agent
-    /// inside it whenever you're ready — Overseer picks up its status via the
-    /// existing push hooks, no adapter is launched on your behalf.
+    /// Start a workspace: a bare shell in a repo (server-side launch via the
+    /// running TUI), registered immediately and named after the repo. Run
+    /// your own agent inside it whenever you're ready — Overseer picks up
+    /// its status via the existing push hooks, no adapter is launched on
+    /// your behalf.
     Start {
         /// Repo root to start in (default: current directory).
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
     /// Request a child agent. Caller identity comes from $OVERSEER_AGENT_ID — rejected
-    /// if the caller is itself a child (flat tree: roots + children only).
+    /// if the caller is itself a child (flat tree: workspaces + children only).
     Spawn {
         /// The child's entire initial prompt — as long as it needs to be.
         #[arg(long)]
@@ -93,13 +94,13 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Adapter to use. Defaults to the spawning agent's own adapter when
-        /// omitted (a pi root's children run pi too, unless told otherwise) —
-        /// never a fixed "claude" default, which would silently launch the
-        /// wrong harness for a non-claude root.
+        /// omitted (a pi workspace's children run pi too, unless told
+        /// otherwise) — never a fixed "claude" default, which would silently
+        /// launch the wrong harness for a non-claude workspace.
         #[arg(long)]
         adapter: Option<String>,
     },
-    /// Kill the agent's session and deregister it. Root agents can only be
+    /// Kill the agent's session and deregister it. Workspaces can only be
     /// dropped through the TUI, not this command.
     Drop {
         /// Agent id to drop.
@@ -124,9 +125,9 @@ pub enum Command {
     Kill,
     /// Submit `--text` into the agent's PTY as a prompt, press Enter, and
     /// exit — the scriptable counterpart to typing into a pane in the TUI.
-    /// Lets a root agent (or a cron job/script) nudge an idle or blocked
+    /// Lets a workspace (or a cron job/script) nudge an idle or blocked
     /// child without a real interactive terminal (AGENTS.md "Attention
-    /// Surfacing" leaves re-prompting to a human or the root deciding —
+    /// Surfacing" leaves re-prompting to a human or the workspace deciding —
     /// this is how that decision gets carried out non-interactively). Not a
     /// new capability: any agent holding `OVERSEER_SOCKET` could already
     /// write into any other agent's PTY via the wire protocol's `Write`

@@ -7,7 +7,7 @@ use crate::session::SessionManager;
 pub enum DropError {
     #[error("unknown agent: {0}")]
     NotFound(AgentId),
-    #[error("root agents cannot be dropped via command — use the TUI")]
+    #[error("workspaces can only be dropped through the TUI")]
     RootRequiresTui,
     #[error("agent has children — use --recursive to drop the whole subtree")]
     HasChildrenNeedsRecursive,

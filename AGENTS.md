@@ -4,9 +4,9 @@
 
 The agents are already smart. Overseer does **not** reimplement what they do — it does not manage git worktrees, branches, or merges; agents handle their own isolation. Overseer is the observability, routing, and approval surface on top: see every agent's state at a glance, jump into any one to approve or intervene, or leave the parent to supervise its own children.
 
-The usual shape is **one root per repository**. `n` spawns a root in a repo you choose (default: cwd). If you've run `overseer install <agent>` for at least one harness, `n` first asks which to launch — every installed adapter plus a "bare terminal" choice — then prompts for the repo path; picking an adapter launches it directly, same as typing it into a shell yourself. If nothing is installed yet, `n` skips straight to the repo-path prompt and gives you a bare shell, exactly as it always did — Overseer doesn't force an agent on you. Either way the row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks (a bare shell's own `idle` sticks until you run something yourself). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
+The usual shape is **one workspace per repository**. `n` spawns a workspace in a repo you choose (default: cwd). If you've run `overseer install <agent>` for at least one harness, `n` first asks which to launch — every installed adapter plus a "bare terminal" choice — then prompts for the repo path; picking an adapter launches it directly, same as typing it into a shell yourself. If nothing is installed yet, `n` skips straight to the repo-path prompt and gives you a bare shell, exactly as it always did — Overseer doesn't force an agent on you. Either way the row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks (a bare shell's own `idle` sticks until you run something yourself). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
 
-The hierarchy is intentionally **flat**: a parent (root) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **root's** node name is the **repo name** — there's no task description, since a root is either a bare shell with nothing running yet or an adapter launched with an empty task, same as a human just opening it. The adapter (claude, opencode, pi) is shown in the detail panel; a root spawned as a bare shell shows adapter `shell` until you run something inside it yourself, while a root spawned via the picker's adapter choice shows that adapter immediately.
+The hierarchy is intentionally **flat**: a parent (workspace) can spawn children, but children cannot spawn further agents. This keeps the tree readable, the user in control, and token costs predictable. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is either a bare shell with nothing running yet or an adapter launched with an empty task, same as a human just opening it. The adapter (claude, opencode, pi) is shown in the detail panel; a workspace spawned as a bare shell shows adapter `shell` until you run something inside it yourself, while a workspace spawned via the picker's adapter choice shows that adapter immediately.
 
 ---
 
@@ -15,14 +15,14 @@ The hierarchy is intentionally **flat**: a parent (root) can spawn children, but
 ```
 You (the user)
   └─ Overseer TUI                                                        ← one window, the whole fleet
-       └─ Root  (name: overseer, adapter: shell → claude once you run it) ← bare shell in the repo checkout
+       └─ Workspace  (name: overseer, adapter: shell → claude once you run it) ← bare shell in the repo checkout
             ├─ Child Agent A  (task: auth-module, adapter: claude)       ← own PTY, own branch
             └─ Child Agent B  (task: write-tests, adapter: opencode)     ← own PTY, own branch
 ```
 
-You spawn the root — either as a bare shell you run your own agent inside, or, once you've installed at least one adapter, by picking it directly from `n`'s picker — and talk to it directly; it fans out children on your behalf. Every agent (root or child) is a PTY Overseer launched and a row you can jump into. Branch/worktree isolation is the **agent's** job, not Overseer's.
+You spawn the workspace — either as a bare shell you run your own agent inside, or, once you've installed at least one adapter, by picking it directly from `n`'s picker — and talk to it directly; it fans out children on your behalf. Every agent (workspace or child) is a PTY Overseer launched and a row you can jump into. Branch/worktree isolation is the **agent's** job, not Overseer's.
 
-Agents know their role (`root` or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens, nothing written into your repo.
+Agents know their role (`root` (the wire value for a workspace) or `child`) via injected env vars and a **user-level skill** installed once with `overseer install <agent>`. Claude Code hooks POST lifecycle events to the Unix socket to report status — zero agent context tokens, nothing written into your repo.
 
 The registry and every agent's PTY live in a **daemon** process, not the TUI — an `overseer` launch attaches as a client (auto-spawning one if it isn't running). Quitting the TUI detaches; the daemon and every agent keep running, and a later launch reattaches to exactly what was there before (see "Daemon + Attach Protocol").
 
@@ -34,12 +34,12 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 
 | Term | Also called | What it is | Code anchor |
 |------|-------------|------------|-------------|
-| **Agent structure** pane | tree, agent tree, sidebar | The left-column list of every agent (roots with their children nested under them), titled `AGENTS`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
+| **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
 | **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and context %. | `ui::render_agent_detail` |
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
-| **Root** | workspace | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
-| **Child** | — | An agent a root spawned for one task; cannot spawn further agents. | `AgentRole::Child` |
+| **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
+| **Child** | — | An agent a workspace spawned for one task; cannot spawn further agents. | `AgentRole::Child` |
 | **Harness** | adapter, agent type | The AI CLI an agent runs (claude, opencode, pi) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
 | **Jump in** | focus the pane | Moving keyboard focus into the agent pane (`Ctrl-l`/`Enter`/`o`/click); every key but `Ctrl-h` then forwards to the agent. | `tui::jump_in`, `Focus::Pane` |
 | **Daemon** | — | The background process owning the registry and every PTY; the TUI is a detachable client of it. | `src/daemon.rs` |
@@ -115,15 +115,15 @@ Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `
 | `overseer install` | `<agent> --uninstall?` | Install (or remove) the user-level skill(s) + status hooks for an agent type. Run once at setup, not per launch. |
 | `overseer uninstall` | `<agent>` | Remove the user-level skill(s) + status hooks for an agent type. Direct top-level equivalent of `overseer install <agent> --uninstall`, both call the same `install::run_install`. |
 | `overseer daemon` | — | Runs the daemon itself: binds the socket, serves requests, streams attach events, watches session exits. Hidden from `--help` — not a user workflow, the TUI spawns one automatically. |
-| `overseer start` | `--cwd?` | Register a root and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. `--cwd` must exist and be a directory, but doesn't have to be a git repo: outside one, the root is named after the directory itself with an empty (`—` in the TUI) branch, rather than faking a repo/branch pair. The wire request (`Request::Start`) also accepts an optional adapter to launch directly instead; only the TUI's `n` picker uses that today, this CLI subcommand doesn't expose an `--adapter` flag. |
+| `overseer start` | `--cwd?` | Register a workspace and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. `--cwd` must exist and be a directory, but doesn't have to be a git repo: outside one, the workspace is named after the directory itself with an empty (`—` in the TUI) branch, rather than faking a repo/branch pair. The wire request (`Request::Start`) also accepts an optional adapter to launch directly instead; only the TUI's `n` picker uses that today, this CLI subcommand doesn't expose an `--adapter` flag. |
 | `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context % — Claude-specific; opencode's plugin and pi's extension push plain `overseer status <s>`, no `--from-hook`, since their own events are already precise. Each push carries a `pushed_at` wall-clock timestamp captured at process start (`main.rs`, before argument parsing) — every hook fire is its own short-lived process making its own socket connection with no ordering between connections, so a push that fired earlier can otherwise arrive later and clobber a fresher one; `AgentRegistry::set_status` drops any push older than the newest one already applied for that agent. |
 | `overseer spawn` | `--task --name? --adapter?` | Request a child. Rejected if the caller is already a child. `--task` is the child's entire initial prompt; `--name` is a short, distinct tree-row label (falls back to `--task` verbatim if omitted or blank). |
-| `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. Root agents are rejected here — only the TUI's `d`/`D` (a distinct wire request, see below) can drop one. |
-| `overseer shutdown` | — | The kill switch: recursive-drops every root, then the daemon process exits. Same request the TUI's `Q` sends after its confirm. Unchanged, no timeout — assumes a healthy daemon; if it can't reach one, use `kill` instead. |
+| `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. Workspaces are rejected here — only the TUI's `d`/`D` (a distinct wire request, see below) can drop one. |
+| `overseer shutdown` | — | The kill switch: recursive-drops every workspace, then the daemon process exits. Same request the TUI's `Q` sends after its confirm. Unchanged, no timeout — assumes a healthy daemon; if it can't reach one, use `kill` instead. |
 | `overseer kill` | — | Last-resort forceful cleanup for a daemon `shutdown` can't reach — wedged/deadlocked and never replying, or already crashed with a stale socket/lockfile left behind. Tries the exact same graceful `Request::Shutdown` first, bounded by a ~5s timeout (with retries against the narrow lock-acquired-before-socket-bound startup race) — only escalates to `SIGKILL`ing the daemon pid (read from the `flock`-guarded `daemon.pid` lockfile, see below) if that doesn't answer in time. Also `SIGKILL`s any orphaned agent PTY processes found as the daemon's direct children (best-effort, via `ps` — see "Daemon death is total" below for why the daemon pid alone isn't enough), then removes the stale socket/lockfile so a fresh daemon can bind cleanly. A separate subcommand rather than added behavior on `shutdown`, so existing callers of `shutdown` see no new destructive-by-default timeout/signal-kill. |
 | `overseer list` | — | List all agents |
 | `overseer agent` | `<id>` | Get agent detail |
-| `overseer prompt` | `<id> --text "<text>"` | Submit `--text` into the agent's PTY as a prompt and press Enter, non-interactively, then exit — the scriptable counterpart to typing into a pane in the TUI. Lets a root (or a cron job/script) nudge an idle or blocked child without a real interactive terminal (see "Attention Surfacing" below). Internally opens its own `Attach` connection, discards the initial `Snapshot`, and sends two separate `Write`s (text, then a delayed `\r`) — `Write` is only honored on an attach connection, not the one-shot `dispatch` path, so this isn't a thin wrapper over a single request. |
+| `overseer prompt` | `<id> --text "<text>"` | Submit `--text` into the agent's PTY as a prompt and press Enter, non-interactively, then exit — the scriptable counterpart to typing into a pane in the TUI. Lets a workspace (or a cron job/script) nudge an idle or blocked child without a real interactive terminal (see "Attention Surfacing" below). Internally opens its own `Attach` connection, discards the initial `Snapshot`, and sends two separate `Write`s (text, then a delayed `\r`) — `Write` is only honored on an attach connection, not the one-shot `dispatch` path, so this isn't a thin wrapper over a single request. |
 
 Identity (`OVERSEER_AGENT_ID`, socket path) comes from injected env, so commands don't pass it explicitly.
 
@@ -146,13 +146,13 @@ The same connection accepts `Watch { agent_id }` / `Unwatch` (the TUI watches wh
 
 `Output` streams a rendered `GridSnapshot` DTO (cells, colors, cursor, the two `TermModes` bits key encoding needs), not raw PTY bytes (see "What to Avoid" for why), whenever `SessionManager`'s per-agent generation counter says the watched agent's screen changed. `ui::term_pane::paint_grid_snapshot` paints it directly.
 
-Root-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only by the TUI's `d`/`D` handling — a safety rail against *accidental* misuse (a script or supervising agent calling the documented CLI taking out a whole root tree it doesn't own), not an authorization boundary between agents — see "Security" below for what actually is.
+Workspace-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only by the TUI's `d`/`D` handling — a safety rail against *accidental* misuse (a script or supervising agent calling the documented CLI taking out a whole workspace tree it doesn't own), not an authorization boundary between agents — see "Security" below for what actually is.
 
 `--mock` never touches any of this: fully in-process, its own throwaway socket, seeded demo data, no real PTYs.
 
 ### Security
 
-Every agent under one daemon fully trusts every other agent. `agent_id` is a plain, caller-supplied field on every IPC request — never checked against the identity of the connection sending it, because the protocol has no notion of connection identity (no `SO_PEERCRED` check, no per-agent auth handshake). Any agent holding `OVERSEER_SOCKET` can `Write` into any other agent's PTY (including the root shell's — real cross-agent code execution, not a UI nuisance), forge any agent's `Status`, `Drop` any non-root agent, or `Shutdown` the whole daemon. `overseer prompt` is a documented, scriptable path to that same `Write` capability (attach + two writes under the hood) — not a new one; the underlying wire protocol already let any agent write into any other agent's PTY before this command existed. This is a deliberate, accepted trade-off, not an oversight (see `.specs/SECURITY-AUDIT.md` F4) — the isolation Overseer provides is organizational (a tree you can see and `drop`), not a sandbox between siblings. **Do not run mutually-distrusting agents under one daemon.**
+Every agent under one daemon fully trusts every other agent. `agent_id` is a plain, caller-supplied field on every IPC request — never checked against the identity of the connection sending it, because the protocol has no notion of connection identity (no `SO_PEERCRED` check, no per-agent auth handshake). Any agent holding `OVERSEER_SOCKET` can `Write` into any other agent's PTY (including the workspace's own shell — real cross-agent code execution, not a UI nuisance), forge any agent's `Status`, `Drop` any non-workspace agent, or `Shutdown` the whole daemon. `overseer prompt` is a documented, scriptable path to that same `Write` capability (attach + two writes under the hood) — not a new one; the underlying wire protocol already let any agent write into any other agent's PTY before this command existed. This is a deliberate, accepted trade-off, not an oversight (see `.specs/SECURITY-AUDIT.md` F4) — the isolation Overseer provides is organizational (a tree you can see and `drop`), not a sandbox between siblings. **Do not run mutually-distrusting agents under one daemon.**
 
 Cross-user isolation relies on the socket directory being owner-only (`0700`, validated rather than blindly chmod'd — a pre-existing dir at the predictable `/tmp/overseer-$UID` fallback path is checked for real-directory/ownership/mode before being trusted) and the socket node itself being `0600`.
 
@@ -177,7 +177,7 @@ pub trait AgentAdapter: Send + Sync {
 
 `InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
-- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those. Also recognizes and cleans up pre-tagging-era Overseer hooks, via two independent legacy signatures: entries containing both `OVERSEER_AGENT_ID` and `Follow the overseer` (the old SessionStart printf text), or entries invoking our own binary's `status` subcommand at all (`overseer status `) — the latter catches untagged `PostToolUse`/`Stop` duplicates from before `--from-hook` classification existed, found live racing a correctly-tagged push and intermittently winning (a bare `status done` on every `Stop` could force a perfectly healthy root to `done`). Both are treated as ours so upgrading from an install that predates the tag converges instead of leaving orphaned duplicates behind (see `is_overseer_entry` in `src/settings.rs`).
+- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those. Also recognizes and cleans up pre-tagging-era Overseer hooks, via two independent legacy signatures: entries containing both `OVERSEER_AGENT_ID` and `Follow the overseer` (the old SessionStart printf text), or entries invoking our own binary's `status` subcommand at all (`overseer status `) — the latter catches untagged `PostToolUse`/`Stop` duplicates from before `--from-hook` classification existed, found live racing a correctly-tagged push and intermittently winning (a bare `status done` on every `Stop` could force a perfectly healthy workspace to `done`). Both are treated as ours so upgrading from an install that predates the tag converges instead of leaving orphaned duplicates behind (see `is_overseer_entry` in `src/settings.rs`).
 - `JsonArrayMerge { key, entries }` — generic: merges/removes string `entries` into/from a named top-level JSON array (opencode's `instructions`); uninstall removes exactly `entries` back out.
 
 `legacy_paths()` names a previous install layout to delete outright rather than leave to rot. Nothing is ever written into the user's repo, for any adapter.
@@ -189,13 +189,13 @@ Adding a fourth adapter is a repeatable recipe: `.claude/skills/adding-harness-s
 Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_SOCKET` — Unix socket path
 - `OVERSEER_AGENT_ID` — UUID
-- `OVERSEER_ROLE` — `root` | `child`
-- `OVERSEER_PARENT_ID` — parent UUID (absent for root)
+- `OVERSEER_ROLE` — `root` (the wire value for a workspace) | `child`
+- `OVERSEER_PARENT_ID` — parent UUID (absent for a workspace)
 - `OVERSEER_REPO` — repository name
-- `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for root). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
+- `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for a workspace). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
 
 Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE`:
-- Root agents: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is supported — a claude root may spawn an opencode or pi child and vice versa.
+- Workspaces: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is supported — a claude workspace may spawn an opencode or pi child and vice versa.
 - Child agents: spawning is not permitted; the agent sets up its own branch/worktree, does the task, and reports completion explicitly (`overseer status done`) — never inferred.
 
 Three harnesses, three status-wiring mechanisms — each verified against the installed binary, not just its docs:
@@ -204,7 +204,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | Hook | Pushes | Why |
 |------|--------|-----|
-| `SessionStart` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | A root is a bare shell the human ran `claude` inside themselves — freshly started, it's waiting on the human to type a prompt, so `running` here would be misleading before the first prompt is even submitted; `UserPromptSubmit` is what flips it. A child's task is delivered as its initial prompt, so it's already working the instant it launches (registered `Spawning` — see "Spawn Data Flow") — this is what flips it to `running`. Both branches self-identify the adapter and print a pointer at the role-specific skill. |
+| `SessionStart` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | A workspace is a bare shell the human ran `claude` inside themselves — freshly started, it's waiting on the human to type a prompt, so `running` here would be misleading before the first prompt is even submitted; `UserPromptSubmit` is what flips it. A child's task is delivered as its initial prompt, so it's already working the instant it launches (registered `Spawning` — see "Spawn Data Flow") — this is what flips it to `running`. Both branches self-identify the adapter and print a pointer at the role-specific skill. |
 | `UserPromptSubmit` | `running` | The point real work actually begins — covers both a session's first prompt and the user prompting again after the agent had gone `idle`. |
 | `PostToolUse` | `running` | Actively working. |
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
@@ -214,7 +214,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | opencode event | Pushes | Why |
 |------|--------|-----|
-| `session.created` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | A root is a bare shell waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. Same reasoning as Claude's `SessionStart`. |
+| `session.created` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | A workspace is a bare shell waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. Same reasoning as Claude's `SessionStart`. |
 | `session.status` (`status.type === "busy"`) | `running` | The actual "agent is actively working" signal — confirmed live; better grounded than proxying through `tool.execute.after`, which only fires around tool calls. |
 | `session.idle` | `idle` | Finished responding. |
 | `permission.ask` *(a separate hook, not the generic event bus)* | `blocked` | The moment a permission prompt appears. Never sets the hook's own `output.status` — Overseer only observes, the human still decides. |
@@ -225,7 +225,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 
 | pi event | Pushes | Why |
 |------|--------|-----|
-| `session_start` | `idle` for a root, `running` for a child (branches on `$OVERSEER_ROLE`) | Mirrors Claude's `SessionStart`: a root is waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. |
+| `session_start` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | Mirrors Claude's `SessionStart`: a workspace is waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. |
 | `agent_start` | `running` | A turn begins. |
 | `agent_end` | `idle` | A turn ends. |
 | `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |
@@ -243,7 +243,7 @@ A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tr
 - **Terminal bell.** `\x07` to the TUI's own stdout on any `→blocked` transition — works everywhere, including over ssh. On by default unless `[notify] bell = false`.
 - **Desktop notification.** `osascript`/`notify-send`, off by default (`[notify] mode = "off"`). `"blocked"` fires on `→blocked` only; `"blocked+idle"` also fires on `→idle`.
 
-Both are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the last — identical for `--mock` and daemon-attached. Config in `[notify]` (see Config below). Out of scope: a supervision loop that auto-re-prompts an idle child — this surfaces, a human (or the root agent reading `overseer list`) decides.
+Both are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the last — identical for `--mock` and daemon-attached. Config in `[notify]` (see Config below). Out of scope: a supervision loop that auto-re-prompts an idle child — this surfaces, a human (or the workspace reading `overseer list`) decides.
 
 ### Workspace
 
@@ -251,13 +251,13 @@ Overseer does **not** manage workspaces. A parent runs in the repo's existing ch
 
 ### Cleanup
 
-Dropping an agent kills its PTY and deregisters it — Overseer doesn't delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent. Root agents can't be dropped via IPC, only the TUI (`Request::TuiDrop`).
+Dropping an agent kills its PTY and deregisters it — Overseer doesn't delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent. Workspaces can't be dropped via IPC, only the TUI (`Request::TuiDrop`).
 
 A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0) or `error` (non-zero/signal), and the agent stays visible for review before an explicit `drop`.
 
 **Quitting the TUI is a detach, not a kill.** `q`/`Ctrl-C` closes the attach connection immediately, no confirm — the daemon and every agent it tracks are unaffected. A later `overseer` launch reattaches and recovers the full tree and each agent's terminal content.
 
-**`overseer shutdown`** (CLI) or **`Q`** (TUI, with a confirm) is the actual kill switch: recursive-drops every root, then the daemon exits. Dropping the last agent does *not* shut the daemon down on its own. **`overseer kill`** is the fallback for when `shutdown` can't even get a response — see "Daemon + Attach Protocol" above for what it does and why a plain `kill -9` on the daemon pid alone wouldn't be enough.
+**`overseer shutdown`** (CLI) or **`Q`** (TUI, with a confirm) is the actual kill switch: recursive-drops every workspace, then the daemon exits. Dropping the last agent does *not* shut the daemon down on its own. **`overseer kill`** is the fallback for when `shutdown` can't even get a response — see "Daemon + Attach Protocol" above for what it does and why a plain `kill -9` on the daemon pid alone wouldn't be enough.
 
 **Daemon death is total — for the graceful paths.** No on-disk state file, and `shutdown`/`Q` recursively drop (and thus `SIGKILL`) every agent PTY explicitly before the daemon exits, so nothing outlives it: a fresh daemon always starts from an empty tree (same contract a `tmux` server has with its panes). This is *not* an automatic consequence of the daemon process itself dying, though — a bare `kill -9` on the daemon pid (or a crash) leaves every agent PTY running as an orphan, since each is `setsid()`'d into its own session and the daemon isn't its process-group leader. `overseer kill` accounts for this by finding and killing those orphans too, rather than assuming a plain signal-kill of the daemon takes them with it.
 
@@ -265,7 +265,7 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 
 ```
 ┌───────────────────────────┬─────────────────────────────────────────┐
-│ AGENTS                    │                                         │
+│ WORKSPACES                │                                         │
 │ ◌ overseer            idle│   the selected agent's live grid,       │
 │   ├ ⠸ auth-module 8%      │   painted directly into this same       │
 │   ├ ! tests blocked 2m 91%│   ratatui frame by ui/term_pane —       │
@@ -300,7 +300,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
-| `n` | Spawn a root in a chosen repo (default cwd). If any adapter is installed, first opens a picker (`j`/`k`, `Enter` to confirm, `Esc` to cancel) — every `overseer install`ed adapter plus "bare terminal" — then the repo-path prompt; skips straight to the prompt (bare shell) if nothing is installed |
+| `n` | Spawn a workspace in a chosen repo (default cwd). If any adapter is installed, first opens a picker (`j`/`k`, `Enter` to confirm, `Esc` to cancel) — every `overseer install`ed adapter plus "bare terminal" — then the repo-path prompt; skips straight to the prompt (bare shell) if nothing is installed |
 | `s` | Spawn child under selected agent (adapter-launched, same as before) |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
@@ -334,7 +334,7 @@ Scrolling happens where the real terminal state lives — the daemon (`SessionMa
 ### Spawn Data Flow
 
 ```
-Root agent runs: overseer spawn --name "write-tests" --task "write tests" --adapter claude
+Workspace runs: overseer spawn --name "write-tests" --task "write tests" --adapter claude
 
 IPC server (spawn_blocking):
   → name = name.filter(non-blank).unwrap_or(task) = "write-tests"  // task text is the fallback only
@@ -356,9 +356,9 @@ per the overseer-child skill's worked example), and its own SessionStart hook
 flips it from Spawning to Running moments later.
 ```
 
-`overseer start` (launch a root) is a *different* path — always no task, and by default no adapter either: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it. The cwd doesn't have to be a git repo — git failure just falls back to the directory's own basename as the name and an empty branch, rather than rejecting the root outright; only a nonexistent/non-directory cwd is rejected.
+`overseer start` (launch a workspace) is a *different* path — always no task, and by default no adapter either: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it. The cwd doesn't have to be a git repo — git failure just falls back to the directory's own basename as the name and an empty branch, rather than rejecting the workspace outright; only a nonexistent/non-directory cwd is rejected.
 
-`Request::Start` also accepts an optional `adapter` (the TUI's `n` picker's second field, once step 1 finds at least one `overseer_installed()` adapter). When set, `spawn_root` takes the other branch — `spawn_root_with_adapter` — and launches that adapter the same way a child's spawn does: `adapter.spawn_command(ctx)`/`adapter.env_inject(ctx)`, role `Root`, no parent, `task=""`. It registers `status=Spawning` (not `Idle`) for the same reason a child does — the PTY is launching but the harness hasn't reported activity yet. No `SessionStart`/hook changes were needed for this: launching an adapter directly at root with an empty task is byte-identical to a human typing e.g. `claude` into today's bare shell, and every adapter's own install hook already branches on `$OVERSEER_ROLE` (`idle` for root, `running` for child) regardless of who launched the process.
+`Request::Start` also accepts an optional `adapter` (the TUI's `n` picker's second field, once step 1 finds at least one `overseer_installed()` adapter). When set, `spawn_root` takes the other branch — `spawn_root_with_adapter` — and launches that adapter the same way a child's spawn does: `adapter.spawn_command(ctx)`/`adapter.env_inject(ctx)`, role `Root`, no parent, `task=""`. It registers `status=Spawning` (not `Idle`) for the same reason a child does — the PTY is launching but the harness hasn't reported activity yet. No `SessionStart`/hook changes were needed for this: launching an adapter directly as a workspace with an empty task is byte-identical to a human typing e.g. `claude` into today's bare shell, and every adapter's own install hook already branches on `$OVERSEER_ROLE` (`idle` for a workspace, `running` for child) regardless of who launched the process.
 
 ---
 
@@ -442,7 +442,7 @@ Single statically-linked binary. Targets: `aarch64-apple-darwin`, `x86_64-apple-
 
 ## Limits
 
-Measured, not assumed — `scripts/stress.sh [N] [lines_per_sec]` spawns 1 root + N chatty children (status pushes + one high-output pane, default 400 lines/sec) and watches the streaming pane for the entire load window (a watched pane must be exercised throughout, not just after — an earlier version of this script that skipped that missed a real regression).
+Measured, not assumed — `scripts/stress.sh [N] [lines_per_sec]` spawns 1 workspace + N chatty children (status pushes + one high-output pane, default 400 lines/sec) and watches the streaming pane for the entire load window (a watched pane must be exercised throughout, not just after — an earlier version of this script that skipped that missed a real regression).
 
 Tested at **N=30** (target fleet size) and **N=50** (headroom), release build: daemon RSS 150-250MB (under the 500MB budget, dominated by scrollback buffers not fleet size), daemon CPU under ~17% of one core with two simultaneous watchers, spawn latency ~10-30ms mean, status-push round-trip a few ms to tens of ms (0 pushes lost), write→`Output` round trip in the tens of milliseconds.
 
@@ -478,5 +478,5 @@ Implementation plans and research notes live in **`.specs/`**, which is **gitign
 - **Don't skip the confirm prompt for `d`/`D`/`Q`.** Killing a session (or the whole daemon) interrupts in-flight work.
 - **Don't make quitting kill agents.** `q`/`Ctrl-C` is a detach, never touches a session or the daemon. `d`/`D` kills one agent, `Q` kills everything plus the daemon; both confirm.
 - **Don't add a second way to *gracefully* end the daemon process.** `Request::Shutdown` asks the accept loop to stop and lets `main` return — no `std::process::exit`. A response still in flight when the process exits is a real bug (once caused by `tokio::sync::Notify::notify_waiters` losing a wake under this exact race — use `notify_one`, which stores a permit, for any future stop-signal here). `overseer kill` (`src/kill.rs`) doesn't violate this: it always tries this exact same `Request::Shutdown` path first, and only reaches for `SIGKILL` once that request has been given a real chance and failed to get a response — it's a forceful fallback for an unresponsive daemon, not a second graceful exit path racing this one.
-- **Don't add a `Request::Drop`-with-a-flag for root drops.** Root-allowed drop is `Request::TuiDrop`, a distinct wire request only the TUI's key handling constructs — a caller-supplied bool would let any script opt out of the restriction it exists to enforce.
+- **Don't add a `Request::Drop`-with-a-flag for workspace drops.** Workspace-allowed drop is `Request::TuiDrop`, a distinct wire request only the TUI's key handling constructs — a caller-supplied bool would let any script opt out of the restriction it exists to enforce.
 - **Don't assume `alacritty_terminal` exposes raw PTY bytes.** It doesn't, not without reimplementing its mio/signalfd event loop — that's why the attach protocol streams rendered `GridSnapshot`s instead. Re-verify against the installed version before retrying; a future public tap would be a contained change to `session::pty` + `ipc::protocol`, not a redesign.
