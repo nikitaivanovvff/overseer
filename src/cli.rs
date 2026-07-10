@@ -1,7 +1,7 @@
 //! CLI definition + client mode: parses `overseer <subcommand>`, builds the
-//! matching wire `Request`, and sends it over the socket. `Install` is
-//! special-cased before reaching `run_client` (see `main.rs`) since it needs
-//! no socket at all.
+//! matching wire `Request`, and sends it over the socket. `Install` and
+//! `Uninstall` are special-cased before reaching `run_client` (see
+//! `main.rs`) since they need no socket at all.
 
 use std::path::PathBuf;
 
@@ -59,6 +59,13 @@ pub enum Command {
         /// Remove only the Overseer-managed entries instead of installing them.
         #[arg(long)]
         uninstall: bool,
+    },
+    /// Remove the adapter skill(s) + hooks installed at the user level (runs
+    /// once, no socket needed). Equivalent to `overseer install <agent>
+    /// --uninstall`.
+    Uninstall {
+        /// Adapter name to uninstall (e.g. "claude").
+        agent: String,
     },
     /// Runs the daemon that owns the registry, sessions, and IPC socket across
     /// TUI restarts. Not meant to be run by hand — the TUI auto-spawns one,
@@ -296,6 +303,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
         }
         Command::Shutdown => Ok(Some(Request::Shutdown)),
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
+        Command::Uninstall { .. } => unreachable!("Uninstall is handled before run_client"),
         Command::Daemon => unreachable!("Daemon is handled before run_client"),
         Command::Kill => unreachable!("Kill is handled before run_client"),
         Command::Prompt { .. } => unreachable!("Prompt is handled before build_request in run_client"),

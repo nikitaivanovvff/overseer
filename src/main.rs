@@ -33,6 +33,7 @@ fn main() -> Result<()> {
     match parsed.cmd {
         None => tui::run_tui(socket, parsed.mock),
         Some(Command::Install { agent, uninstall }) => install::run_install(&agent, uninstall),
+        Some(Command::Uninstall { agent }) => install::run_install(&agent, true),
         Some(Command::Daemon) => daemon::run_daemon(socket),
         Some(Command::Kill) => kill::run_kill(socket),
         Some(cmd) => cli::run_client(socket, cmd, pushed_at),
