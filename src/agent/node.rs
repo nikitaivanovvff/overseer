@@ -7,6 +7,8 @@ use super::{AgentId, AgentStatus};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
+    /// A top-level agent, one per repo. Wire/env value `root`
+    /// (`OVERSEER_ROLE=root`) — presented to the user as *workspace*.
     Root,
     Child,
 }

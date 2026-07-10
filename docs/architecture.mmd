@@ -28,7 +28,7 @@ flowchart TB
     IPC --> SM
 
     subgraph AGENTS["Agent sessions (each its own PTY child process)"]
-        ROOT["Root — one per repo<br/>bare shell or picked harness"]
+        ROOT["Workspace — one per repo<br/>bare shell or picked harness"]
         C1["Child agent<br/>(claude)"]
         C2["Child agent<br/>(opencode / pi)"]
     end
