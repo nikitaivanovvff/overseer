@@ -1,0 +1,37 @@
+[package]
+name = "overseer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client-agnostic core for Overseer: agent registry, session/PTY management, IPC protocol, daemon, and config"
+
+[lib]
+name = "overseer_core"
+path = "src/lib.rs"
+
+[features]
+# Exposes test-only helpers (env-var guard, escape-sequence-to-GridSnapshot
+# fixtures) to other workspace crates' own test/dev-dependency builds, so
+# nothing needs to duplicate them or pull in alacritty_terminal/crossterm
+# just to write tests. See AGENTS.md "alacritty_terminal lives only in
+# session/pty.rs" — this keeps that true for the bin crate too.
+test-util = []
+
+[dependencies]
+anyhow.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+alacritty_terminal.workspace = true
+toml.workspace = true
+libc.workspace = true
+# session/keys.rs encodes a crossterm KeyEvent into PTY escape bytes; kept
+# here (crossterm-only, never ratatui) rather than splitting the file — see
+# AGENTS.md and the workspace-split judgment-call notes.
+crossterm.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

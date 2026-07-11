@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::agent::{AgentId, AgentNode, AgentStatus, AgentTree};
-use crate::ipc::protocol::{AgentDto, AttachEvent, GridSnapshot, Request, Response};
-use crate::ipc::AppCtx;
+use overseer_core::agent::{AgentId, AgentNode, AgentStatus, AgentTree};
+use overseer_core::ipc::protocol::{AgentDto, AttachEvent, GridSnapshot, Request, Response};
+use overseer_core::ipc::AppCtx;
 
 /// What a text-input prompt (`n` / `s` / `/`) is being collected for.
 #[derive(Debug, Clone)]
@@ -194,14 +194,14 @@ impl App {
     /// bracketed paste). Mock mode reads its local `Term` directly (via
     /// `SessionManager::term_modes`); daemon mode rebuilds the same struct
     /// from the last received `GridSnapshot`'s two bools.
-    pub fn term_modes(&self, id: &AgentId) -> crate::session::keys::TermModes {
+    pub fn term_modes(&self, id: &AgentId) -> overseer_core::session::keys::TermModes {
         match &self.backend {
             Backend::Mock(ctx) => ctx.0.sessions.term_modes(id),
             Backend::Daemon(state) => state
                 .grid
                 .as_ref()
                 .filter(|(gid, _)| gid == id)
-                .map(|(_, grid)| crate::session::keys::TermModes {
+                .map(|(_, grid)| overseer_core::session::keys::TermModes {
                     app_cursor: grid.app_cursor_mode,
                     bracketed_paste: grid.bracketed_paste_mode,
                 })
@@ -305,8 +305,8 @@ impl App {
     /// `Watch`/`Unwatch`/`Write`/`Resize` inward.
     pub fn dispatch(&self, req: Request) -> Response {
         match &self.backend {
-            Backend::Mock(ctx) => crate::ipc::handlers::dispatch(&ctx.0, req),
-            Backend::Daemon(state) => crate::ipc::client::send(&state.socket, &req)
+            Backend::Mock(ctx) => overseer_core::ipc::handlers::dispatch(&ctx.0, req),
+            Backend::Daemon(state) => overseer_core::ipc::client::send(&state.socket, &req)
                 .unwrap_or_else(|e| Response::err(e.to_string())),
         }
     }
@@ -467,9 +467,9 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentRegistry, AgentRole};
-    use crate::git::GitClient;
-    use crate::session::SessionManager;
+    use overseer_core::agent::{AgentRegistry, AgentRole};
+    use overseer_core::git::GitClient;
+    use overseer_core::session::SessionManager;
     use std::path::PathBuf;
 
     fn test_app() -> App {
@@ -478,7 +478,7 @@ mod tests {
             sessions: Arc::new(SessionManager::dry_run()),
             socket: PathBuf::from("/tmp/overseer-test.sock"),
             git: Arc::new(GitClient::new()),
-            config: Arc::new(crate::config::Config::default()),
+            config: Arc::new(overseer_core::config::Config::default()),
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });
@@ -826,7 +826,7 @@ mod tests {
             sessions: Arc::new(sessions),
             socket: PathBuf::from("/tmp/overseer-scroll-test.sock"),
             git: Arc::new(GitClient::new()),
-            config: Arc::new(crate::config::Config::default()),
+            config: Arc::new(overseer_core::config::Config::default()),
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         });

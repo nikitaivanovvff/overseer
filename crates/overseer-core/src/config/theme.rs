@@ -1,8 +1,15 @@
 //! `[theme]` — status + chrome colors only (PHASE5B.md Task 4). Deliberately
 //! small and honest: no font, no layout, nothing beyond what `ui/` already
 //! centralizes as `status_style`/border styling.
+//!
+//! Colors are `ColorDto` (the same wire-neutral mirror of
+//! `ratatui::style::Color` that `ipc::protocol::GridSnapshot` uses), not
+//! `ratatui::style::Color` itself — this crate never depends on `ratatui`
+//! (AGENTS.md/workspace-split house rule). The `overseer` bin crate's `ui/`
+//! converts with the same `map_dto_color` helper it already uses for grid
+//! cells (`ui::term_pane::map_dto_color`).
 
-use ratatui::style::Color;
+use crate::ipc::protocol::ColorDto as Color;
 use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -1,0 +1,27 @@
+[package]
+name = "overseer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal IDE for orchestrating AI agent hierarchies"
+
+[[bin]]
+name = "overseer"
+path = "src/main.rs"
+
+[dependencies]
+overseer-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+dirs.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+overseer-core = { workspace = true, features = ["test-util"] }
+# tests/kill_daemon_recovery.rs probes daemon pids with libc::kill(pid, 0).
+libc.workspace = true

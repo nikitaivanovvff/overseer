@@ -7,10 +7,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::agent;
-use crate::agent::{AgentId, AgentStatus};
-use crate::ipc;
-use crate::ipc::protocol::Request;
+use overseer_core::agent;
+use overseer_core::agent::{AgentId, AgentStatus};
+use overseer_core::ipc;
+use overseer_core::ipc::protocol::Request;
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -168,7 +168,7 @@ impl From<StatusArg> for AgentStatus {
 pub fn resolve_socket(cli_socket: Option<PathBuf>) -> PathBuf {
     cli_socket
         .or_else(|| std::env::var("OVERSEER_SOCKET").ok().map(PathBuf::from))
-        .unwrap_or_else(crate::daemon::default_socket_path)
+        .unwrap_or_else(overseer_core::daemon::default_socket_path)
 }
 
 pub fn run_client(socket: PathBuf, cmd: Command, pushed_at: std::time::SystemTime) -> Result<()> {
@@ -314,7 +314,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::EnvGuard;
+    use overseer_core::test_env::EnvGuard;
 
     #[test]
     fn build_request_status_no_env_var_returns_none() {

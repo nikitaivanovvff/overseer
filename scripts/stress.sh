@@ -293,7 +293,7 @@ tmux new-session -d -s "$HARNESS" -x 160 -y 40 -c "$TEST_REPO" \
     -e "PATH=$PATH" -e "MARKER_DIR=$MARKER_DIR" -e "TIMING_DIR=$TIMING_DIR" \
     -- sh -c "exec '$OVERSEER' --socket '$SOCK'"
 for _ in $(seq 1 50); do
-    tmux capture-pane -t "$HARNESS" -p 2>/dev/null | grep -q "AGENTS" && break
+    tmux capture-pane -t "$HARNESS" -p 2>/dev/null | grep -q "WORKSPACES" && break
     sleep 0.1
 done
 # Tree order is root first, then children in spawn order — one `j` from the

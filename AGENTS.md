@@ -42,7 +42,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 | **Child** | — | An agent a workspace spawned for one task; cannot spawn further agents. | `AgentRole::Child` |
 | **Harness** | adapter, agent type | The AI CLI an agent runs (claude, opencode, pi) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
 | **Jump in** | focus the pane | Moving keyboard focus into the agent pane (`Ctrl-l`/`Enter`/`o`/click); every key but `Ctrl-h` then forwards to the agent. | `tui::jump_in`, `Focus::Pane` |
-| **Daemon** | — | The background process owning the registry and every PTY; the TUI is a detachable client of it. | `src/daemon.rs` |
+| **Daemon** | — | The background process owning the registry and every PTY; the TUI is a detachable client of it. | `crates/overseer-core/src/daemon.rs` |
 
 ---
 
@@ -60,18 +60,22 @@ overseer (TUI) = attach client                    overseer <subcommand> = one-sh
 overseer --mock = fully in-process demo data, never spawns a real PTY, never touches a daemon
 ```
 
+A Cargo workspace of two crates: `overseer-core` (library — everything
+client-agnostic: agent model, sessions, IPC, daemon, config) and `overseer`
+(the binary — CLI subcommands, daemon entrypoint, and the TUI). The binary's
+name, CLI surface, and behavior are exactly what the pre-workspace single
+crate shipped; core is an internal path dependency, never published on its
+own.
+
 ```
-overseer (binary)
-├── ui/               Ratatui-based terminal UI
-│   ├── mod           Tree|pane split (~25/75): agent tree, detail, status bar, spawn modal
-│   └── term_pane     Paints the selected agent's pane from a GridSnapshot — the only render
-│                     currency, in both --mock and daemon-attached modes
+crates/overseer-core (lib)
 ├── session/          PTY + terminal-emulator management, keyed by AgentId
 │   ├── pty           SessionManager: owns one PTY + terminal emulator per agent — the only file
-│   │                 in the crate that imports alacritty_terminal. Renders GridSnapshot DTOs and
+│   │                 in the workspace that imports alacritty_terminal. Renders GridSnapshot DTOs and
 │   │                 tracks a per-agent content-generation counter (bumped on new PTY output)
 │   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder, parameterized by the neutral
-│                     TermModes struct (input path for a focused pane)
+│                     TermModes struct (input path for a focused pane); the one crossterm import in
+│                     core — kept here rather than splitting the encoder from its input type
 ├── agent/            Agent model and lifecycle
 │   ├── model         AgentNode, AgentStatus, AgentRole, AgentTree
 │   ├── registry      AgentRegistry: in-memory tree of registered agents + a broadcast channel
@@ -94,12 +98,20 @@ overseer (binary)
 │   ├── handlers      dispatch: status, list, agent, start, spawn, drop, tui_drop, shutdown
 │   ├── protocol      Request / Response / AgentDto / AttachEvent / GridSnapshot wire types (serde)
 │   └── client        One-shot sync client used by CLI subcommands and daemon reachability probes
-├── app               App: Backend enum (Mock | Daemon) unifying tree access, session I/O, and
-│                     dispatch behind one API so tui.rs/ui/ don't branch on which backend is live
 └── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters,
                       notify, keybindings, theme}. Missing/invalid file falls back to a built-in
                       default; per-field a bad value falls back to that field's own default too
-                      (a stderr warning, never a hard error).
+                      (a stderr warning, never a hard error). Parsing lives in core even for the
+                      TUI-only sections (keybindings/theme) so a second frontend never needs a
+                      second loader; Theme carries the wire-neutral ColorDto, not a ratatui color.
+
+crates/overseer (bin — the `overseer` binary)
+├── ui/               Ratatui-based terminal UI
+│   ├── mod           Tree|pane split (~25/75): agent tree, detail, status bar, spawn modal
+│   └── term_pane     Paints the selected agent's pane from a GridSnapshot — the only render
+│                     currency, in both --mock and daemon-attached modes
+└── app               App: Backend enum (Mock | Daemon) unifying tree access, session I/O, and
+                      dispatch behind one API so tui.rs/ui/ don't branch on which backend is live
 ```
 
 ---
@@ -131,7 +143,7 @@ Identity (`OVERSEER_AGENT_ID`, socket path) comes from injected env, so commands
 
 The daemon owns `AgentRegistry` and `SessionManager`; the TUI is its first, richest client. On startup the TUI connects to the socket, or spawns `overseer daemon` detached (`setsid`, stdio to a log file next to the socket) and retries with backoff. A `flock` lockfile (`daemon.pid`) makes a second daemon on the same socket fail fast instead of racing for the bind.
 
-**`overseer kill`: the forceful fallback for when the graceful path can't reach a daemon at all.** `overseer shutdown`/`Q` depend on a healthy daemon actually processing `Request::Shutdown` — wedged (deadlocked, `kill -STOP`'d) or already-crashed daemons don't. `overseer kill` (`src/kill.rs`) covers that gap: it reads `daemon.pid`'s `flock` state, not just its contents, to tell "alive but unresponsive" (something holds the lock) apart from "already dead" (nothing does, only stale files remain, which get removed so a fresh daemon can bind). For the former, it tries the identical `Request::Shutdown` first, bounded by a short timeout — only once that fails does it `SIGKILL` the daemon pid directly. That pid normally comes straight from `daemon.pid`'s contents, written by `DaemonLock::acquire` the instant it wins the lock (and, critically, *only* after it wins — a losing `acquire` opens the file without truncating and never writes to it, so it can't erase a winner's already-recorded pid; a real 2026-07-11 incident traced back to exactly that ordering bug, wedging a live daemon's own `overseer kill` recovery path against its own pid file). If the lockfile's pid still isn't usable for some other reason (hand-edited, or truncated by something outside Overseer entirely) while the lock is nonetheless held, `overseer kill` falls back to scanning `ps` for the one process whose argv contains `daemon --socket <this exact socket>` — a match on the full argument sequence, not a substring or bare-binary-name search, so a daemon serving a different socket never matches. Zero or multiple matches both refuse to guess. Critically, that alone doesn't reclaim everything: each agent's PTY child calls `setsid()` before exec (own session/process-group, decoupled from the daemon's), so it survives the daemon's death as an orphan rather than dying with it — the daemon pid's own `ppid` links to those children still work though, so `overseer kill` walks `ps` for the daemon's direct children and `SIGKILL`s them too. This is why "Daemon death is total" (Cleanup, below) is a guarantee about the *graceful* paths only (`shutdown`/`Q`, which drop every agent explicitly before the daemon exits) — a forceful `kill -9` of the daemon process alone does not actually take its agents with it, contrary to what that line might suggest in isolation.
+**`overseer kill`: the forceful fallback for when the graceful path can't reach a daemon at all.** `overseer shutdown`/`Q` depend on a healthy daemon actually processing `Request::Shutdown` — wedged (deadlocked, `kill -STOP`'d) or already-crashed daemons don't. `overseer kill` (`crates/overseer-core/src/kill.rs`) covers that gap: it reads `daemon.pid`'s `flock` state, not just its contents, to tell "alive but unresponsive" (something holds the lock) apart from "already dead" (nothing does, only stale files remain, which get removed so a fresh daemon can bind). For the former, it tries the identical `Request::Shutdown` first, bounded by a short timeout — only once that fails does it `SIGKILL` the daemon pid directly. That pid normally comes straight from `daemon.pid`'s contents, written by `DaemonLock::acquire` the instant it wins the lock (and, critically, *only* after it wins — a losing `acquire` opens the file without truncating and never writes to it, so it can't erase a winner's already-recorded pid; a real 2026-07-11 incident traced back to exactly that ordering bug, wedging a live daemon's own `overseer kill` recovery path against its own pid file). If the lockfile's pid still isn't usable for some other reason (hand-edited, or truncated by something outside Overseer entirely) while the lock is nonetheless held, `overseer kill` falls back to scanning `ps` for the one process whose argv contains `daemon --socket <this exact socket>` — a match on the full argument sequence, not a substring or bare-binary-name search, so a daemon serving a different socket never matches. Zero or multiple matches both refuse to guess. Critically, that alone doesn't reclaim everything: each agent's PTY child calls `setsid()` before exec (own session/process-group, decoupled from the daemon's), so it survives the daemon's death as an orphan rather than dying with it — the daemon pid's own `ppid` links to those children still work though, so `overseer kill` walks `ps` for the daemon's direct children and `SIGKILL`s them too. This is why "Daemon death is total" (Cleanup, below) is a guarantee about the *graceful* paths only (`shutdown`/`Q`, which drop every agent explicitly before the daemon exits) — a forceful `kill -9` of the daemon process alone does not actually take its agents with it, contrary to what that line might suggest in isolation.
 
 `Request::Attach` upgrades a connection: one `AttachEvent::Snapshot` (every agent, as of that instant), then a stream:
 
@@ -177,7 +189,7 @@ pub trait AgentAdapter: Send + Sync {
 
 `InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
-- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those. Also recognizes and cleans up pre-tagging-era Overseer hooks, via two independent legacy signatures: entries containing both `OVERSEER_AGENT_ID` and `Follow the overseer` (the old SessionStart printf text), or entries invoking our own binary's `status` subcommand at all (`overseer status `) — the latter catches untagged `PostToolUse`/`Stop` duplicates from before `--from-hook` classification existed, found live racing a correctly-tagged push and intermittently winning (a bare `status done` on every `Stop` could force a perfectly healthy workspace to `done`). Both are treated as ours so upgrading from an install that predates the tag converges instead of leaving orphaned duplicates behind (see `is_overseer_entry` in `src/settings.rs`).
+- `JsonMerge` — Claude-specific: merges into `~/.claude/settings.json`'s `hooks` object-of-arrays, tagging Overseer's entries with `_overseer: true` so uninstall removes exactly those. Also recognizes and cleans up pre-tagging-era Overseer hooks, via two independent legacy signatures: entries containing both `OVERSEER_AGENT_ID` and `Follow the overseer` (the old SessionStart printf text), or entries invoking our own binary's `status` subcommand at all (`overseer status `) — the latter catches untagged `PostToolUse`/`Stop` duplicates from before `--from-hook` classification existed, found live racing a correctly-tagged push and intermittently winning (a bare `status done` on every `Stop` could force a perfectly healthy workspace to `done`). Both are treated as ours so upgrading from an install that predates the tag converges instead of leaving orphaned duplicates behind (see `is_overseer_entry` in `crates/overseer-core/src/settings.rs`).
 - `JsonArrayMerge { key, entries }` — generic: merges/removes string `entries` into/from a named top-level JSON array (opencode's `instructions`); uninstall removes exactly `entries` back out.
 
 `legacy_paths()` names a previous install layout to delete outright rather than leave to rot. Nothing is ever written into the user's repo, for any adapter.
@@ -460,7 +472,7 @@ Implementation plans and research notes live in **`.specs/`**, which is **gitign
 
 - **IPC is the only shared channel.** Agent ↔ overseer communication always goes through the Unix socket — never shared in-process state from an agent context.
 - **The "no grandchildren" rule lives in the IPC server,** in the `spawn` handler. Not the TUI, not adapters. One place, always enforced.
-- **`alacritty_terminal` lives only in `session/pty.rs`.** `SessionManager`'s public method set — `launch`, `kill`, `write`, `resize_all`, `is_alive`, `scroll_display`, `scroll_to_bottom`, `display_offset`, `grid_snapshot`, `term_modes`, `generation`, `drain_exits` — is the entire terminal-backend contract; every signature uses only `GridSnapshot`/`TermModes`/std types. Swapping the backend means rewriting that one file, not chasing leaks through `ui/` and `ipc/`.
+- **`alacritty_terminal` lives only in `crates/overseer-core/src/session/pty.rs`** — the one file in the whole workspace; the `overseer` bin crate never imports it at all (both halves guarded by an `alacritty_boundary.rs` test per crate). `SessionManager`'s public method set — `launch`, `kill`, `write`, `resize_all`, `is_alive`, `scroll_display`, `scroll_to_bottom`, `display_offset`, `grid_snapshot`, `term_modes`, `generation`, `drain_exits` — is the entire terminal-backend contract; every signature uses only `GridSnapshot`/`TermModes`/std types. Swapping the backend means rewriting that one file, not chasing leaks through `ui/` and `ipc/`.
 - **Parse functions are pure.** E.g. `parse_session_line` takes a `&str`, returns a value — no process spawning, no I/O. Trivially testable.
 - **`AgentNode` is a data model, not a handle.** No PTY ownership. Session handles live in `SessionManager`, keyed by `AgentId`. Overseer holds no worktree state — that's the agent's.
 - **Status is push, not pull.** Agent hooks POST status changes; the daemon POSTs registry/output events to attach clients the same way. Overseer never infers status from PTY output; the TUI never polls for tree state. Each push is its own independent connection with no ordering guarantee against any other (`ipc::server` spawns a task per connection) — `Request::Status`'s `pushed_at` timestamp and `AgentRegistry::set_status`'s staleness guard are what keep a late-arriving-but-earlier-fired push from clobbering a fresher one.
@@ -477,6 +489,6 @@ Implementation plans and research notes live in **`.specs/`**, which is **gitign
 - **Don't write into the user's repo.** All agent config is installed at the user level by `overseer install`. Launch injects env only.
 - **Don't skip the confirm prompt for `d`/`D`/`Q`.** Killing a session (or the whole daemon) interrupts in-flight work.
 - **Don't make quitting kill agents.** `q`/`Ctrl-C` is a detach, never touches a session or the daemon. `d`/`D` kills one agent, `Q` kills everything plus the daemon; both confirm.
-- **Don't add a second way to *gracefully* end the daemon process.** `Request::Shutdown` asks the accept loop to stop and lets `main` return — no `std::process::exit`. A response still in flight when the process exits is a real bug (once caused by `tokio::sync::Notify::notify_waiters` losing a wake under this exact race — use `notify_one`, which stores a permit, for any future stop-signal here). `overseer kill` (`src/kill.rs`) doesn't violate this: it always tries this exact same `Request::Shutdown` path first, and only reaches for `SIGKILL` once that request has been given a real chance and failed to get a response — it's a forceful fallback for an unresponsive daemon, not a second graceful exit path racing this one.
+- **Don't add a second way to *gracefully* end the daemon process.** `Request::Shutdown` asks the accept loop to stop and lets `main` return — no `std::process::exit`. A response still in flight when the process exits is a real bug (once caused by `tokio::sync::Notify::notify_waiters` losing a wake under this exact race — use `notify_one`, which stores a permit, for any future stop-signal here). `overseer kill` (`crates/overseer-core/src/kill.rs`) doesn't violate this: it always tries this exact same `Request::Shutdown` path first, and only reaches for `SIGKILL` once that request has been given a real chance and failed to get a response — it's a forceful fallback for an unresponsive daemon, not a second graceful exit path racing this one.
 - **Don't add a `Request::Drop`-with-a-flag for workspace drops.** Workspace-allowed drop is `Request::TuiDrop`, a distinct wire request only the TUI's key handling constructs — a caller-supplied bool would let any script opt out of the restriction it exists to enforce.
 - **Don't assume `alacritty_terminal` exposes raw PTY bytes.** It doesn't, not without reimplementing its mio/signalfd event loop — that's why the attach protocol streams rendered `GridSnapshot`s instead. Re-verify against the installed version before retrying; a future public tap would be a contained change to `session::pty` + `ipc::protocol`, not a redesign.

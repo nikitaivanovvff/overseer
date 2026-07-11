@@ -144,7 +144,7 @@ pub struct SessionManager {
     /// what would have been typed into the PTY (e.g.
     /// `spawn_root_with_adapter`'s auto-typed harness command line) without
     /// spawning a real process. Keyed by agent id, bytes appended in write order.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     dry_run_writes: Mutex<HashMap<AgentId, Vec<u8>>>,
 }
 
@@ -155,7 +155,7 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
@@ -168,40 +168,40 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_dry_run(&self) -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_dry_run(&self) -> bool {
         matches!(self.mode, Mode::DryRun { .. })
     }
 
     /// A dry-run manager whose `launch()` always fails — for testing rollback
     /// behavior on launch failure without a real, misconfigured PTY spawn.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn dry_run_failing_launch() -> Self {
         Self {
             mode: Mode::DryRun { fail_launch: true, live: None },
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
     /// A dry-run manager that reports only `live` as alive — for testing code
     /// that must distinguish which of several agents' sessions are still up.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn dry_run_with_live_sessions(live: HashSet<AgentId>) -> Self {
         Self {
             mode: Mode::DryRun { fail_launch: false, live: Some(live) },
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
@@ -339,7 +339,7 @@ impl SessionManager {
     /// keystrokes (Task 3) as well as this module's own query-reply writes
     /// (e.g. `spawn_root_with_adapter` auto-typing the harness command).
     pub fn write(&self, id: &AgentId, bytes: Vec<u8>) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if matches!(self.mode, Mode::DryRun { .. }) {
             self.dry_run_writes
                 .lock()
@@ -357,8 +357,8 @@ impl SessionManager {
     /// Test-only accessor for `dry_run_writes` — every byte `write()` has
     /// recorded for `id` so far, concatenated in write order. Empty for an id
     /// with no recorded writes (including outside dry-run mode).
-    #[cfg(test)]
-    pub(crate) fn dry_run_written_bytes(&self, id: &AgentId) -> Vec<u8> {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn dry_run_written_bytes(&self, id: &AgentId) -> Vec<u8> {
         self.dry_run_writes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -460,7 +460,7 @@ impl SessionManager {
 
     /// Test-only: pretend `id`'s PTY child exited with the given exit status,
     /// for exercising `drain_exits()` consumers without spawning a real process.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn simulate_exit(&self, id: AgentId, success: bool) {
         self.exits.lock().unwrap_or_else(|e| e.into_inner()).push((id, success));
     }
@@ -561,8 +561,8 @@ fn dto_color(color: AnsiColor) -> ColorDto {
 /// of their own. Feeds `bytes` through a throwaway `Term`, applies a scroll
 /// (`Scroll::Delta(scroll_delta)`, then `Scroll::Bottom` if `then_bottom`),
 /// and returns the resulting snapshot.
-#[cfg(test)]
-pub(crate) fn snapshot_from_bytes_scrolled(
+#[cfg(any(test, feature = "test-util"))]
+pub fn snapshot_from_bytes_scrolled(
     cols: usize,
     lines: usize,
     bytes: &[u8],
@@ -587,8 +587,8 @@ pub(crate) fn snapshot_from_bytes_scrolled(
 
 /// Test-support only: `snapshot_from_bytes_scrolled` with no scrolling — the
 /// live/unscrolled snapshot.
-#[cfg(test)]
-pub(crate) fn snapshot_from_bytes(cols: usize, lines: usize, bytes: &[u8]) -> GridSnapshot {
+#[cfg(any(test, feature = "test-util"))]
+pub fn snapshot_from_bytes(cols: usize, lines: usize, bytes: &[u8]) -> GridSnapshot {
     snapshot_from_bytes_scrolled(cols, lines, bytes, 0, false)
 }
 

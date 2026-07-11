@@ -613,19 +613,33 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "overseer"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "anyhow",
  "clap",
  "crossterm",
  "dirs",
  "libc",
+ "overseer-core",
  "ratatui",
+ "serde_json",
+ "tokio",
+ "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
+name = "overseer-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "crossterm",
+ "dirs",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "toml",
- "unicode-segmentation",
  "uuid",
 ]
 
