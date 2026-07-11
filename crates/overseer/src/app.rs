@@ -284,7 +284,13 @@ impl App {
     /// this for the currently selected/watched agent.
     pub fn scroll(&mut self, id: &AgentId, delta: i32) {
         match &mut self.backend {
-            Backend::Mock(ctx) => ctx.0.sessions.scroll_display(id, delta),
+            Backend::Mock(ctx) => {
+                // The "did it move" return only matters to the daemon's own
+                // scroll handler (it decides whether a fresh grid needs
+                // pushing) — mock mode re-reads the grid directly each
+                // frame, so there's nothing to skip.
+                ctx.0.sessions.scroll_display(id, delta);
+            }
             Backend::Daemon(state) => state.send(&Request::Scroll { delta }),
         }
     }
@@ -293,7 +299,9 @@ impl App {
     /// split as `scroll`.
     pub fn scroll_to_bottom(&mut self, id: &AgentId) {
         match &mut self.backend {
-            Backend::Mock(ctx) => ctx.0.sessions.scroll_to_bottom(id),
+            Backend::Mock(ctx) => {
+                ctx.0.sessions.scroll_to_bottom(id);
+            }
             Backend::Daemon(state) => state.send(&Request::ScrollToBottom),
         }
     }

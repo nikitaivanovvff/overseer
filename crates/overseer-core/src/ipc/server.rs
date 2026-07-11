@@ -116,10 +116,26 @@ const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// this state per-connection, instead of a single flag consumed off the
 /// session itself, is what fixes F3: two connections watching the same agent
 /// each track their own progress instead of racing to steal one shared flag.
+///
+/// `scroll_dirty` marks that a `Scroll`/`ScrollToBottom` moved the watched
+/// agent's display offset since the last send — scrolling never touches the
+/// PTY, so it never bumps the generation counter; this flag is how the
+/// output poller learns a resend is needed. It's set by the request loop and
+/// *consumed* by the poller, which is safe (unlike the pre-F3 shared dirty
+/// bool) because both live on the same connection: scrolls only ever arrive
+/// from this connection's own client, so there's no second consumer to
+/// starve. Deferring the resend to the poll tick (≤16ms) instead of replying
+/// inline is what coalesces a trackpad flick's dozens of notches into at
+/// most one full grid per tick — each inline reply used to cost a ~1MB
+/// serialize+write *per notch*, head-of-line blocking every keystroke
+/// (`Write`) queued behind it on this same request loop, and a fast flick
+/// could keep the connection saturated for seconds after the gesture ended
+/// (a real, reported freeze).
 #[derive(Clone)]
 struct WatchState {
     agent_id: Option<crate::agent::AgentId>,
     last_sent_gen: u64,
+    scroll_dirty: bool,
 }
 
 pub async fn run(
@@ -338,7 +354,7 @@ async fn handle_attach(
 
     let mut registry_rx = ctx.registry.subscribe();
     let watch: Arc<std::sync::Mutex<WatchState>> =
-        Arc::new(std::sync::Mutex::new(WatchState { agent_id: None, last_sent_gen: 0 }));
+        Arc::new(std::sync::Mutex::new(WatchState { agent_id: None, last_sent_gen: 0, scroll_dirty: false }));
 
     // Forwards registry mutations (register/status/remove) as they happen —
     // no polling, per AGENTS.md's "status is push, not pull", now extended
@@ -393,13 +409,21 @@ async fn handle_attach(
             let mut interval = tokio::time::interval(OUTPUT_POLL_INTERVAL);
             loop {
                 interval.tick().await;
-                let (agent_id, last_sent_gen) = {
-                    let w = watch.lock().unwrap_or_else(|e| e.into_inner());
-                    (w.agent_id.clone(), w.last_sent_gen)
+                // `scroll_dirty` is consumed *here*, before the build, not
+                // cleared after the send — a scroll landing mid-build just
+                // re-marks it and costs one extra resend next tick, whereas
+                // clearing afterwards could erase a scroll the in-flight
+                // snapshot was built too early to include (same
+                // read-before-build reasoning as the `Watch` handler's
+                // generation read below).
+                let (agent_id, last_sent_gen, scroll_dirty) = {
+                    let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                    let dirty = std::mem::take(&mut w.scroll_dirty);
+                    (w.agent_id.clone(), w.last_sent_gen, dirty)
                 };
                 let Some(agent_id) = agent_id else { continue };
                 let Some(gen) = sessions.generation(&agent_id) else { continue };
-                if gen == last_sent_gen {
+                if gen == last_sent_gen && !scroll_dirty {
                     continue;
                 }
                 let Some(bytes) = build_output_event_bytes(sessions.clone(), agent_id.clone()).await else { continue };
@@ -446,11 +470,12 @@ async fn handle_attach(
                         // — leave last_sent_gen at 0 so the poller doesn't
                         // skip a real first send once the session appears.
                         last_sent_gen: if sent { gen } else { 0 },
+                        scroll_dirty: false,
                     };
                 }
                 Ok(Request::Unwatch) => {
                     *watch.lock().unwrap_or_else(|e| e.into_inner()) =
-                        WatchState { agent_id: None, last_sent_gen: 0 };
+                        WatchState { agent_id: None, last_sent_gen: 0, scroll_dirty: false };
                 }
                 Ok(Request::Write { agent_id, data }) => {
                     // Oversized writes are silently dropped rather than
@@ -477,26 +502,43 @@ async fn handle_attach(
                     .await;
                 }
                 Ok(Request::Scroll { delta }) => {
+                    // Scrolling doesn't touch the PTY, so it never bumps the
+                    // generation the output poll relies on — mark this
+                    // connection's own scroll_dirty flag and let the poller
+                    // push the fresh grid on its next tick (≤16ms away)
+                    // instead of building + writing a full ~1MB snapshot
+                    // inline per request. The inline reply was a real,
+                    // reported freeze: a trackpad flick delivers dozens of
+                    // notches, each of which stalled this request loop for
+                    // the whole serialize+write, queueing keystrokes
+                    // (`Write`) behind megabytes of identical grids and
+                    // blocking the TUI's own (synchronous) request writes
+                    // once the socket buffers filled. Deferring to the
+                    // poller coalesces however many scrolls land within a
+                    // tick into one send. Skipped entirely when the offset
+                    // didn't move (already clamped at the top/bottom).
                     let current = watch.lock().unwrap_or_else(|e| e.into_inner()).agent_id.clone();
                     if let Some(agent_id) = current {
-                        ctx.sessions.scroll_display(&agent_id, delta);
-                        // Scrolling doesn't touch the PTY, so it never bumps
-                        // the generation the output poll relies on — push
-                        // the new grid immediately instead, same as `Watch`.
-                        if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
-                            if !write_output_bytes(&write_half, bytes).await {
-                                break;
+                        if ctx.sessions.scroll_display(&agent_id, delta) {
+                            let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                            // Only mark if still watching the same agent — a
+                            // concurrent `Watch` switch means this scroll
+                            // applied to the *old* agent's term, and the new
+                            // agent's immediate snapshot is already correct.
+                            if w.agent_id.as_ref() == Some(&agent_id) {
+                                w.scroll_dirty = true;
                             }
                         }
                     }
                 }
                 Ok(Request::ScrollToBottom) => {
+                    // Same deferred-to-the-poller shape as `Scroll` above.
                     let current = watch.lock().unwrap_or_else(|e| e.into_inner()).agent_id.clone();
                     if let Some(agent_id) = current {
-                        ctx.sessions.scroll_to_bottom(&agent_id);
-                        if let Some(bytes) = build_output_event_bytes(ctx.sessions.clone(), agent_id).await {
-                            if !write_output_bytes(&write_half, bytes).await {
-                                break;
+                        if ctx.sessions.scroll_to_bottom(&agent_id) {
+                            let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                            if w.agent_id.as_ref() == Some(&agent_id) {
+                                w.scroll_dirty = true;
                             }
                         }
                     }
