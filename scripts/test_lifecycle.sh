@@ -140,7 +140,7 @@ attach_tui() {
         -e "PATH=$PATH" -e "MARKER_DIR=$MARKER_DIR" \
         -- sh -c "SHELL='$STUBDIR/claude' exec '$OVERSEER' --socket '$SOCK'"
     for _ in $(seq 1 50); do
-        tmux capture-pane -t "$HARNESS" -p 2>/dev/null | grep -q "AGENTS" && return 0
+        tmux capture-pane -t "$HARNESS" -p 2>/dev/null | grep -q "WORKSPACES" && return 0
         sleep 0.1
     done
     echo "TUI never rendered its first frame" >&2
