@@ -67,52 +67,11 @@ name, CLI surface, and behavior are exactly what the pre-workspace single
 crate shipped; core is an internal path dependency, never published on its
 own.
 
-```
-crates/overseer-core (lib)
-├── session/          PTY + terminal-emulator management, keyed by AgentId
-│   ├── pty           SessionManager: owns one PTY + terminal emulator per agent — the only file
-│   │                 in the workspace that imports alacritty_terminal. Renders GridSnapshot DTOs and
-│   │                 tracks a per-agent content-generation counter (bumped on new PTY output)
-│   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder, parameterized by the neutral
-│                     TermModes struct (input path for a focused pane); the one crossterm import in
-│                     core — kept here rather than splitting the encoder from its input type
-├── agent/            Agent model and lifecycle
-│   ├── model         AgentNode, AgentStatus, AgentRole, AgentTree
-│   ├── registry      AgentRegistry: in-memory tree of registered agents + a broadcast channel
-│   │                 of RegistryEvent (Registered/Removed/StatusChanged/Shutdown) for attach clients
-│   ├── hook          Pure Claude Code hook-payload parsing: blocked-vs-idle-nag
-│   │                 classification, context % from transcript JSONL
-│   ├── adapters/     Pluggable per-agent-type behaviour
-│   │   ├── mod       AgentAdapter trait (install_files, spawn_command, env_inject)
-│   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
-│   │   ├── opencode  opencode adapter (auto-loaded plugin.js + instructions array, --prompt launch)
-│   │   └── pi        pi adapter (--extension-loaded hook + --append-system-prompt, no blocked support)
-│   ├── spawn         Orchestrates session launch + env injection + register
-│   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it
-├── git/              Read-only git info via CLI (repo name, current branch) — no worktrees
-├── daemon            Daemon process bootstrap: socket path resolution, flock lockfile,
-│                     detached auto-spawn (setsid) with retry/backoff for the TUI to attach to
-├── ipc/              Unix socket server (tokio, newline-delimited JSON)
-│   ├── server        Binds the socket; one-shot request/response *and* the attach event-stream
-│   │                 loop (Watch/Unwatch/Write/Resize inward, AttachEvent outward); session-exit watcher
-│   ├── handlers      dispatch: status, list, agent, start, spawn, drop, tui_drop, shutdown
-│   ├── protocol      Request / Response / AgentDto / AttachEvent / GridSnapshot wire types (serde)
-│   └── client        One-shot sync client used by CLI subcommands and daemon reachability probes
-└── config/           TOML config (~/.config/overseer/config.toml): Config{defaults, adapters,
-                      notify, keybindings, theme}. Missing/invalid file falls back to a built-in
-                      default; per-field a bad value falls back to that field's own default too
-                      (a stderr warning, never a hard error). Parsing lives in core even for the
-                      TUI-only sections (keybindings/theme) so a second frontend never needs a
-                      second loader; Theme carries the wire-neutral ColorDto, not a ratatui color.
-
-crates/overseer (bin — the `overseer` binary)
-├── ui/               Ratatui-based terminal UI
-│   ├── mod           Tree|pane split (~25/75): agent tree, detail, status bar, spawn modal
-│   └── term_pane     Paints the selected agent's pane from a GridSnapshot — the only render
-│                     currency, in both --mock and daemon-attached modes
-└── app               App: Backend enum (Mock | Daemon) unifying tree access, session I/O, and
-                      dispatch behind one API so tui.rs/ui/ don't branch on which backend is live
-```
+Module-level maps live next to the code they describe — start at
+[ARCHITECTURE.md](ARCHITECTURE.md) (process model, workspace layout, the
+"what changes where" guide) and drill into
+[crates/overseer-core/ARCHITECTURE.md](crates/overseer-core/ARCHITECTURE.md)
+or [crates/overseer/ARCHITECTURE.md](crates/overseer/ARCHITECTURE.md).
 
 ---
 

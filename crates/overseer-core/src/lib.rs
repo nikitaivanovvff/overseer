@@ -1,7 +1,7 @@
 //! `overseer-core` — the client-agnostic core of Overseer: agent model +
 //! registry, session/PTY management, the IPC protocol + server, the daemon
 //! process, git info, and config parsing. No UI toolkit lives here — see
-//! AGENTS.md's "Architecture" section for the full module breakdown and the
+//! this crate's ARCHITECTURE.md for the full module breakdown and the
 //! `overseer` binary crate for the TUI that consumes this library.
 
 pub mod agent;
