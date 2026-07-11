@@ -6,8 +6,8 @@
 //! One daemon per user at a stable path — every repo's agents live under the
 //! same daemon, same as a single tmux server backs every session.
 
-use std::fs::{self, File};
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write as _};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -149,18 +149,41 @@ pub(crate) fn lock_is_held(socket: &Path) -> bool {
 struct DaemonLock(#[allow(dead_code)] File);
 
 impl DaemonLock {
+    /// BUG A (real 2026-07-11 incident): the previous implementation opened
+    /// this lockfile with `File::create`, which truncates on open -- *before*
+    /// the `flock` attempt even ran. Every *losing* daemon (one that loses
+    /// the race for the lock) therefore erased the winner's already-recorded
+    /// pid the instant it tried, live-observed as a 0-byte `daemon.pid` next
+    /// to a daemon that was still alive and holding the lock. That pid is
+    /// exactly what `overseer kill`'s `SIGKILL` escalation needs when the
+    /// graceful path can't reach the daemon at all -- so a losing daemon was
+    /// silently sabotaging the live daemon's only forceful recovery path.
+    ///
+    /// Fixed by opening without truncating (`create(true)`, no `O_TRUNC`),
+    /// attempting the `flock` first, and only truncating + rewriting *after*
+    /// the lock is actually held. A losing daemon now never touches the
+    /// file's bytes at all -- open, fail to lock, fail to acquire, done.
     fn acquire(socket: &Path) -> Result<Self> {
         let path = lockfile_path(socket);
-        let file = File::create(&path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false) // BUG A: must not clobber a winner's pid before we even hold the lock
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
         let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         anyhow::ensure!(
             ret == 0,
             "another overseer daemon already holds the lock at {}",
             path.display()
         );
-        let mut pid_file = &file;
-        let _ = write!(pid_file, "{}", std::process::id());
+        // Only reachable once we actually hold the lock -- safe to clobber
+        // the file's contents now, since nobody else could still be relying
+        // on what was there (a prior holder would have this same fd's lock).
+        file.set_len(0).with_context(|| format!("failed to truncate {}", path.display()))?;
+        file.seek(SeekFrom::Start(0)).with_context(|| format!("failed to seek {}", path.display()))?;
+        let _ = write!(file, "{}", std::process::id());
         Ok(Self(file))
     }
 }
@@ -205,15 +228,44 @@ pub fn ensure_daemon_running(socket: &Path) -> Result<()> {
 
     spawn_detached(socket)?;
 
+    if wait_until_reachable(socket) {
+        return Ok(());
+    }
+    Err(unreachable_in_time_error(socket))
+}
+
+/// Polls `socket` with backoff until a connection succeeds or the attempt
+/// budget runs out. Split out from `ensure_daemon_running` so the give-up
+/// error (`unreachable_in_time_error`, below) is its own seam, testable
+/// without waiting out the real retry loop.
+fn wait_until_reachable(socket: &Path) -> bool {
     let mut delay = Duration::from_millis(50);
     for _ in 0..20 {
         std::thread::sleep(delay);
         if client::connect(socket).is_ok() {
-            return Ok(());
+            return true;
         }
         delay = (delay * 2).min(Duration::from_millis(500));
     }
-    anyhow::bail!("daemon at {} did not become reachable in time", socket.display())
+    false
+}
+
+/// FIX C: the plain "did not become reachable in time" message leaves a real
+/// incident (BUG A: a daemon alive, holding the lock, but unreachable
+/// because its socket got unlinked out from under it) looking identical to
+/// "nothing is there at all" -- no hint that `overseer kill` is the way out.
+/// `lock_is_held` is the same live probe `overseer kill` itself uses to tell
+/// "wedged but alive" apart from "already dead", so reusing it here costs
+/// nothing extra and can only ever add information, never mislead: if the
+/// lock isn't held, the plain message is already the whole truth.
+fn unreachable_in_time_error(socket: &Path) -> anyhow::Error {
+    let mut msg = format!("daemon at {} did not become reachable in time", socket.display());
+    if lock_is_held(socket) {
+        msg.push_str(
+            " -- a daemon holds the lock but isn't answering; try `overseer kill` to force-recover it",
+        );
+    }
+    anyhow::anyhow!(msg)
 }
 
 /// Spawns `overseer daemon --socket <socket>` detached from this process's
@@ -303,6 +355,47 @@ mod tests {
         drop(first);
         let third = DaemonLock::acquire(&socket);
         assert!(third.is_ok(), "lock must be released when the holder drops");
+
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    /// Creates the socket's parent dir and writes `pid` into its lockfile,
+    /// under a real `flock` held by the returned `File` — simulating "a
+    /// daemon with this pid is alive and holds the lock" without needing a
+    /// real `overseer daemon` process. Mirrors `kill.rs`'s test helper of the
+    /// same name/shape (private to each module's own test suite, so
+    /// duplicated rather than shared).
+    fn simulate_daemon_holding_lock(socket: &Path, pid: i32) -> File {
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let path = lockfile_path(socket);
+        let file = File::create(&path).unwrap();
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(ret, 0, "test setup must be able to acquire its own fresh lockfile");
+        let mut writer = &file;
+        write!(writer, "{pid}").unwrap();
+        file
+    }
+
+    /// BUG A regression: a losing `DaemonLock::acquire` bid must fail without
+    /// ever touching the winner's lockfile bytes. The previous implementation
+    /// opened via `File::create` (truncating on open, before the `flock` even
+    /// ran), so every losing daemon erased the live daemon's recorded pid —
+    /// exactly the pid `overseer kill`'s `SIGKILL` escalation depends on.
+    #[test]
+    fn acquire_never_truncates_the_lockfile_of_a_daemon_that_beat_it_to_the_lock() {
+        let socket = unique_test_socket("notrunc");
+        let winner_pid = 424_242; // arbitrary, distinct from this test process's own pid
+        let _held = simulate_daemon_holding_lock(&socket, winner_pid);
+
+        let losing_attempt = DaemonLock::acquire(&socket);
+        assert!(losing_attempt.is_err(), "a losing acquire must fail");
+
+        let contents = fs::read_to_string(lockfile_path(&socket)).unwrap();
+        assert_eq!(
+            contents,
+            winner_pid.to_string(),
+            "a losing daemon must leave the winner's recorded pid byte-identical"
+        );
 
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
@@ -435,5 +528,31 @@ mod tests {
 
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    // ── FIX C: unreachable_in_time_error's lock-held breadcrumb ──────────────
+
+    #[test]
+    fn unreachable_in_time_error_adds_a_kill_breadcrumb_when_the_lock_is_held() {
+        let socket = unique_test_socket("breadcrumb-held");
+        let _held = simulate_daemon_holding_lock(&socket, std::process::id() as i32);
+
+        let err = unreachable_in_time_error(&socket).to_string();
+        assert!(err.contains("did not become reachable in time"), "{err}");
+        assert!(err.contains("overseer kill"), "expected a `overseer kill` breadcrumb, got: {err}");
+
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    #[test]
+    fn unreachable_in_time_error_has_no_breadcrumb_when_nothing_holds_the_lock() {
+        // Nothing acquired the lock at all here (no lockfile even exists) --
+        // the plain message is already the whole truth, no daemon to point
+        // `overseer kill` at.
+        let socket = unique_test_socket("breadcrumb-noheld");
+
+        let err = unreachable_in_time_error(&socket).to_string();
+        assert!(err.contains("did not become reachable in time"), "{err}");
+        assert!(!err.contains("overseer kill"), "no daemon holds the lock -- must not suggest `overseer kill`: {err}");
     }
 }

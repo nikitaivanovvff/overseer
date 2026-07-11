@@ -90,11 +90,35 @@ fn run_with_timeouts(
     // actually pinned to, so it's still the right target even though we
     // can't re-derive it now (a daemon that's genuinely wedged won't answer
     // a fresh IPC request asking it to identify itself either).
-    let Some(daemon_pid) = prior_pid else {
-        anyhow::bail!(
-            "daemon at {} is unresponsive but its lockfile has no readable pid -- refusing to force-kill blindly",
-            socket.display()
-        );
+    //
+    // BUG B: before FIX A, a losing daemon's `File::create` truncated this
+    // exact lockfile out from under the live daemon, so `prior_pid` could be
+    // `None` even though a daemon is demonstrably alive (we're in this branch
+    // *because* the lock is held). FIX A stops that from happening going
+    // forward, but a lockfile can still be unreadable for other reasons (hand
+    // edited, truncated by something outside Overseer entirely -- the
+    // 2026-07-11 incident's original deleter was never identified, see
+    // AGENTS.md/NON-GOALS), so this fallback stays regardless: scan the
+    // process table for the one process whose argv proves it's *this*
+    // socket's daemon, rather than bailing out with a pid the lockfile no
+    // longer has.
+    let daemon_pid = match prior_pid {
+        Some(pid) => pid,
+        None => match discover_daemon_pid(socket) {
+            DaemonScan::Found(pid) => pid,
+            DaemonScan::NotFound => anyhow::bail!(
+                "daemon at {} is unresponsive, its lockfile has no readable pid, and no process was \
+                 found running `daemon --socket {}` -- refusing to force-kill blindly",
+                socket.display(),
+                socket.display()
+            ),
+            DaemonScan::Ambiguous(pids) => anyhow::bail!(
+                "daemon at {} is unresponsive, its lockfile has no readable pid, and multiple processes \
+                 matched `daemon --socket {}` ({pids:?}) -- refusing to guess which one to kill",
+                socket.display(),
+                socket.display()
+            ),
+        },
     };
 
     let children = direct_children(daemon_pid);
@@ -213,6 +237,74 @@ fn direct_children(parent_pid: i32) -> Vec<i32> {
             (ppid == parent_pid).then_some(pid)
         })
         .collect()
+}
+
+/// The result of scanning the process table for `socket`'s own daemon
+/// process (FIX B's fallback for when the lockfile's recorded pid isn't
+/// usable). Zero or multiple matches are both refusals to act, not errors on
+/// their own -- `run_with_timeouts` is what turns them into a bailout, this
+/// type just reports what was found.
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonScan {
+    Found(i32),
+    NotFound,
+    Ambiguous(Vec<i32>),
+}
+
+/// Runs the same `ps` discovery `direct_children` uses (`/bin/ps` by
+/// absolute path, not `$PATH`-resolved -- SECURITY-AUDIT.md F6) to find
+/// `socket`'s own daemon process, and hands the raw output to the pure
+/// parser (`find_daemon_pid_in_ps_output`) below. `-ww` disables BSD `ps`'s
+/// terminal-width truncation of the command column -- without it a long
+/// socket path could get cut off mid-string and silently stop matching.
+fn discover_daemon_pid(socket: &Path) -> DaemonScan {
+    let Ok(output) =
+        std::process::Command::new("/bin/ps").args(["-axwwo", "pid=,command="]).output()
+    else {
+        return DaemonScan::NotFound;
+    };
+    if !output.status.success() {
+        return DaemonScan::NotFound;
+    }
+    find_daemon_pid_in_ps_output(&String::from_utf8_lossy(&output.stdout), socket)
+}
+
+/// Pure parser (no process spawning, no I/O) for `ps -axwwo pid=,command=`
+/// output (one process per line: pid, then its full command line, no
+/// header since each column name ends in `=`): finds the process whose argv
+/// contains the exact contiguous sequence `daemon --socket <socket>`.
+///
+/// Matching the full three-token sequence -- not a bare substring search,
+/// and not just the binary name -- matters for two reasons: a daemon serving
+/// a *different* socket must never match just because it also happens to be
+/// an `overseer` process (binary-name-only matching would find every
+/// `overseer` process on the machine, TUIs included), and a socket path that
+/// happens to be a prefix/suffix of another socket's path must not
+/// cross-match on a plain substring search of the whole command line.
+/// Requiring `daemon`, `--socket`, and the exact path as three consecutive
+/// tokens rules out both.
+fn find_daemon_pid_in_ps_output(ps_output: &str, socket: &Path) -> DaemonScan {
+    let socket_str = socket.to_string_lossy();
+    let mut matches = Vec::new();
+
+    for line in ps_output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid_str) = fields.next() else { continue };
+        let Ok(pid) = pid_str.parse::<i32>() else { continue };
+        let tokens: Vec<&str> = fields.collect();
+        let is_match = tokens
+            .windows(3)
+            .any(|w| w[0] == "daemon" && w[1] == "--socket" && w[2] == socket_str);
+        if is_match {
+            matches.push(pid);
+        }
+    }
+
+    match matches.len() {
+        1 => DaemonScan::Found(matches[0]),
+        0 => DaemonScan::NotFound,
+        _ => DaemonScan::Ambiguous(matches),
+    }
 }
 
 /// CLI entry point: runs the forceful-cleanup flow against `socket` and
@@ -424,7 +516,18 @@ mod tests {
     fn forced_kill_errors_out_rather_than_guessing_a_pid_it_never_had() {
         // An empty/unparseable lockfile content while the lock is
         // nonetheless held is a degenerate state this must refuse to act
-        // blindly on, rather than signaling some fallback pid.
+        // blindly on. BUG B: this is the exact pre-fix repro -- prior to the
+        // FIX B ps-scan fallback, an unreadable lockfile pid here meant an
+        // unconditional bail, full stop, with no way to recover the pid at
+        // all (this was the state the 2026-07-11 incident got stuck in:
+        // BUG A had truncated the live daemon's `daemon.pid`, so `overseer
+        // kill` bailed here forever, wedged until a manual `kill -9` + file
+        // cleanup). Confirmed live before writing FIX B: `run_with_timeouts`
+        // hit exactly this branch and returned `Err` with no attempt at
+        // recovery. It must *still* error here today -- this socket has no
+        // real `daemon --socket <path>` process behind it for the ps scan to
+        // find, so `DaemonScan::NotFound` is the fallback's correct answer,
+        // not a regression back to the old unconditional bail.
         let socket = unique_socket("nopid");
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let path = daemon::lockfile_path(&socket);
@@ -440,10 +543,61 @@ mod tests {
             Duration::from_millis(200),
             Duration::from_millis(20),
         );
-        assert!(result.is_err(), "must refuse to force-kill without a known pid");
+        assert!(result.is_err(), "must refuse to force-kill without a known pid and no ps match");
 
         drop(file);
         cleanup(&socket);
+    }
+
+    // ── FIX B: find_daemon_pid_in_ps_output (pure ps-parsing fallback) ───────
+
+    #[test]
+    fn find_daemon_pid_in_ps_output_one_match() {
+        let socket = PathBuf::from("/tmp/ovsr-x/d.sock");
+        let ps_output = "  1234 /usr/local/bin/overseer daemon --socket /tmp/ovsr-x/d.sock\n\
+                          55 /sbin/launchd\n";
+        assert_eq!(find_daemon_pid_in_ps_output(ps_output, &socket), DaemonScan::Found(1234));
+    }
+
+    #[test]
+    fn find_daemon_pid_in_ps_output_zero_matches() {
+        let socket = PathBuf::from("/tmp/ovsr-x/d.sock");
+        let ps_output = "  55 /sbin/launchd\n  99 -zsh\n";
+        assert_eq!(find_daemon_pid_in_ps_output(ps_output, &socket), DaemonScan::NotFound);
+    }
+
+    #[test]
+    fn find_daemon_pid_in_ps_output_multiple_matches_is_ambiguous() {
+        let socket = PathBuf::from("/tmp/ovsr-x/d.sock");
+        let ps_output = "  1234 /usr/local/bin/overseer daemon --socket /tmp/ovsr-x/d.sock\n\
+                          5678 /Users/me/target/debug/overseer daemon --socket /tmp/ovsr-x/d.sock\n";
+        assert_eq!(
+            find_daemon_pid_in_ps_output(ps_output, &socket),
+            DaemonScan::Ambiguous(vec![1234, 5678])
+        );
+    }
+
+    #[test]
+    fn find_daemon_pid_in_ps_output_excludes_a_daemon_on_a_different_socket() {
+        // A process serving a *different* socket -- including one whose path
+        // is a prefix of the one we're looking for -- must never match: only
+        // the exact three-token sequence with the exact socket path counts.
+        let socket = PathBuf::from("/tmp/ovsr-x/d.sock");
+        let ps_output = "  1234 /usr/local/bin/overseer daemon --socket /tmp/ovsr-x/d.sock.bak\n\
+                          5678 /usr/local/bin/overseer daemon --socket /tmp/ovsr-y/d.sock\n\
+                          9012 /usr/local/bin/overseer daemon --socket /tmp/ovsr-x/d.sock\n";
+        assert_eq!(find_daemon_pid_in_ps_output(ps_output, &socket), DaemonScan::Found(9012));
+    }
+
+    #[test]
+    fn find_daemon_pid_in_ps_output_ignores_a_bare_binary_name_match() {
+        // An `overseer` process that isn't a daemon at all (e.g. the TUI, or
+        // an `overseer status` one-shot) must never match on binary name
+        // alone -- only the full `daemon --socket <path>` argv sequence
+        // counts.
+        let socket = PathBuf::from("/tmp/ovsr-x/d.sock");
+        let ps_output = "  1234 /usr/local/bin/overseer\n  5678 /usr/local/bin/overseer status idle\n";
+        assert_eq!(find_daemon_pid_in_ps_output(ps_output, &socket), DaemonScan::NotFound);
     }
 
     // ── direct_children / pid_is_alive ─────────────────────────────────────────
