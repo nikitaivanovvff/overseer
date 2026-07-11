@@ -12,10 +12,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use std::collections::HashSet;
 
-use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
+use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
 use crate::app::{InputState, PendingAction, PickerOption, PickerState};
-use crate::config::{Action, Keybindings, Theme};
-use crate::ipc::protocol::GridSnapshot;
+use overseer_core::config::{Action, Keybindings, Theme};
+use overseer_core::ipc::protocol::GridSnapshot;
 
 pub use term_pane::render_term_pane;
 
@@ -40,12 +40,14 @@ pub(crate) fn status_badge(status: &AgentStatus) -> &'static str {
 /// colors only.
 pub(crate) fn status_style(status: &AgentStatus, theme: &Theme) -> Style {
     match status {
-        AgentStatus::Spawning => Style::default().fg(theme.spawning),
-        AgentStatus::Running => Style::default().fg(theme.running),
-        AgentStatus::Blocked => Style::default().fg(theme.blocked).add_modifier(Modifier::BOLD),
-        AgentStatus::Idle => Style::default().fg(theme.idle),
-        AgentStatus::Done => Style::default().fg(theme.done),
-        AgentStatus::Error => Style::default().fg(theme.error),
+        AgentStatus::Spawning => Style::default().fg(term_pane::map_dto_color(theme.spawning)),
+        AgentStatus::Running => Style::default().fg(term_pane::map_dto_color(theme.running)),
+        AgentStatus::Blocked => {
+            Style::default().fg(term_pane::map_dto_color(theme.blocked)).add_modifier(Modifier::BOLD)
+        }
+        AgentStatus::Idle => Style::default().fg(term_pane::map_dto_color(theme.idle)),
+        AgentStatus::Done => Style::default().fg(term_pane::map_dto_color(theme.done)),
+        AgentStatus::Error => Style::default().fg(term_pane::map_dto_color(theme.error)),
     }
 }
 /// Width of the tree column as a percentage of the full window — the pane
@@ -309,7 +311,7 @@ fn render_agent_tree(
 
 fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Line<'static> {
     let name_style = if dimmed {
-        Style::default().fg(theme.idle)
+        Style::default().fg(term_pane::map_dto_color(theme.idle))
     } else if selected {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
@@ -339,9 +341,10 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     // A dimmed (ancestor-context-only) row during search stays legible but
     // visually recedes behind actual matches — everything in `theme.idle`,
     // badge included, regardless of the node's real status color.
-    let badge_style = if dimmed { Style::default().fg(theme.idle) } else { status_style(&node.status, theme) };
+    let badge_style =
+        if dimmed { Style::default().fg(term_pane::map_dto_color(theme.idle)) } else { status_style(&node.status, theme) };
     let row_status_style = if dimmed {
-        Style::default().fg(theme.idle)
+        Style::default().fg(term_pane::map_dto_color(theme.idle))
     } else if node.status == AgentStatus::Blocked {
         status_style(&node.status, theme)
     } else {
@@ -732,9 +735,9 @@ fn context_bar(pct: u8) -> String {
 
 fn focused_border(focused: bool, theme: &Theme) -> Style {
     if focused {
-        Style::default().fg(theme.border_focused)
+        Style::default().fg(term_pane::map_dto_color(theme.border_focused))
     } else {
-        Style::default().fg(theme.border)
+        Style::default().fg(term_pane::map_dto_color(theme.border))
     }
 }
 
@@ -1029,7 +1032,7 @@ mod tests {
 
     fn node(name: &str, children: Vec<AgentNode>) -> AgentNode {
         AgentNode {
-            id: crate::agent::AgentId::new(),
+            id: overseer_core::agent::AgentId::new(),
             name: name.to_string(),
             status: AgentStatus::Running,
             role: AgentRole::Root,
@@ -1191,7 +1194,7 @@ mod tests {
 
     #[test]
     fn help_rows_reflects_a_remap() {
-        let kb = Keybindings { spawn_root: crate::config::KeyBinding::Char('a'), ..Keybindings::default() };
+        let kb = Keybindings { spawn_root: overseer_core::config::KeyBinding::Char('a'), ..Keybindings::default() };
         let rows = help_rows(&kb);
         let spawn_root_row = rows.iter().find(|(_, label)| *label == Action::SpawnRoot.label()).unwrap();
         assert_eq!(spawn_root_row.0, "a");

@@ -14,18 +14,18 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::{Position, Rect}, Terminal};
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::agent::{AgentId, AgentTree};
+use overseer_core::agent::{AgentId, AgentTree};
 use crate::app::{
     App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction, PickerOption,
     PickerState,
 };
-use crate::config::{Action, Config, KeyBinding, Keybindings};
-use crate::daemon;
-use crate::git::GitClient;
-use crate::ipc;
-use crate::ipc::protocol::Request;
-use crate::ipc::AppCtx;
-use crate::session::{self, SessionManager};
+use overseer_core::config::{Action, Config, KeyBinding, Keybindings};
+use overseer_core::daemon;
+use overseer_core::git::GitClient;
+use overseer_core::ipc;
+use overseer_core::ipc::protocol::Request;
+use overseer_core::ipc::AppCtx;
+use overseer_core::session::{self, SessionManager};
 use crate::ui;
 
 pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
@@ -87,7 +87,7 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
 /// daemon split — it never spawns a real PTY and never touches a daemon.
 fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
     let ctx = Arc::new(AppCtx {
-        registry: Arc::new(crate::agent::AgentRegistry::from_tree(AgentTree::with_mock_data())),
+        registry: Arc::new(overseer_core::agent::AgentRegistry::from_tree(AgentTree::with_mock_data())),
         sessions: Arc::new(SessionManager::dry_run()),
         socket: socket.clone(),
         git: Arc::new(GitClient::new()),
@@ -110,13 +110,13 @@ fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    notify_config: &crate::config::NotifyConfig,
+    notify_config: &overseer_core::config::NotifyConfig,
     keybindings: &Keybindings,
-    theme: &crate::config::Theme,
+    theme: &overseer_core::config::Theme,
 ) -> Result<()> {
     let mut last_pane_size: Option<(u16, u16)> = None;
-    let mut last_selected: Option<crate::agent::AgentId> = None;
-    let mut last_statuses: std::collections::HashMap<crate::agent::AgentId, crate::agent::AgentStatus> =
+    let mut last_selected: Option<overseer_core::agent::AgentId> = None;
+    let mut last_statuses: std::collections::HashMap<overseer_core::agent::AgentId, overseer_core::agent::AgentStatus> =
         std::collections::HashMap::new();
 
     loop {
@@ -148,9 +148,9 @@ fn run_app<B: ratatui::backend::Backend>(
         // and a daemon-attached session, since it only reads the
         // already-materialized tree, not either backend's own event plumbing.
         let flat = app.with_tree(|t| t.flatten());
-        let transitions = crate::notify::status_transitions(&last_statuses, &flat);
-        crate::notify::handle_transitions(notify_config, &transitions);
-        last_statuses = crate::notify::snapshot_statuses(&flat);
+        let transitions = overseer_core::notify::status_transitions(&last_statuses, &flat);
+        overseer_core::notify::handle_transitions(notify_config, &transitions);
+        last_statuses = overseer_core::notify::snapshot_statuses(&flat);
 
         let prompt = build_prompt(app);
         let input = app.input.as_ref();
@@ -501,7 +501,7 @@ fn build_prompt(app: &App) -> Option<String> {
 /// `handle_picker_key`'s Enter open the same prompt with whatever got picked.
 fn start_spawn_root(app: &mut App) {
     app.status_message = None;
-    let installed = crate::agent::adapters::installed_adapter_names();
+    let installed = overseer_core::agent::adapters::installed_adapter_names();
     if installed.is_empty() {
         open_spawn_root_prompt(app, None);
         return;
@@ -742,7 +742,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+    use overseer_core::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
 
     /// Points every adapter's config-dir env var at a fresh, empty temp dir
     /// at once, so `installed_adapter_names()` reports nothing installed
@@ -750,9 +750,9 @@ mod tests {
     /// baseline every `n`-key test needs (a dev/CI box with a real adapter
     /// installed would otherwise open the picker where these tests expect
     /// the pre-picker straight-to-prompt behavior, or vice versa).
-    fn with_no_adapters_installed() -> crate::test_env::EnvGuard {
+    fn with_no_adapters_installed() -> overseer_core::test_env::EnvGuard {
         let dir = std::env::temp_dir().join(format!("overseer-tui-no-adapters-test-{}", uuid::Uuid::new_v4()));
-        crate::test_env::EnvGuard::set_all(&[
+        overseer_core::test_env::EnvGuard::set_all(&[
             ("CLAUDE_CONFIG_DIR", dir.join("claude").to_str().unwrap()),
             ("XDG_CONFIG_HOME", dir.join("xdg").to_str().unwrap()),
             ("PI_CODING_AGENT_DIR", dir.join("pi").to_str().unwrap()),
@@ -792,7 +792,7 @@ mod tests {
     // ── quit guard ────────────────────────────────────────────────────────────
 
     fn register_agent(ctx: &AppCtx, id: Option<AgentId>) -> AgentId {
-        use crate::agent::RegisterArgs;
+        use overseer_core::agent::RegisterArgs;
         ctx.registry
             .register(RegisterArgs {
                 id,
@@ -1130,17 +1130,17 @@ mod tests {
     /// state, then writes claude's own install artifacts (its actual
     /// `install_files()` list, not a hand-picked path) so only claude reports
     /// `overseer_installed()`.
-    fn with_only_claude_installed() -> crate::test_env::EnvGuard {
+    fn with_only_claude_installed() -> overseer_core::test_env::EnvGuard {
         let dir = std::env::temp_dir().join(format!("overseer-tui-picker-test-{}", uuid::Uuid::new_v4()));
         let claude_dir = dir.join("claude");
-        let env = crate::test_env::EnvGuard::set_all(&[
+        let env = overseer_core::test_env::EnvGuard::set_all(&[
             ("CLAUDE_CONFIG_DIR", claude_dir.to_str().unwrap()),
             ("XDG_CONFIG_HOME", dir.join("xdg").to_str().unwrap()),
             ("PI_CODING_AGENT_DIR", dir.join("pi").to_str().unwrap()),
         ]);
-        let adapter = crate::agent::adapters::adapter_for("claude").unwrap();
+        let adapter = overseer_core::agent::adapters::adapter_for("claude").unwrap();
         for file in adapter.install_files() {
-            if matches!(file.merge, crate::agent::adapters::MergeStrategy::Overwrite) {
+            if matches!(file.merge, overseer_core::agent::adapters::MergeStrategy::Overwrite) {
                 let full = claude_dir.join(&file.path);
                 std::fs::create_dir_all(full.parent().unwrap()).unwrap();
                 std::fs::write(&full, "x").unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
     // ── fuzzy search (PHASE5B.md Task 1) ─────────────────────────────────────
 
     fn register_named_agent(ctx: &AppCtx, name: &str) -> AgentId {
-        use crate::agent::RegisterArgs;
+        use overseer_core::agent::RegisterArgs;
         ctx.registry
             .register(RegisterArgs {
                 id: None,

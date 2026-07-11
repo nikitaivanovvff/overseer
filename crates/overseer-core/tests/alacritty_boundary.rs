@@ -1,18 +1,22 @@
 //! Guard test for the terminal-backend seal: `alacritty_terminal` may only
-//! ever be imported from `src/session/pty.rs` — every other file talks to
-//! `SessionManager` through backend-neutral types (`GridSnapshot`,
-//! `session::keys::TermModes`). A plain source grep rather than a
-//! compile-time check because the point is to catch a *future* regression
-//! (a new `use alacritty_terminal::...` creeping into `ui/` or elsewhere),
-//! not to re-verify today's code compiles.
+//! ever be imported from `src/session/pty.rs` in this crate (`overseer-core`)
+//! — every other file talks to `SessionManager` through backend-neutral
+//! types (`GridSnapshot`, `session::keys::TermModes`). A plain source grep
+//! rather than a compile-time check because the point is to catch a *future*
+//! regression (a new `use alacritty_terminal::...` creeping in elsewhere),
+//! not to re-verify today's code compiles. The `overseer` bin crate has its
+//! own copy of this guard (`crates/overseer/tests/alacritty_boundary.rs`)
+//! asserting zero occurrences there at all, now that the terminal backend
+//! lives only in this crate.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn alacritty_terminal_is_only_imported_in_session_pty() {
-    let allowed = Path::new("src/session/pty.rs");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let allowed = root.join("session").join("pty.rs");
     let mut offenders = Vec::new();
-    visit(Path::new("src"), allowed, &mut offenders);
+    visit(&root, &allowed, &mut offenders);
 
     assert!(
         offenders.is_empty(),

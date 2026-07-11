@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::agent::{AgentStatus, FlatNode};
-use crate::ipc::protocol::{ColorDto, GridSnapshot};
+use overseer_core::agent::{AgentStatus, FlatNode};
+use overseer_core::ipc::protocol::{ColorDto, GridSnapshot};
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
 /// half of the tree|pane split. `grid` is the selected agent's current
@@ -112,7 +112,13 @@ fn pane_title(focused: bool, display_offset: usize, alive: bool) -> String {
 /// `session::pty::dto_color`) into a `ratatui::style::Color`. A mechanical
 /// 1:1 mapping since `ColorDto` was deliberately shaped to mirror `Color`'s
 /// own variants.
-fn map_dto_color(color: ColorDto) -> Color {
+///
+/// `pub(crate)`, not private: `ui/mod.rs` also uses it to convert
+/// `config::Theme`'s `ColorDto` fields (`overseer-core` is deliberately
+/// `ratatui`-free — see the workspace-split notes in AGENTS.md — so `Theme`
+/// carries `ColorDto`, not `ratatui::style::Color`, and this one mapping now
+/// serves both grid cells and theme colors).
+pub(crate) fn map_dto_color(color: ColorDto) -> Color {
     match color {
         ColorDto::Reset => Color::Reset,
         ColorDto::Black => Color::Black,
@@ -183,9 +189,9 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AgentId, AgentRole};
-    use crate::ipc::protocol::CellDto;
-    use crate::session::snapshot_from_bytes;
+    use overseer_core::agent::{AgentId, AgentRole};
+    use overseer_core::ipc::protocol::CellDto;
+    use overseer_core::session::snapshot_from_bytes;
 
     fn flat_node(status: AgentStatus, adapter: &str) -> FlatNode {
         FlatNode {
@@ -280,7 +286,7 @@ mod tests {
 
     #[test]
     fn scroll_display_shows_older_lines_then_bottom_restores_live_content() {
-        use crate::session::snapshot_from_bytes_scrolled;
+        use overseer_core::session::snapshot_from_bytes_scrolled;
 
         // 5 lines of visible height, but print far more so there's real
         // scrollback history to move into.

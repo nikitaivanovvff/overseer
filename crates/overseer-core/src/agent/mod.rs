@@ -14,7 +14,8 @@ pub use registry::{AgentRegistry, RegistryEvent};
 pub use status::AgentStatus;
 pub use tree::{AgentTree, FlatNode};
 
-// Only reached from cross-module test helpers (main.rs's quit-guard tests
-// build a `RegisterArgs` directly); production code goes through `spawn`.
-#[cfg(test)]
+// Only reached from cross-module test helpers (the `overseer` bin crate's
+// tui.rs quit-guard tests build a `RegisterArgs` directly, via the
+// `test-util` feature); production code goes through `spawn`.
+#[cfg(any(test, feature = "test-util"))]
 pub use registry::RegisterArgs;

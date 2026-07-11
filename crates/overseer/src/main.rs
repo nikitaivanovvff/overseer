@@ -1,23 +1,12 @@
 use anyhow::Result;
 
-mod agent;
 mod app;
 mod cli;
-mod config;
-mod daemon;
-mod git;
-mod install;
-mod ipc;
-mod kill;
-mod notify;
-mod session;
-mod settings;
-#[cfg(test)]
-mod test_env;
 mod tui;
 mod ui;
 
 use cli::{Cli, Command};
+use overseer_core::{daemon, install, kill};
 
 fn main() -> Result<()> {
     // Captured before argument parsing so a `status --from-hook` push's

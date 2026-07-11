@@ -1,22 +1,20 @@
-//! Integration test for FIX B (`src/kill.rs`'s process-table-scan pid
-//! discovery, DAEMON-LOCK-SAFETY): spawns a *real* `overseer daemon`
-//! process, then reproduces the observed state of the 2026-07-11 incident —
-//! the daemon alive and holding the `flock`, but with an unreadable
-//! `daemon.pid` and no reachable socket — and asserts `overseer kill`
-//! recovers it anyway (finds the daemon by scanning the process table for
-//! `daemon --socket <this socket>` in its argv, force-kills it, and cleans
-//! up the stale files) rather than bailing out wedged forever the way it did
-//! pre-fix.
+//! Integration test for FIX B (`kill.rs`'s process-table-scan pid
+//! discovery, DAEMON-LOCK-SAFETY — `crates/overseer-core/src/kill.rs`):
+//! spawns a *real* `overseer daemon` process, then reproduces the observed
+//! state of the 2026-07-11 incident — the daemon alive and holding the
+//! `flock`, but with an unreadable `daemon.pid` and no reachable socket —
+//! and asserts `overseer kill` recovers it anyway (finds the daemon by
+//! scanning the process table for `daemon --socket <this socket>` in its
+//! argv, force-kills it, and cleans up the stale files) rather than bailing
+//! out wedged forever the way it did pre-fix.
 //!
-//! Lives under `tests/`, not `src/kill.rs`'s own `#[cfg(test)]` module,
-//! specifically to get Cargo's `CARGO_BIN_EXE_overseer` env var: that's only
-//! set for targets that *depend on* the `overseer` binary (integration
-//! tests, benches, examples), not for the bin's own unit-test harness, and
-//! this crate ships only a `[[bin]]` (no `[lib]`) so `kill::run` and its
-//! internals aren't reachable from any external crate anyway — this drives
-//! the same code path through the documented CLI surface instead (`overseer
-//! kill --socket <path>`), which is exactly what a user hitting this
-//! incident would run by hand.
+//! Lives under this bin crate's `tests/`, not `kill.rs`'s own `#[cfg(test)]`
+//! module, specifically to get Cargo's `CARGO_BIN_EXE_overseer` env var:
+//! that's only set for targets that *depend on* the `overseer` binary
+//! (integration tests, benches, examples), never in `overseer-core`'s own
+//! test harness — and driving the documented CLI surface (`overseer kill
+//! --socket <path>`) is exactly what a user hitting this incident would run
+//! by hand anyway.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

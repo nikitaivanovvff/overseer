@@ -1,15 +1,14 @@
-[package]
-name = "overseer"
+[workspace]
+resolver = "2"
+members = ["crates/overseer-core", "crates/overseer"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Terminal IDE for orchestrating AI agent hierarchies"
 license = "MIT"
 
-[[bin]]
-name = "overseer"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+overseer-core = { path = "crates/overseer-core" }
 ratatui = "0.29"
 crossterm = "0.28"
 anyhow = "1"
@@ -24,6 +23,3 @@ alacritty_terminal = "0.26"
 toml = "0.8"
 unicode-segmentation = "1"
 libc = "0.2"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
