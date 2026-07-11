@@ -318,7 +318,20 @@ impl SessionManager {
 
     /// Resizes every live session to `(cols, lines)` and remembers it as the
     /// size new sessions launch at — all agents share one rect (§2).
+    ///
+    /// A degenerate rect (either dimension 0) is ignored outright, keeping
+    /// the previous size: it means "the pane isn't visible right now" (a
+    /// terminal reporting 0x0 mid-startup or mid-resize), not a real size an
+    /// agent's terminal could ever usefully have. Passing 0 through would do
+    /// far worse than render wrong — `Term::resize`'s reflow underflows on a
+    /// zero dimension and panics the PTY reader thread, which is the *only*
+    /// place `Event::ChildExit` is emitted, silently disabling exit
+    /// detection for that agent from then on (a real incident: a workspace
+    /// stuck `idle` forever after the user typed `exit` in its shell).
     pub fn resize_all(&self, cols: usize, lines: usize) {
+        if cols == 0 || lines == 0 {
+            return;
+        }
         *self.current_size.lock().unwrap_or_else(|e| e.into_inner()) = GridSize { cols, lines };
         if matches!(self.mode, Mode::DryRun { .. }) {
             return;
@@ -454,8 +467,46 @@ impl SessionManager {
     /// — consumed by the dead-session watcher in place of polling. Each entry is
     /// `(id, success)`, `success` being the child's exit status (`true` for a
     /// clean exit code 0).
+    ///
+    /// Also sweeps for sessions whose event-loop thread *finished without
+    /// ever recording an exit* — a reader that died abnormally (e.g. a panic
+    /// inside the terminal emulator) rather than breaking cleanly after
+    /// `Event::ChildExit`. That thread is the only source of exit events, so
+    /// without this check such an agent would look alive forever no matter
+    /// what its process does (the incident behind `resize_all`'s
+    /// degenerate-size guard). Reported as an unclean exit: the session is
+    /// unusable and the real exit status is unknowable.
     pub fn drain_exits(&self) -> Vec<(AgentId, bool)> {
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut exits = self.exits.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, session) in sessions.iter() {
+                // `alive` flips false (on the reader thread) strictly before
+                // that thread can finish, so a finished reader with `alive`
+                // still true never races a normal exit's own bookkeeping —
+                // it can only mean the exit event was never sent at all.
+                if session.alive.load(Ordering::Relaxed)
+                    && session.reader.as_ref().is_some_and(|r| r.is_finished())
+                {
+                    session.alive.store(false, Ordering::Relaxed);
+                    exits.push((id.clone(), false));
+                }
+            }
+        }
         std::mem::take(&mut *self.exits.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Test-only: stops `id`'s PTY event loop without the `ChildExit`
+    /// bookkeeping ever running — the same observable state a reader-thread
+    /// panic leaves behind (thread finished, `alive` still true, no exit
+    /// recorded), for exercising `drain_exits`'s dead-reader sweep
+    /// deterministically.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn simulate_reader_death(&self, id: &AgentId) {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = sessions.get(id) {
+            let _ = session.channel.send(Msg::Shutdown);
+        }
     }
 
     /// Test-only: pretend `id`'s PTY child exited with the given exit status,
@@ -818,6 +869,112 @@ mod tests {
         assert_eq!(s.display_offset(&id), 15);
         s.scroll_to_bottom(&id);
         assert_eq!(s.display_offset(&id), 0);
+
+        s.kill(&id);
+    }
+
+    // ── degenerate resize / dead-reader sweep (the stuck-workspace incident) ──
+
+    /// Regression test: `resize_all` with a zero dimension (a terminal
+    /// reporting a degenerate size mid-startup/mid-resize, forwarded verbatim
+    /// by the TUI's `Request::Resize`) used to reach `Term::resize`, whose
+    /// reflow underflows on 0 and panics the PTY reader thread — the only
+    /// emitter of `Event::ChildExit`, so the agent's exit could never be
+    /// detected again. The degenerate resize must be ignored (previous size
+    /// kept), the session must stay fully alive, and a later real resize must
+    /// still apply.
+    #[test]
+    fn resize_all_ignores_a_degenerate_zero_size_and_the_session_survives() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf hello; sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.generation(&id).unwrap_or(0) > 0
+        });
+        assert!(became_dirty, "session must have produced output first");
+
+        s.resize_all(0, 0);
+        s.resize_all(0, 40);
+        s.resize_all(120, 0);
+
+        // Give a would-be panic on the reader thread a moment to surface.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(s.is_alive(&id), "a degenerate resize must not kill the session");
+        assert!(s.drain_exits().is_empty(), "no exit may be recorded for a live session");
+
+        let grid = s.grid_snapshot(&id).expect("session must still render");
+        assert_eq!((grid.cols, grid.lines), (DEFAULT_COLS as u16, DEFAULT_LINES as u16),
+            "a degenerate resize must keep the previous size");
+
+        s.resize_all(100, 30);
+        let grid = s.grid_snapshot(&id).expect("session must still render");
+        assert_eq!((grid.cols, grid.lines), (100, 30), "a real resize must still apply");
+
+        s.kill(&id);
+    }
+
+    /// The incident end to end: a degenerate resize arrives (previously
+    /// killing the reader thread), then the user types `exit` — the child's
+    /// clean exit must still be detected and reported via `drain_exits`, or
+    /// the workspace sits `idle` forever.
+    #[test]
+    fn exit_is_still_detected_after_a_degenerate_resize() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        // An interactive shell reading commands from the PTY, like a
+        // workspace's own bare shell.
+        let cmd = Command::new("/bin/sh");
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        s.resize_all(0, 0);
+        s.write(&id, b"exit\r".to_vec());
+
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            exits = s.drain_exits();
+            if !exits.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(exits, vec![(id.clone(), true)],
+            "typing exit after a degenerate resize must still be detected as a clean exit");
+        assert!(!s.is_alive(&id));
+
+        s.kill(&id);
+    }
+
+    /// Defense-in-depth regression test: if the event-loop thread ever dies
+    /// *without* recording an exit (a panic inside the terminal emulator —
+    /// exactly what the pre-guard degenerate resize did), `drain_exits` must
+    /// report the session as an unclean exit rather than leave the agent
+    /// looking alive forever.
+    #[test]
+    fn drain_exits_reports_a_dead_reader_thread_as_an_unclean_exit() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+        assert!(s.is_alive(&id));
+
+        s.simulate_reader_death(&id);
+
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            exits = s.drain_exits();
+            if !exits.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(exits, vec![(id.clone(), false)],
+            "a dead reader thread must surface as an unclean exit");
+        assert!(!s.is_alive(&id), "the session must not look alive after its reader died");
 
         s.kill(&id);
     }

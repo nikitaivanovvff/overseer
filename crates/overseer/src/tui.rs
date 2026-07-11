@@ -180,7 +180,15 @@ fn run_app<B: ratatui::backend::Backend>(
         // the user ever gets to spawn one).
         let pane_size = (pane_rect.width, pane_rect.height);
         if last_pane_size != Some(pane_size) {
-            app.resize(pane_size.0 as usize, pane_size.1 as usize);
+            // A zero dimension means the pane isn't visible (a terminal
+            // reporting a degenerate size mid-startup/mid-resize) — nothing
+            // to size agents to. `SessionManager::resize_all` guards this
+            // server-side too (resizing a terminal grid to 0 kills its PTY
+            // reader thread and with it exit detection); skipping here just
+            // avoids sending a request the daemon would ignore anyway.
+            if pane_size.0 > 0 && pane_size.1 > 0 {
+                app.resize(pane_size.0 as usize, pane_size.1 as usize);
+            }
             last_pane_size = Some(pane_size);
         }
 
