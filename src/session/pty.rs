@@ -139,6 +139,13 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<AgentId, PtySession>>,
     exits: Arc<Mutex<Vec<(AgentId, bool)>>>,
     current_size: Mutex<GridSize>,
+    /// Test-only seam: in dry-run mode there's no real PTY for `write()` to
+    /// send bytes to, so it records them here instead — lets tests assert
+    /// what would have been typed into the PTY (e.g.
+    /// `spawn_root_with_adapter`'s auto-typed harness command line) without
+    /// spawning a real process. Keyed by agent id, bytes appended in write order.
+    #[cfg(test)]
+    dry_run_writes: Mutex<HashMap<AgentId, Vec<u8>>>,
 }
 
 impl SessionManager {
@@ -148,6 +155,8 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
+            #[cfg(test)]
+            dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -159,6 +168,8 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
+            #[cfg(test)]
+            dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -176,6 +187,8 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
+            #[cfg(test)]
+            dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -188,6 +201,8 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             exits: Arc::new(Mutex::new(Vec::new())),
             current_size: Mutex::new(GridSize { cols: DEFAULT_COLS, lines: DEFAULT_LINES }),
+            #[cfg(test)]
+            dry_run_writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -321,11 +336,35 @@ impl SessionManager {
     }
 
     /// Forwards raw bytes to the agent's PTY — the input path for jump-in
-    /// keystrokes (Task 3) as well as this module's own query-reply writes.
+    /// keystrokes (Task 3) as well as this module's own query-reply writes
+    /// (e.g. `spawn_root_with_adapter` auto-typing the harness command).
     pub fn write(&self, id: &AgentId, bytes: Vec<u8>) {
+        #[cfg(test)]
+        if matches!(self.mode, Mode::DryRun { .. }) {
+            self.dry_run_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(id.clone())
+                .or_default()
+                .extend_from_slice(&bytes);
+            return;
+        }
         if let Some(session) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
             Notifier(session.channel.clone()).notify(bytes);
         }
+    }
+
+    /// Test-only accessor for `dry_run_writes` — every byte `write()` has
+    /// recorded for `id` so far, concatenated in write order. Empty for an id
+    /// with no recorded writes (including outside dry-run mode).
+    #[cfg(test)]
+    pub(crate) fn dry_run_written_bytes(&self, id: &AgentId) -> Vec<u8> {
+        self.dry_run_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Briefly locks the selected agent's `Term` for rendering. Private —
@@ -608,6 +647,21 @@ mod tests {
         let s = SessionManager::dry_run();
         s.write(&AgentId::new(), b"hello".to_vec());
         s.resize_all(120, 40);
+    }
+
+    #[test]
+    fn dry_run_write_is_recorded_and_readable_via_the_test_seam() {
+        let s = SessionManager::dry_run();
+        let id = AgentId::new();
+        s.write(&id, b"claude ".to_vec());
+        s.write(&id, b"--flag\n".to_vec());
+        assert_eq!(s.dry_run_written_bytes(&id), b"claude --flag\n".to_vec());
+    }
+
+    #[test]
+    fn dry_run_written_bytes_empty_for_an_id_with_no_writes() {
+        let s = SessionManager::dry_run();
+        assert!(s.dry_run_written_bytes(&AgentId::new()).is_empty());
     }
 
     #[test]
