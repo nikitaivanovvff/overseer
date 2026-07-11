@@ -140,14 +140,24 @@ fn resolve_shell() -> String {
 }
 
 /// Root path when an adapter was actually chosen (picker step 2, or a
-/// hand-built `Request::Start { adapter: Some(_), .. }`) — the same
-/// adapter-driven launch a child uses, just role=Root, no parent, empty task.
-/// Byte-identical to a human typing e.g. `claude` into today's bare shell
-/// (AGENTS.md), so no `SessionStart`/hook changes were needed: the adapter's
-/// own install hook already branches on `$OVERSEER_ROLE` to push `idle` for a
-/// root vs. `running` for a child, regardless of who launched it. Registers
-/// `Spawning` (not `Idle`) for the same reason a child does — the PTY is
-/// launching but the harness hasn't reported activity yet.
+/// hand-built `Request::Start { adapter: Some(_), .. }`) — launched like the
+/// bare-shell root (a live, interactive shell as the PTY child), with the
+/// adapter's own launch command auto-typed into it. Registers `Idle`, same
+/// as the bare-shell root: the PTY child is a shell, byte-identical to a
+/// human typing the command into a bare-shell root themselves, and the
+/// harness's own `SessionStart`-equivalent hook flips status from there
+/// (every adapter's install hook already branches on `$OVERSEER_ROLE` to
+/// push `idle` for a root regardless of who typed the launch command).
+///
+/// Exec'ing the harness binary directly as the PTY child (the previous
+/// approach) meant exiting the harness killed the whole PTY — the exit
+/// watcher then flipped the workspace straight to `done`/`error` and the
+/// pane froze on the harness's last frame. Going through a shell first means
+/// exiting the harness drops back to a live shell prompt (workspace stays
+/// up), and only exiting *that* shell ends the workspace — exactly how a
+/// bare-shell root already behaves. Side benefit: the pane shows a live
+/// shell prompt and the typed command within milliseconds instead of being
+/// blank for the harness's entire boot time.
 fn spawn_root_with_adapter(
     registry: &AgentRegistry,
     sessions: &SessionManager,
@@ -163,11 +173,11 @@ fn spawn_root_with_adapter(
         name: req.repo.clone(), // still named after the repo, same as the bare-shell root
         role: AgentRole::Root,
         parent_id: None,
-        adapter: adapter_name,
+        adapter: adapter_name, // label = the chosen adapter, not "shell"
         repo: req.repo.clone(),
         cwd: req.cwd.clone(),
         branch: req.branch,
-        initial_status: AgentStatus::Spawning,
+        initial_status: AgentStatus::Idle,
     };
     let result = registry.register(args)?;
 
@@ -176,18 +186,49 @@ fn spawn_root_with_adapter(
         role: AgentRole::Root,
         parent_id: None,
         socket: socket.to_path_buf(),
-        cwd: req.cwd,
+        cwd: req.cwd.clone(),
         repo: req.repo,
         command: adapter_config.command.clone(),
         extra_args: adapter_config.extra_args.clone(),
         task: String::new(), // a root has no task, same as the bare-shell path
     };
+    // The harness invocation to type in, not to exec directly — see the
+    // doc comment above for why exec'ing it here would recreate the bug.
+    let harness_cmd = adapter.spawn_command(&launch_ctx);
+    let env = adapter.env_inject(&launch_ctx);
 
-    if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
+    let shell_cmd = Command::new(resolve_shell());
+    if let Err(e) = sessions.launch(result.id.clone(), &req.cwd, &shell_cmd, &env) {
         registry.remove(&result.id);
         return Err(SpawnError::Launch(e));
     }
+
+    let command_line = format!("{}\n", shell_command_line(&harness_cmd));
+    sessions.write(&result.id, command_line.into_bytes());
+
     Ok(result)
+}
+
+/// POSIX single-quote-quotes `cmd`'s program and each argument, joined by
+/// spaces — safe to type verbatim into an interactive shell. Single-quoting
+/// (rather than double-quoting or escaping) is the simplest form that's
+/// correct for arbitrary bytes: the only special case is an embedded `'`,
+/// which becomes `'\''` (close the quote, an escaped literal quote, reopen
+/// the quote). Needed because some adapters' args are absolute paths that
+/// may contain spaces (pi's `--extension <path>`, `--append-system-prompt
+/// <path>`).
+fn shell_command_line(cmd: &Command) -> String {
+    let mut parts = Vec::new();
+    parts.push(shell_quote(&cmd.get_program().to_string_lossy()));
+    for arg in cmd.get_args() {
+        parts.push(shell_quote(&arg.to_string_lossy()));
+    }
+    parts.join(" ")
+}
+
+/// Single-quotes `s` for a POSIX shell, escaping any embedded `'`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Looks up `adapter_name`'s `AgentAdapter` impl + its resolved `config.adapters`
@@ -618,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_root_with_adapter_registers_spawning_with_that_adapter_label() {
+    fn spawn_agent_root_with_adapter_registers_idle_with_that_adapter_label() {
         let (registry, sessions) = make_registry_and_sessions();
         let config = Config::default();
         let result = spawn_agent(
@@ -630,11 +671,13 @@ mod tests {
         )
         .unwrap();
         let dto = registry.get(&result.id).unwrap();
-        // Not "shell" and not Idle — this root launched a real adapter
-        // directly, same as a child would, so it starts in the same
-        // "launching, hasn't reported activity yet" state a child does.
+        // Adapter label is the chosen adapter, not "shell" — but status is
+        // Idle, same as a bare-shell root: the PTY child launched here is a
+        // live shell (the harness command is only typed into it), so this
+        // root is in exactly the same "waiting, nothing has reported
+        // activity yet" state a bare-shell root starts in.
         assert_eq!(dto.adapter, "claude");
-        assert_eq!(dto.status, AgentStatus::Spawning);
+        assert_eq!(dto.status, AgentStatus::Idle);
     }
 
     #[test]
@@ -696,5 +739,60 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SpawnError::Launch(_)));
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// The PTY child launched is a shell (not the harness binary), and the
+    /// harness invocation gets typed into it as a follow-up write, ending in
+    /// a newline to submit it — this is what actually fixes ROOT-SHELL-FALLBACK:
+    /// exiting the harness now drops to a live shell instead of killing the PTY.
+    #[test]
+    fn spawn_agent_root_with_adapter_launches_a_shell_and_types_the_harness_command() {
+        let _env = crate::test_env::EnvGuard::set("SHELL", "/bin/zsh");
+        let (registry, sessions) = make_registry_and_sessions();
+        let mut config = Config::default();
+        config.adapters.insert(
+            "claude".to_string(),
+            crate::config::AdapterConfig {
+                command: "claude".to_string(),
+                extra_args: vec!["--dangerously-skip-permissions".to_string()],
+            },
+        );
+        let result = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            root_request_with_adapter("claude"),
+        )
+        .unwrap();
+
+        let typed = String::from_utf8(sessions.dry_run_written_bytes(&result.id)).unwrap();
+        assert_eq!(typed, "'claude' '--dangerously-skip-permissions'\n");
+    }
+
+    // ── shell_command_line ────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_command_line_quotes_plain_program_and_args() {
+        let mut cmd = Command::new("claude");
+        cmd.arg("--dangerously-skip-permissions");
+        assert_eq!(shell_command_line(&cmd), "'claude' '--dangerously-skip-permissions'");
+    }
+
+    #[test]
+    fn shell_command_line_quotes_args_containing_spaces() {
+        let mut cmd = Command::new("pi");
+        cmd.arg("--append-system-prompt").arg("/Users/me/My Documents/overseer-root.md");
+        assert_eq!(
+            shell_command_line(&cmd),
+            "'pi' '--append-system-prompt' '/Users/me/My Documents/overseer-root.md'"
+        );
+    }
+
+    #[test]
+    fn shell_command_line_escapes_embedded_single_quotes() {
+        let mut cmd = Command::new("claude");
+        cmd.arg("it's a task");
+        assert_eq!(shell_command_line(&cmd), r"'claude' 'it'\''s a task'");
     }
 }
