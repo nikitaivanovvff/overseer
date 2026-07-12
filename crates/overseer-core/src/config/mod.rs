@@ -63,6 +63,8 @@ impl<'de> Deserialize<'de> for Config {
 pub struct Defaults {
     #[serde(default = "default_adapter_name")]
     pub adapter: String,
+    #[serde(default = "default_max_children")]
+    pub max_children: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +112,10 @@ fn default_adapter_name() -> String {
     "claude".to_string()
 }
 
+fn default_max_children() -> usize {
+    8
+}
+
 fn default_adapters() -> HashMap<String, AdapterConfig> {
     let mut adapters = HashMap::new();
     adapters.insert(
@@ -126,7 +132,7 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
 
 impl Default for Defaults {
     fn default() -> Self {
-        Self { adapter: default_adapter_name() }
+        Self { adapter: default_adapter_name(), max_children: default_max_children() }
     }
 }
 
@@ -185,6 +191,7 @@ mod tests {
     fn default_has_claude_adapter_and_default_adapter_name() {
         let cfg = Config::default();
         assert_eq!(cfg.defaults.adapter, "claude");
+        assert_eq!(cfg.defaults.max_children, 8);
         let claude = cfg.adapters.get("claude").expect("default config must have claude");
         assert_eq!(claude.command, "claude");
         assert!(claude.extra_args.is_empty());
@@ -201,6 +208,7 @@ mod tests {
         let raw = r#"
             [defaults]
             adapter = "aider"
+            max_children = 3
 
             [adapters.claude]
             command = "claude"
@@ -212,6 +220,7 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.defaults.adapter, "aider");
+        assert_eq!(cfg.defaults.max_children, 3);
         let claude = cfg.adapters.get("claude").unwrap();
         assert_eq!(claude.extra_args, vec!["--dangerously-skip-permissions".to_string()]);
         let aider = cfg.adapters.get("aider").unwrap();

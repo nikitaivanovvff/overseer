@@ -47,7 +47,7 @@ overseer drop <id>
 ## Hard rules
 
 - Delegate only via `overseer spawn` — never your own built-in subagent/Task tool.
-- You may spawn children; they may not spawn further agents.
+- You may spawn depth-2 children; they may spawn visible depth-3 leaf agents through `overseer spawn`, but no deeper.
 - Never touch another agent's branch or worktree.
 
 Status is otherwise automatic via the Overseer extension — you don't need to push it yourself.

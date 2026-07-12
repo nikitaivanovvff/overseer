@@ -204,6 +204,7 @@ mod tests {
             command: "claude".to_string(),
             extra_args: vec!["--some-flag".to_string()],
             task: String::new(),
+            depth: 1,
         }
     }
 
@@ -218,6 +219,7 @@ mod tests {
             command: "claude".to_string(),
             extra_args: vec![],
             task: "write unit tests for the login flow".to_string(),
+            depth: 2,
         }
     }
 
@@ -255,10 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn root_skill_documents_spawn_and_forbids_nesting() {
+    fn root_skill_documents_spawn_and_depth_three_limit() {
         assert!(ROOT_SKILL_CONTENT.contains("overseer spawn"));
-        assert!(ROOT_SKILL_CONTENT.to_lowercase().contains("not spawn further")
-            || ROOT_SKILL_CONTENT.contains("may not spawn further"));
+        assert!(ROOT_SKILL_CONTENT.contains("depth-3 leaf"));
     }
 
     #[test]
@@ -290,6 +291,13 @@ mod tests {
     fn child_skill_documents_overseer_task_and_done_status() {
         assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
         assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));
+    }
+
+    #[test]
+    fn child_skill_requires_visible_delegation_and_documents_depth_three() {
+        assert!(CHILD_SKILL_CONTENT.contains("never your harness's built-in"));
+        assert!(CHILD_SKILL_CONTENT.contains("read-only lookup"));
+        assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_DEPTH"));
     }
 
     #[test]

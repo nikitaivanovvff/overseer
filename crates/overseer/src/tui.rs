@@ -687,7 +687,7 @@ fn handle_picker_key(app: &mut App, key: KeyEvent, keybindings: &Keybindings) {
 
 /// `s`: opens a task-input prompt for the selected node, whatever its role. Whether
 /// it's actually eligible to take a child is decided by the server's `Spawn` handler
-/// alone (AGENTS.md: the "no grandchildren" rule lives there, "not in the TUI, not as
+/// alone (AGENTS.md: depth/cap admission lives there, "not in the TUI, not as
 /// a UI hint") — a rejection surfaces through `submit_input`'s normal error handling.
 fn start_spawn_child_input(app: &mut App) {
     if let Some(node) = app.with_tree(|t| t.selected()) {

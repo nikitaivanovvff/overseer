@@ -110,8 +110,8 @@ overseer drop <id>
 
 - Delegate only via `overseer spawn` — never your own built-in
   subagent/Task/Agent tool. See "Spawning children" above.
-- You may spawn children; they may not spawn further agents — don't try to
-  nest by asking a child to delegate.
+- You may spawn depth-2 children; they may spawn visible depth-3 leaf agents
+  through `overseer spawn`, but no deeper.
 - Never touch another agent's branch or worktree.
 
 ## Identity variables

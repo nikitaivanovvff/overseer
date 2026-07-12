@@ -37,7 +37,7 @@ src/
 │   ├── server        Binds the socket; one-shot request/response *and* the attach event-stream
 │   │                 loop (Watch/Unwatch/Write/Resize inward, AttachEvent outward); session-exit watcher
 │   ├── handlers      dispatch: status, list, agent, start, spawn, drop, tui_drop, shutdown —
-│   │                 the "no grandchildren" rule is enforced here, in exactly one place
+│   │                 depth-3/max-children admission is enforced here, in exactly one place
 │   ├── protocol      Request / Response / AgentDto / AttachEvent / GridSnapshot / ColorDto
 │   │                 wire types (serde); snapshots include input-relevant terminal modes
 │   └── client        One-shot sync client used by CLI subcommands and daemon reachability probes
@@ -80,7 +80,7 @@ below.
   ordering guarantee).
 - **Parse functions are pure** (`hook.rs`, `settings.rs`, `notify.rs`) — no
   I/O, no process spawning.
-- **The "no grandchildren" rule lives in the `spawn` handler** — not in any
+- **The depth-3 and child-cap rules live in the `spawn` handler** — not in any
   frontend, not in adapters.
 
 ## The `test-util` feature

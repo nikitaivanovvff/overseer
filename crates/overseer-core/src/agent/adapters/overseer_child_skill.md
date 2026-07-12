@@ -3,7 +3,7 @@ name: overseer-child
 description: Operating guide for a child agent managed by Overseer. Active when $OVERSEER_AGENT_ID is set and $OVERSEER_ROLE=child.
 ---
 
-You are a child agent spawned by a root, running inside Overseer.
+You are a child agent spawned by another agent, running inside Overseer.
 
 ## Your assignment
 
@@ -44,7 +44,13 @@ completion from you going quiet or from the session ending.
 
 ## Hard rules
 
-- Never spawn further agents — only roots may spawn.
+- Delegate real sub-tasks with `overseer spawn`, never your harness's built-in
+  subagent or Task tool. Built-in subagents are invisible to the user watching
+  Overseer's tree. A single-shot, read-only lookup that finishes well under a
+  minute may stay in-harness; anything longer, file-writing, or substantial
+  must be a visible Overseer child.
+- Check `$OVERSEER_DEPTH` before delegating. At depth `3` you cannot spawn;
+  perform the work inline. At depth `2`, spawned agents are depth-3 leaves.
 - Never touch another agent's branch or worktree.
 
 ## Identity variables
@@ -57,6 +63,7 @@ completion from you going quiet or from the session ending.
 | `$OVERSEER_PARENT_ID` | Parent agent ID |
 | `$OVERSEER_REPO` | Repository name |
 | `$OVERSEER_TASK` | Your assignment (also your initial prompt) |
+| `$OVERSEER_DEPTH` | Tree depth (`2` or `3`); depth `3` is the spawn limit |
 
 Status is otherwise automatic via hooks — you don't need to push it yourself,
 except for the explicit `done` above.

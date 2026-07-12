@@ -275,6 +275,14 @@ impl AgentRegistry {
         find_dto(&guard.roots, id, None)
     }
 
+    /// Returns derived depth and direct-child count under one tree lock for
+    /// the spawn handler's centralized admission checks.
+    pub fn spawn_metrics(&self, id: &AgentId) -> Option<(usize, usize)> {
+        let guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        let node = guard.find(id)?;
+        Some((guard.depth(id)?, node.children.len()))
+    }
+
     pub fn with_tree<R>(&self, f: impl FnOnce(&AgentTree) -> R) -> R {
         let guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         f(&guard)

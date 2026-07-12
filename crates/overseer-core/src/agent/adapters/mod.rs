@@ -25,6 +25,8 @@ pub struct LaunchContext {
     /// The adapter appends this as the final positional arg to `spawn_command`
     /// and `env_inject` re-exposes it as `$OVERSEER_TASK` for the running agent.
     pub task: String,
+    /// One-based position in the registry tree, derived at launch time.
+    pub depth: usize,
 }
 
 impl LaunchContext {
@@ -35,6 +37,7 @@ impl LaunchContext {
             parent_id: self.parent_id.as_ref(),
             socket: &self.socket,
             repo: &self.repo,
+            depth: self.depth,
         }
     }
 }
@@ -49,6 +52,7 @@ pub struct AgentIdentity<'a> {
     pub parent_id: Option<&'a AgentId>,
     pub socket: &'a std::path::Path,
     pub repo: &'a str,
+    pub depth: usize,
 }
 
 /// Pure. Builds the OVERSEER_* env vars every launched session gets
@@ -68,6 +72,7 @@ pub fn identity_env(id: &AgentIdentity) -> HashMap<String, String> {
         env.insert("OVERSEER_PARENT_ID".to_string(), parent_id.0.to_string());
     }
     env.insert("OVERSEER_REPO".to_string(), id.repo.to_string());
+    env.insert("OVERSEER_DEPTH".to_string(), id.depth.to_string());
     env
 }
 
@@ -197,7 +202,7 @@ mod tests {
     use std::path::Path;
 
     fn root_identity<'a>(agent_id: &'a AgentId, socket: &'a Path, repo: &'a str) -> AgentIdentity<'a> {
-        AgentIdentity { agent_id, role: &AgentRole::Root, parent_id: None, socket, repo }
+        AgentIdentity { agent_id, role: &AgentRole::Root, parent_id: None, socket, repo, depth: 1 }
     }
 
     #[test]
@@ -209,6 +214,7 @@ mod tests {
         assert_eq!(env.get("OVERSEER_SOCKET"), Some(&"/tmp/overseer.sock".to_string()));
         assert_eq!(env.get("OVERSEER_ROLE").map(String::as_str), Some("root"));
         assert_eq!(env.get("OVERSEER_REPO").map(String::as_str), Some("myrepo"));
+        assert_eq!(env.get("OVERSEER_DEPTH").map(String::as_str), Some("1"));
         assert!(!env.contains_key("OVERSEER_PARENT_ID"));
     }
 
@@ -223,10 +229,12 @@ mod tests {
             parent_id: Some(&parent),
             socket: &socket,
             repo: "myrepo",
+            depth: 2,
         };
         let env = identity_env(&identity);
         assert_eq!(env.get("OVERSEER_ROLE").map(String::as_str), Some("child"));
         assert_eq!(env.get("OVERSEER_PARENT_ID"), Some(&parent.0.to_string()));
+        assert_eq!(env.get("OVERSEER_DEPTH").map(String::as_str), Some("2"));
     }
 
     // ── installed_adapter_names ───────────────────────────────────────────────
@@ -277,6 +285,7 @@ mod tests {
             command: "claude".to_string(),
             extra_args: vec![],
             task: String::new(),
+            depth: 1,
         };
         let env = identity_env(&ctx.identity());
         assert_eq!(env.get("OVERSEER_AGENT_ID"), Some(&ctx.agent_id.0.to_string()));
