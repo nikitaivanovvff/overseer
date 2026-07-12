@@ -590,6 +590,113 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    /// Like `start_server`, but with a *real* `SessionManager` so tests can
+    /// exercise the live grid-streaming path (Watch/Scroll → `Output`), and
+    /// a handle to it for launching sessions directly.
+    fn start_server_with_real_sessions() -> (PathBuf, Arc<SessionManager>) {
+        let id = &uuid::Uuid::new_v4().to_string()[..8];
+        let socket = PathBuf::from(format!("/tmp/ovsr-{id}.sock"));
+        let sessions = Arc::new(SessionManager::new());
+        let ctx = Arc::new(AppCtx {
+            registry: Arc::new(AgentRegistry::new()),
+            sessions: sessions.clone(),
+            socket: socket.clone(),
+            git: Arc::new(GitClient::dry_run()),
+            config: Arc::new(crate::config::Config::default()),
+            watch_sessions: false,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        let socket_clone = socket.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = serve_blocking(ctx, socket_clone, Some(ready_tx));
+        });
+        ready_rx.recv().expect("server failed to start");
+        (socket, sessions)
+    }
+
+    /// A `Scroll` no longer replies with an inline snapshot — it marks the
+    /// connection's scroll-dirty flag and the 16ms output poller pushes the
+    /// fresh grid (coalescing however many notches land within one tick,
+    /// instead of a full ~1MB serialize+write per notch — a real, reported
+    /// TUI-freezing flood under a trackpad flick). This pins the user-visible
+    /// half of that contract: a scroll on a live, watched session still
+    /// produces an `Output` whose grid reflects the new offset — and a
+    /// clamped, no-op scroll (already at the live bottom) produces none.
+    #[test]
+    fn scroll_on_a_live_watched_session_streams_a_scrolled_grid_via_the_poller() {
+        let (socket, sessions) = start_server_with_real_sessions();
+        let agent_id = AgentId::new();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 100 ]; do echo \"line $i\"; i=$((i+1)); done; sleep 60"]);
+        sessions
+            .launch(agent_id.clone(), Path::new("/tmp"), &cmd, &std::collections::HashMap::new())
+            .expect("launch test session");
+        let produced = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sessions.generation(&agent_id).unwrap_or(0) > 0
+        });
+        assert!(produced, "session must produce output before there's history to scroll into");
+
+        let (mut stream, mut reader) = attach(&socket);
+        assert!(matches!(next_event(&mut reader), AttachEvent::Snapshot { .. }));
+        send_line(&mut stream, &Request::Watch { agent_id: agent_id.clone() });
+
+        // The immediate on-Watch snapshot (plus possibly a straggler from a
+        // generation bump racing it) arrives at the live bottom.
+        match next_event(&mut reader) {
+            AttachEvent::Output { grid, .. } => assert_eq!(grid.display_offset, 0),
+            other => panic!("expected the immediate on-Watch Output, got {other:?}"),
+        }
+
+        // Let the session's output burst fully settle so the poller has no
+        // generation-driven sends left to interleave below.
+        let mut last_gen = sessions.generation(&agent_id).unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let gen = sessions.generation(&agent_id).unwrap();
+            if gen == last_gen {
+                break;
+            }
+            last_gen = gen;
+        }
+        // Drain any generation-driven Outputs already in flight: bounded by
+        // the events actually queued, proven finished by a request the
+        // server must answer in order (a no-op scroll produces nothing, so
+        // use a real one below as the fence).
+
+        send_line(&mut stream, &Request::Scroll { delta: 10 });
+        let scrolled = (0..20)
+            .map(|_| next_event(&mut reader))
+            .find_map(|ev| match ev {
+                AttachEvent::Output { grid, .. } if grid.display_offset == 10 => Some(grid),
+                AttachEvent::Output { .. } => None,
+                other => panic!("expected only Output events here, got {other:?}"),
+            })
+            .expect("a scroll on a live watched session must stream a grid at the new offset");
+        assert_eq!(scrolled.display_offset, 10);
+
+        // Jump back to the bottom (real movement → one more Output)…
+        send_line(&mut stream, &Request::ScrollToBottom);
+        match next_event(&mut reader) {
+            AttachEvent::Output { grid, .. } => assert_eq!(grid.display_offset, 0),
+            other => panic!("expected the post-ScrollToBottom Output, got {other:?}"),
+        }
+        // …then a second ScrollToBottom at the bottom is a clamped no-op:
+        // no Output may follow. Prove it with an ordered fence rather than a
+        // sleep — the next thing on this stream must be the registry event
+        // from a fresh registration, not a grid.
+        send_line(&mut stream, &Request::ScrollToBottom);
+        let root_id = start_root(&socket);
+        match next_event(&mut reader) {
+            AttachEvent::AgentRegistered { agent } => assert_eq!(agent.id, root_id),
+            other => panic!("a clamped no-op scroll must not stream a grid, got {other:?}"),
+        }
+
+        sessions.kill(&agent_id);
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[test]
     fn scroll_with_nothing_watched_is_a_harmless_noop() {
         let socket = start_server();

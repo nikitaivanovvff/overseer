@@ -412,19 +412,37 @@ impl SessionManager {
     /// into scrollback), negative moves down (toward live). A no-op for an
     /// unknown id (already dropped, or dry-run mode, where no session is
     /// ever inserted).
-    pub fn scroll_display(&self, id: &AgentId, delta: i32) {
+    ///
+    /// Returns whether the display offset actually moved. `false` covers the
+    /// unknown-id no-op *and* a scroll already clamped at either end (at the
+    /// live bottom scrolling down, at the top of history scrolling up) — the
+    /// IPC scroll handler uses this to skip pushing a grid that would be
+    /// byte-identical to what the client already has (a held-down wheel at
+    /// the clamp used to stream full ~1MB snapshots per notch for no visual
+    /// change).
+    pub fn scroll_display(&self, id: &AgentId, delta: i32) -> bool {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(session) = sessions.get(id) {
-            session.term.lock().scroll_display(Scroll::Delta(delta));
+            let mut term = session.term.lock();
+            let before = term.grid().display_offset();
+            term.scroll_display(Scroll::Delta(delta));
+            term.grid().display_offset() != before
+        } else {
+            false
         }
     }
 
-    /// Jumps `id`'s terminal back to the live bottom — same no-op rules as
-    /// `scroll_display`.
-    pub fn scroll_to_bottom(&self, id: &AgentId) {
+    /// Jumps `id`'s terminal back to the live bottom — same no-op rules and
+    /// same "did the offset move" return contract as `scroll_display`.
+    pub fn scroll_to_bottom(&self, id: &AgentId) -> bool {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(session) = sessions.get(id) {
-            session.term.lock().scroll_display(Scroll::Bottom);
+            let mut term = session.term.lock();
+            let before = term.grid().display_offset();
+            term.scroll_display(Scroll::Bottom);
+            before != 0
+        } else {
+            false
         }
     }
 
@@ -863,11 +881,11 @@ mod tests {
         assert!(became_dirty, "session must have produced output to scroll through");
 
         assert_eq!(s.display_offset(&id), 0, "a fresh session starts at the live bottom");
-        s.scroll_display(&id, 10);
+        assert!(s.scroll_display(&id, 10), "moving into real history must report movement");
         assert_eq!(s.display_offset(&id), 10);
-        s.scroll_display(&id, 5);
+        assert!(s.scroll_display(&id, 5));
         assert_eq!(s.display_offset(&id), 15);
-        s.scroll_to_bottom(&id);
+        assert!(s.scroll_to_bottom(&id), "leaving a scrolled position must report movement");
         assert_eq!(s.display_offset(&id), 0);
 
         s.kill(&id);
@@ -913,6 +931,40 @@ mod tests {
         s.resize_all(100, 30);
         let grid = s.grid_snapshot(&id).expect("session must still render");
         assert_eq!((grid.cols, grid.lines), (100, 30), "a real resize must still apply");
+
+        s.kill(&id);
+    }
+
+    /// The `bool` return is what lets the IPC scroll handler skip pushing a
+    /// grid that would be identical to what the client already has — a
+    /// held-down wheel at the clamp used to stream a full snapshot per notch
+    /// for zero visual change. Pin the contract at both clamps.
+    #[test]
+    fn scroll_at_the_clamp_reports_no_movement() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 100 ]; do echo \"line $i\"; i=$((i+1)); done; sleep 60"]);
+        s.launch(id.clone(), &PathBuf::from("/tmp"), &cmd, &HashMap::new()).unwrap();
+
+        let became_dirty = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.generation(&id).unwrap_or(0) > 0
+        });
+        assert!(became_dirty, "session must have produced output to scroll through");
+
+        // Already at the live bottom: scrolling further down (or jumping to
+        // the bottom) moves nothing.
+        assert!(!s.scroll_display(&id, -3), "scrolling down at the live bottom must report no movement");
+        assert!(!s.scroll_to_bottom(&id), "scroll_to_bottom at the bottom must report no movement");
+
+        // Way past the top of history: the offset clamps, so a second huge
+        // scroll up moves nothing either.
+        assert!(s.scroll_display(&id, 1_000_000), "the first jump toward the top is real movement");
+        let top = s.display_offset(&id);
+        assert!(top > 0);
+        assert!(!s.scroll_display(&id, 1_000_000), "scrolling up while clamped at the top must report no movement");
+        assert_eq!(s.display_offset(&id), top);
 
         s.kill(&id);
     }
@@ -977,6 +1029,13 @@ mod tests {
         assert!(!s.is_alive(&id), "the session must not look alive after its reader died");
 
         s.kill(&id);
+    }
+
+    #[test]
+    fn scroll_display_and_scroll_to_bottom_report_no_movement_for_an_unknown_id() {
+        let s = SessionManager::dry_run();
+        assert!(!s.scroll_display(&AgentId::new(), 5));
+        assert!(!s.scroll_to_bottom(&AgentId::new()));
     }
 
     // ── grid_snapshot_from_term / dto_color (pure) ───────────────────────────

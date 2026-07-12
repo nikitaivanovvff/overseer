@@ -32,7 +32,11 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        // Mirror the full arming sequence below, bracketed paste included —
+        // leaving any of these modes armed past our exit wedges the host
+        // terminal (mouse capture especially: every wheel/click keeps
+        // emitting escape sequences into whatever shell prompt follows).
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
         default_panic(info);
     }));
 
@@ -206,37 +210,69 @@ fn run_app<B: ratatui::backend::Backend>(
         // (SCALE.md: ~0.4ms for a 50-node tree, even unoptimized) that the
         // extra wake-ups cost is negligible against the responsiveness win.
         if event::poll(Duration::from_millis(16))? {
-            match event::read()? {
-                Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                    if app.show_help {
-                        // Any key closes it (PHASE5B.md) — doesn't matter
-                        // which, so this comes before focus/input dispatch.
-                        app.show_help = false;
-                    } else {
-                        match app.focus {
-                            Focus::Pane => handle_pane_key(app, key),
-                            Focus::Tree => {
-                                if app.picker.is_some() {
-                                    handle_picker_key(app, key, keybindings);
-                                } else if app.input.is_some() {
-                                    handle_input_key(app, key);
-                                } else if app.confirm.is_some() {
-                                    if !handle_confirm_key(app, key) {
+            // Drain *everything* already queued this frame instead of one
+            // event per 16ms iteration. A trackpad flick delivers dozens of
+            // wheel notches (or, on wheel-as-arrows terminals, synthetic
+            // Up/Down keys) nearly at once — at one-per-frame they used to
+            // keep draining (and each firing its own `Request::Scroll` with
+            // a full ~1MB grid reply) for seconds after the gesture ended.
+            // Scroll intents coalesce into one net delta flushed as at most
+            // one `App::scroll` per frame; a flick that nets to zero sends
+            // nothing at all. Everything else (keys, clicks, paste) is
+            // handled in arrival order exactly as before. The cap keeps a
+            // pathological flood (e.g. a mouse-motion storm under capture)
+            // from starving rendering; leftovers are simply next frame's
+            // first drain.
+            let mut pending_scroll: i32 = 0;
+            let mut quit = false;
+            for _ in 0..MAX_EVENTS_PER_FRAME {
+                match event::read()? {
+                    Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                        if let Some(delta) = tree_arrow_scroll_delta(app, &key) {
+                            pending_scroll += delta;
+                        } else if app.show_help {
+                            // Any key closes it (PHASE5B.md) — doesn't matter
+                            // which, so this comes before focus/input dispatch.
+                            app.show_help = false;
+                        } else {
+                            match app.focus {
+                                Focus::Pane => handle_pane_key(app, key),
+                                Focus::Tree => {
+                                    if app.picker.is_some() {
+                                        handle_picker_key(app, key, keybindings);
+                                    } else if app.input.is_some() {
+                                        handle_input_key(app, key);
+                                    } else if app.confirm.is_some() {
+                                        if !handle_confirm_key(app, key) {
+                                            quit = true;
+                                            break;
+                                        }
+                                    } else if !handle_tree_key(app, key, pane_rect.height, keybindings) {
+                                        quit = true;
                                         break;
                                     }
-                                } else if !handle_tree_key(app, key, pane_rect.height, keybindings) {
-                                    break;
                                 }
                             }
                         }
                     }
+                    Event::Paste(text) if app.focus == Focus::Pane => forward_paste(app, &text),
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                        handle_left_click(app, &layout, mouse);
+                    }
+                    Event::Mouse(mouse) => pending_scroll += wheel_scroll_delta(&mouse, pane_rect),
+                    _ => {}
                 }
-                Event::Paste(text) if app.focus == Focus::Pane => forward_paste(app, &text),
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    handle_left_click(app, &layout, mouse);
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                Event::Mouse(mouse) => handle_mouse_event(app, mouse, pane_rect, selected_id.as_ref()),
-                _ => {}
+            }
+            // Flushed against the frame-start selection: if a j/k mid-drain
+            // moved the cursor, the scroll lands on the previously selected
+            // agent and the next frame's selection-change reset (above)
+            // snaps the new one to the live bottom anyway.
+            apply_pending_scroll(app, selected_id.as_ref(), pending_scroll);
+            if quit {
+                break;
             }
         }
 
@@ -341,7 +377,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: 
 /// check and scroll reset live in one place. Works from *either* focus state:
 /// intercepting a click while a pane is focused steals nothing from the
 /// agent's TUI, because no mouse forwarding exists at all (same argument as
-/// the wheel — see `handle_mouse_event`). A click on an already-focused pane
+/// the wheel — see `wheel_scroll_delta`). A click on an already-focused pane
 /// is a no-op rather than a re-`jump_in`, so it never resets a wheel-scrolled
 /// position back to the live bottom. Clicks while any modal is open (search
 /// input, spawn input, root-spawn adapter picker, drop/shutdown confirm, help
@@ -389,8 +425,20 @@ fn start_search(app: &mut App) {
 /// (3 lines), not tied to `Ctrl-y`/`Ctrl-e`'s single-line nvim semantics.
 const MOUSE_SCROLL_LINES: i32 = 3;
 
-/// Mouse wheel over the pane scrolls the selected agent's history, in
-/// *both* `Focus::Tree` (alongside the existing `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/
+/// Upper bound on input events drained in one frame of `run_app`'s loop.
+/// High enough that no human-generated burst ever hits it (a very fast
+/// trackpad flick is a few dozen events), low enough that a pathological
+/// flood can't postpone rendering indefinitely — anything left over is
+/// simply the first thing read next frame, 16ms later.
+const MAX_EVENTS_PER_FRAME: usize = 128;
+
+/// The mouse wheel's contribution to this frame's pending scroll delta —
+/// positive is up into history, matching `App::scroll`. Zero for anything
+/// that isn't a wheel event over the pane rect (clicks are handled
+/// separately; a wheel over the tree half is ignored).
+///
+/// Wheel-over-pane scrolls the selected agent's history in *both*
+/// `Focus::Tree` (alongside the existing `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/
 /// `Ctrl-e`/`G` preview keys) and `Focus::Pane` — the jumped-in case, where
 /// no keyboard key can do this without stealing something the agent's own
 /// TUI needs (SCROLLBACK.md / AGENTS.md "Keybinding house style"). This is
@@ -399,19 +447,68 @@ const MOUSE_SCROLL_LINES: i32 = 3;
 /// agent runs in its own PTY (`session::pty`) that only ever receives bytes
 /// Overseer explicitly writes to it (`encode_key`/`encode_paste`) — no
 /// mouse forwarding exists, so a scroll event was never reaching the
-/// agent's TUI in the first place. Scoped to `ScrollUp`/`ScrollDown` only
-/// (not clicks) and to `pane_rect` so it never fires while the mouse is
-/// over the tree half.
-fn handle_mouse_event(app: &mut App, mouse: MouseEvent, pane_rect: Rect, selected_id: Option<&AgentId>) {
+/// agent's TUI in the first place.
+///
+/// Returning a delta instead of applying it immediately is deliberate: the
+/// event-drain loop in `run_app` sums every scroll intent in the frame and
+/// flushes once (`apply_pending_scroll`), so a trackpad flick costs one
+/// `Request::Scroll` instead of one per notch — each of which used to pull
+/// a full ~1MB grid snapshot back over the attach connection (a real,
+/// reported TUI-freezing flood).
+fn wheel_scroll_delta(mouse: &MouseEvent, pane_rect: Rect) -> i32 {
     if !pane_rect.contains(Position::new(mouse.column, mouse.row)) {
+        return 0;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp => MOUSE_SCROLL_LINES,
+        MouseEventKind::ScrollDown => -MOUSE_SCROLL_LINES,
+        _ => 0,
+    }
+}
+
+/// The keyboard-arrow contribution to this frame's pending scroll delta:
+/// while the *tree* is focused with no modal open, a plain `Up`/`Down`
+/// scrolls the selected agent's pane preview one wheel notch, exactly like
+/// the mouse wheel — `None` means "not a scroll intent, dispatch normally".
+///
+/// This exists for terminals that never deliver a real xterm wheel report
+/// even with mouse capture armed and instead translate wheel motion into
+/// synthetic arrow-key presses (macOS Terminal.app; Kaku's WezTerm-derived
+/// alternate-scroll path) — routing tree-focus arrows to preview scroll
+/// makes the trackpad work there for free. It's safe within the house
+/// rules because arrows were previously *unbound* in tree focus (`j`/`k`
+/// is the navigation vocabulary, `key_binding_from_event` doesn't even map
+/// arrow keys), so nothing is stolen — and it changes nothing while a pane
+/// is focused: there arrows still forward to the agent untouched (`Ctrl-h`
+/// stays the only intercepted key, pinned by
+/// `arrow_keys_forward_to_the_agent_while_pane_is_focused_not_scroll`).
+fn tree_arrow_scroll_delta(app: &App, key: &KeyEvent) -> Option<i32> {
+    if app.focus != Focus::Tree
+        || app.show_help
+        || app.picker.is_some()
+        || app.input.is_some()
+        || app.confirm.is_some()
+        || key.modifiers != KeyModifiers::NONE
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(MOUSE_SCROLL_LINES),
+        KeyCode::Down => Some(-MOUSE_SCROLL_LINES),
+        _ => None,
+    }
+}
+
+/// Flushes one frame's coalesced scroll delta to the selected agent — the
+/// single `App::scroll` call a whole frame's worth of wheel notches and
+/// synthetic arrows collapses into. A net-zero delta (or no selection)
+/// sends nothing at all.
+fn apply_pending_scroll(app: &mut App, selected_id: Option<&AgentId>, delta: i32) {
+    if delta == 0 {
         return;
     }
     let Some(id) = selected_id else { return };
-    match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll(id, MOUSE_SCROLL_LINES),
-        MouseEventKind::ScrollDown => app.scroll(id, -MOUSE_SCROLL_LINES),
-        _ => {}
-    }
+    app.scroll(id, delta);
 }
 
 fn scroll_selected(app: &mut App, delta: i32) {
@@ -981,6 +1078,14 @@ mod tests {
         MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
     }
 
+    /// One wheel notch, end to end, exactly as `run_app`'s drain-then-flush
+    /// composes it in production: extract the event's delta, flush it as the
+    /// frame's pending scroll.
+    fn wheel(app: &mut App, ev: MouseEvent, pane_rect: Rect, selected_id: Option<&AgentId>) {
+        let delta = wheel_scroll_delta(&ev, pane_rect);
+        apply_pending_scroll(app, selected_id, delta);
+    }
+
     #[test]
     fn mouse_scroll_up_moves_into_history_while_pane_is_focused() {
         let id = AgentId::new();
@@ -989,7 +1094,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Pane);
 
         let pane_rect = Rect::new(0, 0, 80, 20);
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
 
         assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
         ctx.sessions.kill(&id);
@@ -1002,9 +1107,9 @@ mod tests {
         jump_in(&mut app);
 
         let pane_rect = Rect::new(0, 0, 80, 20);
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollDown, 10, 10), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollDown, 10, 10), pane_rect, Some(&id));
 
         assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
         ctx.sessions.kill(&id);
@@ -1019,7 +1124,7 @@ mod tests {
         // Pane occupies columns/rows [0,80)x[0,20) — (90, 25) is outside it
         // (e.g. over the tree half or the status bar).
         let pane_rect = Rect::new(0, 0, 80, 20);
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 90, 25), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 90, 25), pane_rect, Some(&id));
 
         assert_eq!(ctx.sessions.display_offset(&id), 0, "scroll outside the pane must not move it");
         ctx.sessions.kill(&id);
@@ -1032,7 +1137,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Tree);
 
         let pane_rect = Rect::new(0, 0, 80, 20);
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, Some(&id));
 
         assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
         ctx.sessions.kill(&id);
@@ -1042,7 +1147,7 @@ mod tests {
     fn mouse_scroll_with_no_selection_does_not_panic() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         let pane_rect = Rect::new(0, 0, 80, 20);
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, None);
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect, None);
     }
 
     #[test]
@@ -1075,6 +1180,91 @@ mod tests {
             0,
             "arrow keys must not scroll — they forward to the agent's PTY untouched"
         );
+
+        ctx.sessions.kill(&id);
+    }
+
+    /// The tree-focus complement to the pinned pane-focus test above: while
+    /// the tree is focused the pane is a read-only preview (nothing forwards
+    /// to the agent), so plain Up/Down — previously unbound there — safely
+    /// become one-wheel-notch preview scrolls. This is the whole fallback
+    /// for terminals that translate wheel motion into synthetic arrow keys
+    /// (Terminal.app, Kaku's alternate-scroll path): their "wheel" now
+    /// scrolls the preview exactly like a real wheel report would.
+    #[test]
+    fn tree_focus_arrow_keys_scroll_the_selected_pane_preview() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        assert_eq!(app.focus, Focus::Tree);
+
+        let up = tree_arrow_scroll_delta(&app, &key(KeyCode::Up, KeyModifiers::NONE))
+            .expect("Up in tree focus is a scroll intent");
+        apply_pending_scroll(&mut app, Some(&id), up);
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
+
+        let down = tree_arrow_scroll_delta(&app, &key(KeyCode::Down, KeyModifiers::NONE))
+            .expect("Down in tree focus is a scroll intent");
+        apply_pending_scroll(&mut app, Some(&id), down);
+        assert_eq!(ctx.sessions.display_offset(&id), 0, "Down scrolls back toward live");
+
+        ctx.sessions.kill(&id);
+    }
+
+    #[test]
+    fn arrow_scroll_intent_is_suppressed_while_focused_modal_or_modified() {
+        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
+        let up = key(KeyCode::Up, KeyModifiers::NONE);
+
+        app.focus = Focus::Pane;
+        assert_eq!(tree_arrow_scroll_delta(&app, &up), None, "pane focus: arrows forward to the agent");
+        app.focus = Focus::Tree;
+
+        assert!(tree_arrow_scroll_delta(&app, &up).is_some(), "sanity: plain tree focus is a scroll intent");
+
+        app.show_help = true;
+        assert_eq!(tree_arrow_scroll_delta(&app, &up), None, "help popup: any key must close it instead");
+        app.show_help = false;
+
+        app.input = Some(InputState { action: PendingAction::Search, buffer: String::new() });
+        assert_eq!(tree_arrow_scroll_delta(&app, &up), None, "open input prompt: keys belong to it");
+        app.input = None;
+
+        assert_eq!(
+            tree_arrow_scroll_delta(&app, &key(KeyCode::Up, KeyModifiers::SHIFT)),
+            None,
+            "modified arrows are not wheel translations — leave them unbound"
+        );
+    }
+
+    /// One frame's worth of wheel notches (or synthetic arrows) collapses
+    /// into a single flushed delta — and a flick that nets to zero flushes
+    /// nothing at all. This is the client half of the scroll-flood fix: per
+    /// notch, the old path sent one `Request::Scroll` and got a full ~1MB
+    /// grid back, which a trackpad flick turned into seconds of queued
+    /// serialize/parse work (a real, reported TUI freeze).
+    #[test]
+    fn a_frames_scroll_intents_coalesce_into_one_net_delta() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        let pane_rect = Rect::new(0, 0, 80, 20);
+
+        // up + up + down, all in one frame → one flush of net +3.
+        let mut pending = 0;
+        pending += wheel_scroll_delta(&mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect);
+        pending += wheel_scroll_delta(&mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect);
+        pending += wheel_scroll_delta(&mouse(MouseEventKind::ScrollDown, 10, 10), pane_rect);
+        assert_eq!(pending, MOUSE_SCROLL_LINES);
+        apply_pending_scroll(&mut app, Some(&id), pending);
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize);
+
+        // A net-zero flick flushes nothing (delta 0 short-circuits before
+        // any backend call — in daemon mode that's "no request at all").
+        let mut pending = 0;
+        pending += wheel_scroll_delta(&mouse(MouseEventKind::ScrollUp, 10, 10), pane_rect);
+        pending += wheel_scroll_delta(&mouse(MouseEventKind::ScrollDown, 10, 10), pane_rect);
+        assert_eq!(pending, 0);
+        apply_pending_scroll(&mut app, Some(&id), pending);
+        assert_eq!(ctx.sessions.display_offset(&id), MOUSE_SCROLL_LINES as usize, "net-zero must move nothing");
 
         ctx.sessions.kill(&id);
     }
@@ -1443,7 +1633,7 @@ mod tests {
             tree_rect: Rect { x: 0, y: 0, width: 30, height: 10 },
             tree_rows: vec![id.clone()],
         };
-        handle_mouse_event(&mut app, mouse(MouseEventKind::ScrollUp, 45, 5), pane_rect, Some(&id));
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 45, 5), pane_rect, Some(&id));
         let scrolled = ctx.sessions.display_offset(&id);
         assert!(scrolled > 0, "wheel must have scrolled into history first");
 
