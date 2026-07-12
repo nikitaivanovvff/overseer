@@ -381,12 +381,11 @@ mod tests {
             Some(OkBody::Agent { agent }) => agent,
             other => panic!("expected Agent, got {other:?}"),
         };
-        // Adapter label is the chosen adapter, not "shell" — but the PTY
-        // child launched is a live shell with the harness command typed
-        // into it (ROOT-SHELL-FALLBACK), so status is Idle, same as a
-        // bare-shell root's starting state.
+        // Adapter label is the chosen adapter, not "shell". The PTY child is
+        // still a live shell, but it stays Spawning so the TUI can hide the
+        // typed harness command until the harness reports initialization.
         assert_eq!(dto.adapter, "claude");
-        assert_eq!(dto.status, AgentStatus::Idle);
+        assert_eq!(dto.status, AgentStatus::Spawning);
         // Still named after the repo, same as the bare-shell root.
         assert_eq!(dto.name, "test-repo");
     }
