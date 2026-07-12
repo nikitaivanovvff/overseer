@@ -214,18 +214,24 @@ assert "registry shows 2 agents" "$(agent_count)" "2"
 assert "child's parent_id is the root" \
     "$(list_json | jq -r --arg id "$CHILD_ID" '.data.agents[] | select(.id==$id) | .parent_id')" "$ROOT_ID"
 
-echo "-- reject a grandchild (child spawning its own child) --"
-if ov_as "$CHILD_ID" "$TEST_REPO" spawn --task "grandchild-cli" >/tmp/spawn_gc.out 2>&1; then
-    fail "grandchild spawn should have been rejected"
+echo "-- allow a grandchild, then reject depth four --"
+RESP="$(ov_as "$CHILD_ID" "$TEST_REPO" spawn --task "grandchild-cli")"
+GRANDCHILD_ID="$(printf '%s' "$RESP" | jq -r '.data.agent_id')"
+wait_for_pty_alive "$GRANDCHILD_ID"
+assert "grandchild's parent_id is the child" \
+    "$(list_json | jq -r --arg id "$GRANDCHILD_ID" '.data.agents[] | select(.id==$id) | .parent_id')" "$CHILD_ID"
+if ov_as "$GRANDCHILD_ID" "$TEST_REPO" spawn --task "too-deep-cli" >/tmp/spawn_gc.out 2>&1; then
+    fail "depth-four spawn should have been rejected"
 else
-    assert_contains "grandchild spawn rejected with the right message" \
-        "$(cat /tmp/spawn_gc.out)" "cannot spawn"
+    assert_contains "depth-four spawn rejected with the right message" \
+        "$(cat /tmp/spawn_gc.out)" "max depth"
 fi
-assert "registry still shows 2 agents (grandchild not created)" "$(agent_count)" "2"
+assert "registry shows the three-level tree" "$(agent_count)" "3"
 
-echo "-- drop the child (non-root) --"
-ov drop "$CHILD_ID" >/dev/null
+echo "-- recursively drop the child subtree --"
+ov drop "$CHILD_ID" --recursive >/dev/null
 wait_for_pty_gone "$CHILD_ID"
+wait_for_pty_gone "$GRANDCHILD_ID"
 assert "child pty is gone" "$(pty_alive "$CHILD_ID" && echo yes || echo no)" "no"
 assert "registry shows 1 agent" "$(agent_count)" "1"
 
@@ -279,22 +285,30 @@ CHILD_A="$(agent_id_by_name tui-child-a)"
 wait_for_pty_alive "$CHILD_A"
 assert "child pty is alive" "$(pty_alive "$CHILD_A" && echo yes || echo no)" "yes"
 
-echo "-- 'j' then 's' on a child: spawning under a child is refused server-side --"
-# The TUI no longer pre-checks this client-side (AGENTS.md: the "no grandchildren"
-# rule lives only in the server's Spawn handler) — it opens the input prompt like
-# normal and the rejection comes back after Enter, same as any other spawn failure.
+echo "-- 'j' then 's' on a child: spawn a visible grandchild --"
 tui_key j
 tui_key s
-tui_text "would-be-grandchild"
+tui_text "tui-grandchild"
+tui_enter
+assert "grandchild was created" "$(agent_count)" "3"
+GRANDCHILD_A="$(agent_id_by_name tui-grandchild)"
+wait_for_pty_alive "$GRANDCHILD_A"
+
+echo "-- 'j' then 's' on a grandchild: depth-four spawn is refused server-side --"
+tui_key j
+tui_key s
+tui_text "would-be-depth-four"
 tui_enter
 assert_contains "status bar explains why" "$(pane)" "cannot spawn"
-assert "no grandchild was created" "$(agent_count)" "2"
+assert "no depth-four agent was created" "$(agent_count)" "3"
 
-echo "-- 'd' + 'y' on the child: drop succeeds --"
-tui_key d
+echo "-- 'k' then 'D' + 'y' on the child: recursive drop succeeds --"
+tui_key k
+tui_key D
 assert_contains "confirm prompt shown" "$(pane)" "drop 'tui-child-a'"
 tui_key y
 wait_for_pty_gone "$CHILD_A"
+wait_for_pty_gone "$GRANDCHILD_A"
 assert "child removed from registry" "$(agent_count)" "1"
 assert "child pty is gone" "$(pty_alive "$CHILD_A" && echo yes || echo no)" "no"
 

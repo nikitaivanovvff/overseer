@@ -93,6 +93,23 @@ impl AgentTree {
         result
     }
 
+    /// Returns the agent's one-based depth (workspace = 1), derived from the tree.
+    pub fn depth(&self, id: &AgentId) -> Option<usize> {
+        fn find(nodes: &[AgentNode], id: &AgentId, depth: usize) -> Option<usize> {
+            for node in nodes {
+                if &node.id == id {
+                    return Some(depth);
+                }
+                if let Some(found) = find(&node.children, id, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        find(&self.roots, id, 1)
+    }
+
     /// Returns (running, blocked, total) counts across ALL agents, ignoring
     /// expand/collapse state.
     pub fn agent_counts(&self) -> (usize, usize, usize) {

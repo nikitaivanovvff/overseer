@@ -135,8 +135,17 @@ mod tests {
     fn drop_recursive_removes_whole_subtree() {
         let (registry, sessions) = make_registry_and_sessions();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        let grandchild_id = spawn(&registry, &sessions, AgentRole::Child, Some(child_id.clone()));
         spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
-        spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+
+        let postorder = registry.with_tree(|tree| tree.subtree_ids_postorder(&root_id)).unwrap();
+        assert!(
+            postorder.iter().position(|id| id == &grandchild_id).unwrap()
+                < postorder.iter().position(|id| id == &child_id).unwrap()
+        );
+        assert_eq!(postorder.last(), Some(&root_id));
+
         drop_agent(&registry, &sessions, &root_id, true, true).unwrap();
         assert!(registry.snapshot().is_empty());
     }

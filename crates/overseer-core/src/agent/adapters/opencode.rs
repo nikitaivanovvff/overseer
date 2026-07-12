@@ -194,6 +194,7 @@ mod tests {
             command: "opencode".to_string(),
             extra_args: vec![],
             task: String::new(),
+            depth: 1,
         }
     }
 
@@ -208,6 +209,7 @@ mod tests {
             command: "opencode".to_string(),
             extra_args: vec![],
             task: "write unit tests for the login flow".to_string(),
+            depth: 2,
         }
     }
 
@@ -295,6 +297,13 @@ mod tests {
     fn child_instructions_guard_on_role_and_document_done_status() {
         assert!(CHILD_INSTRUCTIONS_CONTENT.contains("OVERSEER_ROLE=child"));
         assert!(CHILD_INSTRUCTIONS_CONTENT.contains("overseer status done"));
+    }
+
+    #[test]
+    fn child_instructions_require_visible_delegation_and_document_depth_three() {
+        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("never your harness's built-in"));
+        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("read-only lookup"));
+        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("OVERSEER_DEPTH"));
     }
 
     #[test]

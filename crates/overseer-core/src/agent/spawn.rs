@@ -123,6 +123,7 @@ fn spawn_root_bare_shell(
         parent_id: None,
         socket,
         repo: &req.repo,
+        depth: 1,
     };
     let env = identity_env(&identity);
     let cmd = Command::new(resolve_shell());
@@ -191,6 +192,7 @@ fn spawn_root_with_adapter(
         command: adapter_config.command.clone(),
         extra_args: adapter_config.extra_args.clone(),
         task: String::new(), // a root has no task, same as the bare-shell path
+        depth: 1,
     };
     // The harness invocation to type in, not to exec directly — see the
     // doc comment above for why exec'ing it here would recreate the bug.
@@ -287,6 +289,9 @@ fn spawn_child_agent(
         initial_status: AgentStatus::Spawning,
     };
     let result = registry.register(args)?;
+    let depth = registry
+        .with_tree(|tree| tree.depth(&result.id))
+        .expect("newly registered child must be in tree");
 
     let launch_ctx = LaunchContext {
         agent_id: result.id.clone(),
@@ -298,6 +303,7 @@ fn spawn_child_agent(
         command: adapter_config.command.clone(),
         extra_args: adapter_config.extra_args.clone(),
         task: req.task,
+        depth,
     };
 
     if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
@@ -331,6 +337,7 @@ mod tests {
             command: "claude".to_string(),
             extra_args: vec![],
             task: String::new(),
+            depth: 1,
         };
         launch(&ctx, &adapter, &sessions).unwrap();
     }

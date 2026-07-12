@@ -60,7 +60,7 @@ The rule of thumb: **if the change should hold for every frontend, it goes in
 it goes in `overseer`.**
 
 Change in `overseer-core`:
-- Agent lifecycle semantics: spawn/drop rules (e.g. "no grandchildren"), status meanings, staleness guards
+- Agent lifecycle semantics: depth/cap spawn rules, drop rules, status meanings, staleness guards
 - Anything about the daemon, the socket, or the wire protocol (`Request`/`Response`/`AttachEvent`/`GridSnapshot`)
 - PTY/terminal-emulation behavior and extraction of input-relevant terminal modes (`session/pty.rs` — the only `alacritty_terminal` importer in the workspace)
 - Adapters: a new harness, install files, launch commands, hook wiring

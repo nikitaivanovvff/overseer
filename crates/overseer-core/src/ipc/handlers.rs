@@ -112,10 +112,19 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                     parent.adapter.clone()
                 }
             });
-            // The one and only "no grandchildren" check (AGENTS.md) — not duplicated
-            // anywhere else, including the TUI, which routes through this same arm.
-            if parent.role == AgentRole::Child {
-                return Response::err("children cannot spawn further agents".to_string());
+            // The one and only hierarchy/cost admission check. Depth is
+            // derived from the parent chain; the TUI routes through this arm.
+            let Some((parent_depth, child_count)) = ctx.registry.spawn_metrics(&parent_id) else {
+                return Response::err(format!("unknown agent: {}", parent_id.short()));
+            };
+            if parent_depth >= 3 {
+                return Response::err("agents at max depth cannot spawn further agents".to_string());
+            }
+            if child_count >= ctx.config.defaults.max_children {
+                return Response::err(format!(
+                    "agent reached max_children cap of {}",
+                    ctx.config.defaults.max_children
+                ));
             }
 
             let req = SpawnRequest {
@@ -421,6 +430,23 @@ mod tests {
         }
     }
 
+    fn spawn_child(ctx: &AppCtx, parent_id: AgentId, task: &str) -> Response {
+        dispatch(ctx, Request::Spawn {
+            parent_id,
+            task: task.to_string(),
+            name: None,
+            adapter: Some("claude".to_string()),
+            cwd: PathBuf::from("/tmp"),
+        })
+    }
+
+    fn registered_id(response: Response) -> AgentId {
+        match response.data {
+            Some(OkBody::Registered { agent_id, .. }) => agent_id,
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
     #[test]
     fn dispatch_spawn_under_root_succeeds() {
         let ctx = make_ctx();
@@ -506,31 +532,32 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_spawn_under_child_is_rejected() {
+    fn dispatch_spawn_allows_depth_three_and_rejects_depth_four() {
         let ctx = make_ctx();
         let root_id = start_root(&ctx);
-        let spawn_resp = dispatch(&ctx, Request::Spawn {
-            parent_id: root_id,
-            task: "child task".to_string(),
-            name: None,
-            adapter: Some("claude".to_string()),
-            cwd: PathBuf::from("/tmp"),
-        });
-        let child_id = match spawn_resp.data {
-            Some(OkBody::Registered { agent_id, .. }) => agent_id,
-            other => panic!("expected Registered, got {other:?}"),
-        };
+        let child_id = registered_id(spawn_child(&ctx, root_id, "child task"));
+        let grandchild_id = registered_id(spawn_child(&ctx, child_id, "grandchild task"));
 
-        // A child trying to spawn its own child — the one "no grandchildren" check.
-        let resp = dispatch(&ctx, Request::Spawn {
-            parent_id: child_id,
-            task: "grandchild task".to_string(),
-            name: None,
-            adapter: Some("claude".to_string()),
-            cwd: PathBuf::from("/tmp"),
-        });
+        assert_eq!(ctx.registry.spawn_metrics(&grandchild_id).map(|m| m.0), Some(3));
+        let resp = spawn_child(&ctx, grandchild_id, "too deep");
         assert!(!resp.ok);
-        assert!(resp.error.as_deref().unwrap_or("").contains("cannot spawn"));
+        assert!(resp.error.as_deref().unwrap_or("").contains("max depth"));
+        assert_eq!(ctx.registry.snapshot().len(), 3);
+    }
+
+    #[test]
+    fn dispatch_spawn_enforces_per_parent_child_cap() {
+        let mut ctx = make_ctx();
+        Arc::get_mut(&mut ctx.config).unwrap().defaults.max_children = 2;
+        let root_id = start_root(&ctx);
+
+        assert!(spawn_child(&ctx, root_id.clone(), "one").ok);
+        assert!(spawn_child(&ctx, root_id.clone(), "two").ok);
+        let resp = spawn_child(&ctx, root_id, "three");
+
+        assert!(!resp.ok);
+        assert!(resp.error.as_deref().unwrap_or("").contains("max_children cap of 2"));
+        assert_eq!(ctx.registry.snapshot().len(), 3);
     }
 
     #[test]

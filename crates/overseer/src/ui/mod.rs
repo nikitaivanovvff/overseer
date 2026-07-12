@@ -1109,6 +1109,26 @@ mod tests {
     }
 
     #[test]
+    fn three_level_tree_indents_and_folds_grandchildren() {
+        let grandchild = node("lookup", vec![]);
+        let grandchild_id = grandchild.id.clone();
+        let child = node("implementation", vec![grandchild]);
+        let child_id = child.id.clone();
+        let root = node("workspace", vec![child]);
+        let mut tree = AgentTree::new();
+        tree.add_root(root);
+
+        let flat = tree.flatten();
+        assert_eq!(flat.iter().map(|n| n.prefix.as_str()).collect::<Vec<_>>(), vec!["", "└ ", "  └ "]);
+        assert_eq!(flat[2].id, grandchild_id);
+
+        tree.find_mut(&child_id).unwrap().expanded = false;
+        let folded = tree.flatten();
+        assert_eq!(folded.len(), 2);
+        assert!(!folded.iter().any(|n| n.id == grandchild_id));
+    }
+
+    #[test]
     fn hit_test_tree_selects_the_row_clicked_with_a_fold_active() {
         let tree = click_tree();
         let flat = tree.flatten();
