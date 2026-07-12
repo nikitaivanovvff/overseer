@@ -259,7 +259,9 @@ fn run_app<B: ratatui::backend::Backend>(
                     Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                         handle_left_click(app, &layout, mouse);
                     }
-                    Event::Mouse(mouse) => pending_scroll += wheel_scroll_delta(&mouse, pane_rect),
+                    Event::Mouse(mouse) => {
+                        pending_scroll += handle_mouse_wheel(app, &mouse, pane_rect);
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -376,8 +378,7 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: 
 /// the pane jumps in — mirroring `Enter`/`o` via `jump_in`, so the alive
 /// check and scroll reset live in one place. Works from *either* focus state:
 /// intercepting a click while a pane is focused steals nothing from the
-/// agent's TUI, because no mouse forwarding exists at all (same argument as
-/// the wheel — see `wheel_scroll_delta`). A click on an already-focused pane
+/// agent's TUI because Overseer forwards wheel reports, not UI clicks. A click on an already-focused pane
 /// is a no-op rather than a re-`jump_in`, so it never resets a wheel-scrolled
 /// position back to the live bottom. Clicks while any modal is open (search
 /// input, spawn input, root-spawn adapter picker, drop/shutdown confirm, help
@@ -437,17 +438,9 @@ const MAX_EVENTS_PER_FRAME: usize = 128;
 /// that isn't a wheel event over the pane rect (clicks are handled
 /// separately; a wheel over the tree half is ignored).
 ///
-/// Wheel-over-pane scrolls the selected agent's history in *both*
-/// `Focus::Tree` (alongside the existing `Ctrl-u`/`Ctrl-d`/`Ctrl-y`/
-/// `Ctrl-e`/`G` preview keys) and `Focus::Pane` — the jumped-in case, where
-/// no keyboard key can do this without stealing something the agent's own
-/// TUI needs (SCROLLBACK.md / AGENTS.md "Keybinding house style"). This is
-/// safe specifically because it steals nothing: `EnableMouseCapture` is
-/// armed on *our own* controlling terminal (`run_tui`, above), and the
-/// agent runs in its own PTY (`session::pty`) that only ever receives bytes
-/// Overseer explicitly writes to it (`encode_key`/`encode_paste`) — no
-/// mouse forwarding exists, so a scroll event was never reaching the
-/// agent's TUI in the first place.
+/// Tree-focused wheel events scroll Overseer's terminal history. Focused
+/// wheel events are instead forwarded to an inner TUI that requested mouse
+/// reporting, letting it scroll its own alternate-screen conversation.
 ///
 /// Returning a delta instead of applying it immediately is deliberate: the
 /// event-drain loop in `run_app` sums every scroll intent in the frame and
@@ -464,6 +457,39 @@ fn wheel_scroll_delta(mouse: &MouseEvent, pane_rect: Rect) -> i32 {
         MouseEventKind::ScrollDown => -MOUSE_SCROLL_LINES,
         _ => 0,
     }
+}
+
+fn handle_mouse_wheel(app: &mut App, mouse: &MouseEvent, pane_rect: Rect) -> i32 {
+    let direction = match mouse.kind {
+        MouseEventKind::ScrollUp => overseer_core::session::keys::WheelDirection::Up,
+        MouseEventKind::ScrollDown => overseer_core::session::keys::WheelDirection::Down,
+        _ => return 0,
+    };
+    let position = Position::new(mouse.column, mouse.row);
+    if !pane_rect.contains(position) {
+        return 0;
+    }
+
+    if app.focus == Focus::Pane {
+        let Some(id) = app.with_tree(|tree| tree.selected()).map(|node| node.id) else { return 0 };
+        let mode = app.term_modes(&id);
+        if mode.mouse_reporting {
+            let column = mouse.column - pane_rect.x;
+            let row = mouse.row - pane_rect.y;
+            if let Some(bytes) = overseer_core::session::keys::encode_mouse_wheel(
+                direction,
+                column,
+                row,
+                mouse.modifiers,
+                mode,
+            ) {
+                app.write_input(&id, bytes);
+            }
+            return 0;
+        }
+    }
+
+    wheel_scroll_delta(mouse, pane_rect)
 }
 
 /// The keyboard-arrow contribution to this frame's pending scroll delta:
@@ -1067,12 +1093,9 @@ mod tests {
 
     // ── mouse wheel scrollback (SCROLLBACK.md) ───────────────────────────────
     //
-    // Covers the one path keyboard scrollback deliberately can't: scrolling
-    // while `Focus::Pane` (jumped in). Keys stay off-limits there (see
-    // `handle_pane_key`'s doc comment — everything but `Ctrl-h` forwards to
-    // the agent untouched), but the mouse wheel never reached the agent to
-    // begin with (no mouse forwarding exists, unlike keys/paste), so routing
-    // it to local scroll control steals nothing.
+    // Tree focus and focused shells without mouse reporting use Overseer's
+    // history. A focused TUI that requested mouse reports receives the wheel
+    // itself, covered by the mode/encoder tests in overseer-core.
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
@@ -1082,7 +1105,7 @@ mod tests {
     /// composes it in production: extract the event's delta, flush it as the
     /// frame's pending scroll.
     fn wheel(app: &mut App, ev: MouseEvent, pane_rect: Rect, selected_id: Option<&AgentId>) {
-        let delta = wheel_scroll_delta(&ev, pane_rect);
+        let delta = handle_mouse_wheel(app, &ev, pane_rect);
         apply_pending_scroll(app, selected_id, delta);
     }
 
@@ -1601,8 +1624,8 @@ mod tests {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
         app.focus = Focus::Pane; // as if the user had already jumped in
 
-        // Click-to-focus works from a focused pane too: clicks never forward
-        // to the agent (no mouse forwarding exists), so intercepting this
+        // Click-to-focus works from a focused pane too: UI clicks never forward
+        // to the agent, so intercepting this
         // steals nothing — unlike keys, which stay passthrough-only.
         handle_left_click(&mut app, &layout, mouse_down(5, 2));
 

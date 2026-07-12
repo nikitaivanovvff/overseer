@@ -62,13 +62,13 @@ it goes in `overseer`.**
 Change in `overseer-core`:
 - Agent lifecycle semantics: spawn/drop rules (e.g. "no grandchildren"), status meanings, staleness guards
 - Anything about the daemon, the socket, or the wire protocol (`Request`/`Response`/`AttachEvent`/`GridSnapshot`)
-- PTY/terminal-emulation behavior (`session/pty.rs` — the only `alacritty_terminal` importer in the workspace)
+- PTY/terminal-emulation behavior and extraction of input-relevant terminal modes (`session/pty.rs` — the only `alacritty_terminal` importer in the workspace)
 - Adapters: a new harness, install files, launch commands, hook wiring
 - Config file shape and parsing (all sections — even TUI-only ones like `[keybindings]`/`[theme]` parse here so a second frontend never needs a second loader)
 
 Change in `overseer` (bin):
 - Rendering: tree rows, badges, detail pane, status bar, modals, the pane painter
-- Interaction: keybinding handling, focus model, scrollback UX, mouse handling
+- Interaction: keybinding handling, focus model, scrollback UX, and routing focused wheel events into the inner PTY's negotiated mouse protocol
 - CLI argument surface (flags/subcommands in `cli.rs` — though the request they *send* is core's protocol)
 - `App`'s Mock-vs-Daemon glue
 
@@ -79,7 +79,7 @@ Yes → core. No, it's terminal-specific presentation → bin.
 
 Enforced boundaries (the first two have guard tests on both sides):
 
-- `alacritty_terminal` appears **only** in core's `session/pty.rs`. Everything else — including the bin's render layer — consumes `GridSnapshot`/`TermModes` DTOs. Swapping the terminal backend must stay a one-file rewrite.
+- `alacritty_terminal` appears **only** in core's `session/pty.rs`. Everything else — including rendering and focused mouse encoding — consumes `GridSnapshot`/`TermModes` DTOs. Swapping the terminal backend must stay a one-file rewrite.
 - No UI toolkit in core: ratatui never appears in `overseer-core` (`config/theme.rs` stores the wire-neutral `ColorDto`, not a ratatui color). The one deliberate exception is crossterm in `session/keys.rs`, kept in core rather than splitting the key encoder from its `KeyEvent` input type.
 - `ui/` is a render layer only; state mutations go through `App`/`AgentTree`/`SessionManager`. `App` (bin) is the single place that branches on `Backend::{Mock, Daemon}`.
 - Core test helpers cross the crate boundary via the `test-util` feature (`overseer` lists core in `[dev-dependencies]` with it) — never by duplicating helpers or loosening `#[cfg(test)]` to unconditional `pub`.

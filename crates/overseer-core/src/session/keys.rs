@@ -1,15 +1,24 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// The two terminal-mode bits `encode_key`/`encode_paste` actually consult,
+/// The terminal-mode bits focused-pane input encoding actually consults,
 /// decoupled from alacritty's own `TermMode` bitflags so nothing outside
 /// `session/pty.rs` needs that crate (AGENTS.md: alacritty stays confined to
 /// `session/pty.rs`). Mock mode builds this from a local `Term`'s mode
-/// (`SessionManager::term_modes`); daemon mode builds it from the two bools a
+/// (`SessionManager::term_modes`); daemon mode builds it from the bools a
 /// `GridSnapshot` carries across the wire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TermModes {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    pub mouse_reporting: bool,
+    pub sgr_mouse: bool,
+    pub utf8_mouse: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDirection {
+    Up,
+    Down,
 }
 
 /// Encodes a crossterm key event into the bytes to write to a PTY, respecting
@@ -70,6 +79,58 @@ pub fn encode_paste(text: &str, mode: TermModes) -> Vec<u8> {
     } else {
         text.as_bytes().to_vec()
     }
+}
+
+/// Encodes one wheel tick at a zero-based terminal cell. Mouse events are
+/// meaningful only when the application requested reporting; coordinates are
+/// converted to the protocol's one-based form here.
+pub fn encode_mouse_wheel(
+    direction: WheelDirection,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    mode: TermModes,
+) -> Option<Vec<u8>> {
+    if !mode.mouse_reporting {
+        return None;
+    }
+
+    let mut button = match direction {
+        WheelDirection::Up => 64,
+        WheelDirection::Down => 65,
+    };
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        button += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        button += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        button += 16;
+    }
+
+    let x = u32::from(column) + 1;
+    let y = u32::from(row) + 1;
+    if mode.sgr_mouse {
+        return Some(format!("\x1b[<{button};{x};{y}M").into_bytes());
+    }
+
+    let mut out = b"\x1b[M".to_vec();
+    if mode.utf8_mouse {
+        for value in [button + 32, x + 32, y + 32] {
+            let ch = char::from_u32(value)?;
+            let mut buf = [0; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    } else {
+        // Request::Write is UTF-8 JSON, so classic protocol bytes must remain
+        // ASCII. Modern TUIs use SGR; refusing an unrepresentable coordinate
+        // is safer than lossy conversion into a report for the wrong cell.
+        for value in [button + 32, x + 32, y + 32] {
+            out.push(u8::try_from(value).ok().filter(|byte| byte.is_ascii())?);
+        }
+    }
+    Some(out)
 }
 
 fn encode_char(c: char, ctrl: bool) -> Option<Vec<u8>> {
@@ -159,7 +220,7 @@ mod tests {
 
     #[test]
     fn arrows_use_ss3_in_application_cursor_mode() {
-        let mode = TermModes { app_cursor: true, bracketed_paste: false };
+        let mode = TermModes { app_cursor: true, ..TermModes::default() };
         assert_eq!(encode_key(&key(KeyCode::Up), mode), Some(vec![0x1b, b'O', b'A']));
         assert_eq!(encode_key(&key(KeyCode::Down), mode), Some(vec![0x1b, b'O', b'B']));
     }
@@ -202,7 +263,7 @@ mod tests {
 
     #[test]
     fn paste_wraps_in_bracketed_markers_when_mode_enabled() {
-        let mode = TermModes { app_cursor: false, bracketed_paste: true };
+        let mode = TermModes { bracketed_paste: true, ..TermModes::default() };
         let bytes = encode_paste("hello\nworld", mode);
         assert_eq!(bytes, b"\x1b[200~hello\nworld\x1b[201~".to_vec());
     }
@@ -211,5 +272,45 @@ mod tests {
     fn paste_is_raw_text_when_bracketed_paste_disabled() {
         let bytes = encode_paste("hello\nworld", TermModes::default());
         assert_eq!(bytes, b"hello\nworld".to_vec());
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_encodes_coordinates_and_modifiers() {
+        let mode = TermModes { mouse_reporting: true, sgr_mouse: true, ..TermModes::default() };
+        assert_eq!(
+            encode_mouse_wheel(WheelDirection::Up, 0, 0, KeyModifiers::NONE, mode),
+            Some(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_wheel(
+                WheelDirection::Down,
+                8,
+                4,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                mode,
+            ),
+            Some(b"\x1b[<93;9;5M".to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_and_utf8_mouse_wheel_encodings_are_supported() {
+        let legacy = TermModes { mouse_reporting: true, ..TermModes::default() };
+        assert_eq!(
+            encode_mouse_wheel(WheelDirection::Up, 0, 0, KeyModifiers::NONE, legacy),
+            Some(vec![0x1b, b'[', b'M', 96, 33, 33])
+        );
+        assert_eq!(encode_mouse_wheel(WheelDirection::Up, 95, 0, KeyModifiers::NONE, legacy), None);
+
+        let utf8 = TermModes { mouse_reporting: true, utf8_mouse: true, ..TermModes::default() };
+        assert!(encode_mouse_wheel(WheelDirection::Down, 200, 100, KeyModifiers::NONE, utf8).is_some());
+    }
+
+    #[test]
+    fn mouse_wheel_is_ignored_without_reporting_mode() {
+        assert_eq!(
+            encode_mouse_wheel(WheelDirection::Up, 0, 0, KeyModifiers::NONE, TermModes::default()),
+            None
+        );
     }
 }

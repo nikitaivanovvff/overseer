@@ -189,11 +189,10 @@ impl App {
         }
     }
 
-    /// The `TermModes` bits `session::keys::encode_key`/`encode_paste` need
-    /// to encode a keystroke/paste correctly (application-cursor arrows,
-    /// bracketed paste). Mock mode reads its local `Term` directly (via
+    /// The `TermModes` bits focused-pane input encoders need to encode keys,
+    /// paste, and mouse reports correctly. Mock mode reads its local `Term` directly (via
     /// `SessionManager::term_modes`); daemon mode rebuilds the same struct
-    /// from the last received `GridSnapshot`'s two bools.
+    /// from the last received `GridSnapshot`'s mode bools.
     pub fn term_modes(&self, id: &AgentId) -> overseer_core::session::keys::TermModes {
         match &self.backend {
             Backend::Mock(ctx) => ctx.0.sessions.term_modes(id),
@@ -204,6 +203,9 @@ impl App {
                 .map(|(_, grid)| overseer_core::session::keys::TermModes {
                     app_cursor: grid.app_cursor_mode,
                     bracketed_paste: grid.bracketed_paste_mode,
+                    mouse_reporting: grid.mouse_reporting_mode,
+                    sgr_mouse: grid.sgr_mouse_mode,
+                    utf8_mouse: grid.utf8_mouse_mode,
                 })
                 .unwrap_or_default(),
         }
@@ -216,7 +218,7 @@ impl App {
             Backend::Daemon(state) => {
                 // Every byte this app ever writes to a PTY originates as
                 // either an ASCII control byte or real UTF-8 text
-                // (`session::keys::encode_key`/`encode_paste`) — lossy only
+                // (`session::keys` input encoders) — lossy only
                 // guards against a future encoding regression, it never
                 // fires in practice.
                 let data = String::from_utf8_lossy(&bytes).into_owned();
@@ -746,6 +748,9 @@ mod tests {
             cursor: None,
             app_cursor_mode: false,
             bracketed_paste_mode: false,
+            mouse_reporting_mode: false,
+            sgr_mouse_mode: false,
+            utf8_mouse_mode: false,
             display_offset: 0,
         };
 
@@ -756,6 +761,33 @@ mod tests {
 
         apply_event(&mut state, AttachEvent::Output { agent_id: watched_id.clone(), grid });
         assert!(state.grid.is_some());
+    }
+
+    #[test]
+    fn daemon_term_modes_include_mouse_reporting_from_the_grid() {
+        let id = AgentId::new();
+        let mut state = empty_daemon_state();
+        state.grid = Some((
+            id.clone(),
+            GridSnapshot {
+                cols: 1,
+                lines: 1,
+                cells: vec![None],
+                cursor: None,
+                app_cursor_mode: false,
+                bracketed_paste_mode: false,
+                mouse_reporting_mode: true,
+                sgr_mouse_mode: true,
+                utf8_mouse_mode: false,
+                display_offset: 0,
+            },
+        ));
+        let app = App::new_daemon(state);
+
+        let modes = app.term_modes(&id);
+        assert!(modes.mouse_reporting);
+        assert!(modes.sgr_mouse);
+        assert!(!modes.utf8_mouse);
     }
 
     #[test]

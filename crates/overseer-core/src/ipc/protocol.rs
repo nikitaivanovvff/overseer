@@ -267,6 +267,14 @@ pub struct GridSnapshot {
     /// Whether the terminal wants pasted text wrapped in bracketed-paste
     /// markers. Same rationale as `app_cursor_mode`.
     pub bracketed_paste_mode: bool,
+    /// Whether the application requested terminal mouse reports, plus the
+    /// negotiated encoding variants needed to forward focused-pane events.
+    #[serde(default)]
+    pub mouse_reporting_mode: bool,
+    #[serde(default)]
+    pub sgr_mouse_mode: bool,
+    #[serde(default)]
+    pub utf8_mouse_mode: bool,
     /// How far this snapshot is scrolled up from the live bottom (`0` = live).
     /// Drives the pane's "[scrolled ↑N — G to follow]" title (SCROLLBACK.md).
     pub display_offset: usize,
@@ -561,6 +569,9 @@ mod tests {
             cursor: Some((10, 20)),
             app_cursor_mode: false,
             bracketed_paste_mode: false,
+            mouse_reporting_mode: false,
+            sgr_mouse_mode: false,
+            utf8_mouse_mode: false,
             display_offset: 0,
         };
         let json_len = serde_json::to_string(&snapshot).unwrap().len();

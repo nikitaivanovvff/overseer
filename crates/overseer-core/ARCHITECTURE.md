@@ -13,7 +13,7 @@ src/
 │   ├── pty           SessionManager: owns one PTY + terminal emulator per agent — the only file
 │   │                 in the workspace that imports alacritty_terminal. Renders GridSnapshot DTOs and
 │   │                 tracks a per-agent content-generation counter (bumped on new PTY output)
-│   └── keys          Crossterm KeyEvent -> PTY escape-byte encoder, parameterized by the neutral
+│   └── keys          Crossterm key/paste/mouse -> PTY escape-byte encoders, parameterized by the neutral
 │                     TermModes struct (input path for a focused pane); the one crossterm import in
 │                     core — kept here rather than splitting the encoder from its input type
 ├── agent/            Agent model and lifecycle
@@ -39,7 +39,7 @@ src/
 │   ├── handlers      dispatch: status, list, agent, start, spawn, drop, tui_drop, shutdown —
 │   │                 the "no grandchildren" rule is enforced here, in exactly one place
 │   ├── protocol      Request / Response / AgentDto / AttachEvent / GridSnapshot / ColorDto
-│   │                 wire types (serde)
+│   │                 wire types (serde); snapshots include input-relevant terminal modes
 │   └── client        One-shot sync client used by CLI subcommands and daemon reachability probes
 ├── daemon            Daemon process bootstrap: socket path resolution, flock lockfile,
 │                     detached auto-spawn (setsid) with retry/backoff for a client to attach to

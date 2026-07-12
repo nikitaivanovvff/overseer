@@ -363,6 +363,9 @@ mod tests {
             cursor: None,
             app_cursor_mode: false,
             bracketed_paste_mode: false,
+            mouse_reporting_mode: false,
+            sgr_mouse_mode: false,
+            utf8_mouse_mode: false,
             display_offset: 0,
         }
     }

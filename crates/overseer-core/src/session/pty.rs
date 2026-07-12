@@ -396,13 +396,16 @@ impl SessionManager {
     /// The neutral `TermModes` mock mode's local `Term` currently has set —
     /// the `with_term`-backed twin of `App::term_modes`'s daemon branch,
     /// which instead derives the same struct from a streamed `GridSnapshot`'s
-    /// two bools. `Default` (both `false`) for an unknown id.
+    /// mode bools. `Default` (all `false`) for an unknown id.
     pub fn term_modes(&self, id: &AgentId) -> TermModes {
         self.with_term(id, |term| {
             let mode = term.mode();
             TermModes {
                 app_cursor: mode.contains(TermMode::APP_CURSOR),
                 bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+                mouse_reporting: mode.intersects(TermMode::MOUSE_MODE),
+                sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
+                utf8_mouse: mode.contains(TermMode::UTF8_MOUSE),
             }
         })
         .unwrap_or_default()
@@ -590,6 +593,9 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
         cursor,
         app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
         bracketed_paste_mode: mode.contains(TermMode::BRACKETED_PASTE),
+        mouse_reporting_mode: mode.intersects(TermMode::MOUSE_MODE),
+        sgr_mouse_mode: mode.contains(TermMode::SGR_MOUSE),
+        utf8_mouse_mode: mode.contains(TermMode::UTF8_MOUSE),
         display_offset: term.grid().display_offset(),
     }
 }
@@ -1106,6 +1112,22 @@ mod tests {
         let mut term = term_from(&bytes, 10, 3);
         term.scroll_display(Scroll::Delta(4));
         assert_eq!(grid_snapshot_from_term(&term).display_offset, 4);
+    }
+
+    #[test]
+    fn grid_snapshot_reports_mouse_modes_requested_by_inner_tui() {
+        let snapshot = snapshot_from_bytes(80, 24, b"\x1b[?1000h\x1b[?1006h");
+        assert!(snapshot.mouse_reporting_mode);
+        assert!(snapshot.sgr_mouse_mode);
+        assert!(!snapshot.utf8_mouse_mode);
+
+        let snapshot = snapshot_from_bytes(80, 24, b"\x1b[?1003h\x1b[?1005h");
+        assert!(snapshot.mouse_reporting_mode);
+        assert!(!snapshot.sgr_mouse_mode);
+        assert!(snapshot.utf8_mouse_mode);
+
+        let snapshot = snapshot_from_bytes(80, 24, b"\x1b[?1000h\x1b[?1000l");
+        assert!(!snapshot.mouse_reporting_mode);
     }
 
     #[test]

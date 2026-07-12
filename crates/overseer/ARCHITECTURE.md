@@ -31,8 +31,9 @@ staleness guard sees the invocation moment, not parse+transcript-read time.
 src/
 ├── main.rs           Dispatch above
 ├── cli.rs            clap definitions + one-shot client glue (build Request, print Response)
-├── tui.rs            Event loop: attach connection, key/mouse handling, focus + confirm +
-│                     search + picker state machines, notify emission
+├── tui.rs            Event loop: attach connection, key/mouse handling (including pane-local
+│                     focused-wheel forwarding), focus + confirm + search + picker state machines,
+│                     notify emission
 ├── app.rs            App: Backend enum (Mock | Daemon) unifying tree access, session I/O, and
 │                     dispatch behind one API — the single place that branches on which backend
 │                     is live; tui.rs/ui/ call the same methods either way
@@ -57,7 +58,8 @@ wedged-daemon recovery test.
   Daemon}` branching stays inside `app.rs` (bar the one `pane_grid` lookup in
   the run loop, which is ui-shape glue).
 - **Keybinding house style is nvim**, and a focused pane intercepts only
-  `Ctrl-h` — every other key forwards to the agent. Full rules and the
+  `Ctrl-h` — every other key forwards to the agent. Mouse wheel events over a
+  focused pane also forward when the inner TUI requested mouse reporting. Full rules and the
   remappable-vs-fixed table: AGENTS.md "TUI Layout".
 - **Quit is a detach.** `q`/`Ctrl-C` never kills agents or the daemon; only
   `d`/`D`/`Q` (all confirmed) destroy anything, and workspace drops go
