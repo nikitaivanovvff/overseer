@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::drop::drop_agent;
-use crate::agent::spawn::{spawn_agent, SpawnRequest};
+use crate::agent::spawn::{spawn_agent, spawn_manual_child, SpawnRequest};
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::{dir_basename, GitClient};
@@ -95,8 +95,9 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                     "task exceeds max size of {MAX_SPAWN_TASK_BYTES} bytes"
                 ));
             }
-            let Some(parent) = ctx.registry.get(&parent_id) else {
-                return Response::err(format!("unknown agent: {}", parent_id.short()));
+            let parent = match spawn_parent(ctx, &parent_id) {
+                Ok(parent) => parent,
+                Err(response) => return response,
             };
             // Default to the spawning agent's *own* adapter, not a fixed
             // global default (AGENTS.md: cross-harness spawning is opt-in
@@ -112,21 +113,6 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                     parent.adapter.clone()
                 }
             });
-            // The one and only hierarchy/cost admission check. Depth is
-            // derived from the parent chain; the TUI routes through this arm.
-            let Some((parent_depth, child_count)) = ctx.registry.spawn_metrics(&parent_id) else {
-                return Response::err(format!("unknown agent: {}", parent_id.short()));
-            };
-            if parent_depth >= 3 {
-                return Response::err("agents at max depth cannot spawn further agents".to_string());
-            }
-            if child_count >= ctx.config.defaults.max_children {
-                return Response::err(format!(
-                    "agent reached max_children cap of {}",
-                    ctx.config.defaults.max_children
-                ));
-            }
-
             let req = SpawnRequest {
                 role: AgentRole::Child,
                 parent_id: Some(parent_id),
@@ -140,6 +126,38 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             };
 
             match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
+                Ok(result) => Response::ok(Some(OkBody::Registered {
+                    agent_id: result.id,
+                    branch: result.branch,
+                })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::TuiSpawnChild { parent_id, name } => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Response::err("child name cannot be empty");
+            }
+            let parent = match spawn_parent(ctx, &parent_id) {
+                Ok(parent) => parent,
+                Err(response) => return response,
+            };
+            if parent.adapter == "shell" {
+                return Response::err("parent has no harness configuration to inherit");
+            }
+            let req = SpawnRequest {
+                role: AgentRole::Child,
+                parent_id: Some(parent_id),
+                task: String::new(),
+                name: Some(name),
+                adapter_name: parent.adapter,
+                cwd: parent.cwd,
+                repo: parent.repo,
+                branch: None,
+                root_adapter: None,
+            };
+            match spawn_manual_child(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
                 Ok(result) => Response::ok(Some(OkBody::Registered {
                     agent_id: result.id,
                     branch: result.branch,
@@ -201,6 +219,25 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             Response::ok(None)
         }
     }
+}
+
+fn spawn_parent(ctx: &AppCtx, parent_id: &AgentId) -> Result<crate::ipc::protocol::AgentDto, Response> {
+    let Some(parent) = ctx.registry.get(parent_id) else {
+        return Err(Response::err(format!("unknown agent: {}", parent_id.short())));
+    };
+    let Some((parent_depth, child_count)) = ctx.registry.spawn_metrics(parent_id) else {
+        return Err(Response::err(format!("unknown agent: {}", parent_id.short())));
+    };
+    if parent_depth >= 3 {
+        return Err(Response::err("agents at max depth cannot spawn further agents"));
+    }
+    if child_count >= ctx.config.defaults.max_children {
+        return Err(Response::err(format!(
+            "agent reached max_children cap of {}",
+            ctx.config.defaults.max_children
+        )));
+    }
+    Ok(parent)
 }
 
 #[cfg(test)]
@@ -469,6 +506,46 @@ mod tests {
             _ => panic!("expected Agents"),
         };
         assert_eq!(agents.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_tui_spawn_child_inherits_parent_and_waits_idle() {
+        let ctx = make_ctx();
+        let start = dispatch(
+            &ctx,
+            Request::Start { cwd: Some(PathBuf::from("/tmp")), adapter: Some("claude".to_string()) },
+        );
+        let root_id = registered_id(start);
+        let child_id = registered_id(dispatch(
+            &ctx,
+            Request::TuiSpawnChild { parent_id: root_id, name: "  manual-review  ".to_string() },
+        ));
+        let child = match dispatch(&ctx, Request::Agent { agent_id: child_id }).data {
+            Some(OkBody::Agent { agent }) => agent,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        assert_eq!(child.name, "manual-review");
+        assert_eq!(child.adapter, "claude");
+        assert_eq!(child.cwd, PathBuf::from("/tmp"));
+        assert_eq!(child.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn dispatch_tui_spawn_child_rejects_blank_name_and_shell_parent() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let blank = dispatch(
+            &ctx,
+            Request::TuiSpawnChild { parent_id: root_id.clone(), name: "   ".to_string() },
+        );
+        assert!(!blank.ok);
+        assert!(blank.error.as_deref().unwrap_or("").contains("name"));
+        let shell = dispatch(
+            &ctx,
+            Request::TuiSpawnChild { parent_id: root_id, name: "manual".to_string() },
+        );
+        assert!(!shell.ok);
+        assert!(shell.error.as_deref().unwrap_or("").contains("no harness"));
     }
 
     // ── child --name ──────────────────────────────────────────────────────────

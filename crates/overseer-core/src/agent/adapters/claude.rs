@@ -51,17 +51,10 @@ impl ClaudeAdapter {
         // only — no need to repeat the adapter identity on every push.
         let session_start_running_cmd = self.hook_command("status running --from-hook --adapter claude");
         let session_start_idle_cmd = self.hook_command("status idle --from-hook --adapter claude");
-        // Role-conditional: a root is a bare shell the human ran `claude` inside
-        // themselves — freshly started, it's waiting on the human to type a
-        // prompt, not doing anything, so it pushes `idle` (UserPromptSubmit is
-        // what flips it to `running`, the moment real work actually begins). A
-        // spawned child is different: its task is delivered as the initial
-        // prompt, so it's already working the instant it launches — it registers
-        // `Spawning` (spawn.rs) and this is what flips it to `running`; pushing
-        // `idle` here would make an already-working child flicker/stick idle.
-        // Both branches still self-identify the adapter (see above).
+        // Roots and taskless TUI-created children wait for a human prompt;
+        // CLI-spawned children already have their initial task.
         let session_start_status_cmd = format!(
-            r#"if [ "$OVERSEER_ROLE" = "root" ]; then {session_start_idle_cmd}; else {session_start_running_cmd}; fi"#
+            r#"if [ -n "$OVERSEER_TASK" ]; then {session_start_running_cmd}; else {session_start_idle_cmd}; fi"#
         );
         // The printed message carries the single most-violated rule inline,
         // per role, rather than just pointing at the skill file — this fires
@@ -347,13 +340,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_session_start_pushes_idle_for_root_running_for_child() {
+    fn settings_session_start_uses_task_presence_for_initial_status() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status idle"), "SessionStart should push idle for a root: {cmd}");
         assert!(cmd.contains("status running"), "SessionStart should push running for a child: {cmd}");
-        assert!(cmd.contains(r#"$OVERSEER_ROLE" = "root""#), "must branch on OVERSEER_ROLE: {cmd}");
+        assert!(cmd.contains(r#"-n "$OVERSEER_TASK""#), "must branch on OVERSEER_TASK: {cmd}");
         assert!(cmd.contains("OVERSEER_AGENT_ID"), "must stay guarded, no-op outside Overseer");
     }
 

@@ -7,9 +7,9 @@ You are a child agent spawned by another agent, running inside Overseer.
 
 ## Your assignment
 
-`$OVERSEER_TASK` holds the task you were spawned with. Your initial prompt
-already contains it, so you don't need to read the variable to get started —
-but re-read it if you ever lose track of what you were asked to do.
+If `$OVERSEER_TASK` is set, it holds the task your parent spawned you with and
+your initial prompt already contains it. If it is absent, the user created you
+from the TUI; wait for the user to type your first prompt.
 
 ## Isolation
 
@@ -62,7 +62,7 @@ completion from you going quiet or from the session ending.
 | `$OVERSEER_ROLE` | `child` |
 | `$OVERSEER_PARENT_ID` | Parent agent ID |
 | `$OVERSEER_REPO` | Repository name |
-| `$OVERSEER_TASK` | Your assignment (also your initial prompt) |
+| `$OVERSEER_TASK` | Your assignment and initial prompt, when parent-spawned; absent when created from the TUI |
 | `$OVERSEER_DEPTH` | Tree depth (`2` or `3`); depth `3` is the spawn limit |
 
 Status is otherwise automatic via hooks — you don't need to push it yourself,

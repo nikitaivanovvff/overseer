@@ -685,8 +685,8 @@ fn handle_picker_key(app: &mut App, key: KeyEvent, keybindings: &Keybindings) {
     }
 }
 
-/// `s`: opens a task-input prompt for the selected node, whatever its role. Whether
-/// it's actually eligible to take a child is decided by the server's `Spawn` handler
+/// `s`: opens a name prompt for a taskless child under the selected node. Whether
+/// it's actually eligible to take a child is decided by the server's spawn handler
 /// alone (AGENTS.md: depth/cap admission lives there, "not in the TUI, not as
 /// a UI hint") — a rejection surfaces through `submit_input`'s normal error handling.
 fn start_spawn_child_input(app: &mut App) {
@@ -760,16 +760,12 @@ fn submit_input(app: &mut App, input: InputState) {
             dispatch_and_report(app, Request::Start { cwd, adapter });
         }
         PendingAction::SpawnChild { parent_id } => {
-            let task = input.buffer.trim().to_string();
-            if task.is_empty() {
-                app.status_message = Some("spawn cancelled: empty task".to_string());
+            let name = input.buffer.trim().to_string();
+            if name.is_empty() {
+                app.status_message = Some("spawn cancelled: empty name".to_string());
                 return;
             }
-            let Some(parent_cwd) = app.with_tree(|t| t.find(&parent_id).map(|n| n.cwd.clone())) else {
-                app.status_message = Some("spawn failed: parent no longer exists".to_string());
-                return;
-            };
-            dispatch_and_report(app, Request::Spawn { parent_id, task, name: None, adapter: None, cwd: parent_cwd });
+            dispatch_and_report(app, Request::TuiSpawnChild { parent_id, name });
         }
         // Enter on a live search: keep the cursor where it is if that node
         // still matches, otherwise jump to the first match in tree order
