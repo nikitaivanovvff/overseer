@@ -153,10 +153,9 @@ fn resolve_shell() -> String {
 /// Root path when an adapter was actually chosen (picker step 2, or a
 /// hand-built `Request::Start { adapter: Some(_), .. }`) — launched like the
 /// bare-shell root (a live, interactive shell as the PTY child), with the
-/// adapter's own launch command auto-typed into it. Registers `Idle`, same
-/// as the bare-shell root: the PTY child is a shell, byte-identical to a
-/// human typing the command into a bare-shell root themselves, and the
-/// harness's own `SessionStart`-equivalent hook flips status from there
+/// adapter's own launch command auto-typed into it. Registers `Spawning` so
+/// the TUI can hide that shell bootstrap until the harness's own
+/// `SessionStart`-equivalent hook flips status to `Idle`
 /// (every adapter's install hook already branches on `$OVERSEER_ROLE` to
 /// push `idle` for a root regardless of who typed the launch command).
 ///
@@ -188,7 +187,7 @@ fn spawn_root_with_adapter(
         repo: req.repo.clone(),
         cwd: req.cwd.clone(),
         branch: req.branch,
-        initial_status: AgentStatus::Idle,
+        initial_status: AgentStatus::Spawning,
     };
     let result = registry.register(args)?;
 
@@ -675,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_root_with_adapter_registers_idle_with_that_adapter_label() {
+    fn spawn_agent_root_with_adapter_registers_spawning_with_that_adapter_label() {
         let (registry, sessions) = make_registry_and_sessions();
         let config = Config::default();
         let result = spawn_agent(
@@ -687,13 +686,10 @@ mod tests {
         )
         .unwrap();
         let dto = registry.get(&result.id).unwrap();
-        // Adapter label is the chosen adapter, not "shell" — but status is
-        // Idle, same as a bare-shell root: the PTY child launched here is a
-        // live shell (the harness command is only typed into it), so this
-        // root is in exactly the same "waiting, nothing has reported
-        // activity yet" state a bare-shell root starts in.
+        // The harness's startup hook changes this to Idle once initialization
+        // completes. Until then the TUI hides the shell bootstrap.
         assert_eq!(dto.adapter, "claude");
-        assert_eq!(dto.status, AgentStatus::Idle);
+        assert_eq!(dto.status, AgentStatus::Spawning);
     }
 
     #[test]
