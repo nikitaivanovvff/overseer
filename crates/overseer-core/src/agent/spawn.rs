@@ -73,8 +73,18 @@ pub fn spawn_agent(
 ) -> Result<RegisterResult, SpawnError> {
     match req.role.clone() {
         AgentRole::Root => spawn_root(registry, sessions, socket, config, req),
-        AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req),
+        AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Spawning),
     }
+}
+
+pub fn spawn_manual_child(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    config: &Config,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
+    spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Idle)
 }
 
 /// Root path: bare shell by default, or — if `req.root_adapter` names one —
@@ -267,6 +277,7 @@ fn spawn_child_agent(
     socket: &Path,
     config: &Config,
     req: SpawnRequest,
+    initial_status: AgentStatus,
 ) -> Result<RegisterResult, SpawnError> {
     let (adapter, adapter_config) = resolve_adapter(config, &req.adapter_name)?;
 
@@ -284,9 +295,7 @@ fn spawn_child_agent(
         repo: req.repo.clone(),
         cwd: req.cwd.clone(),
         branch: req.branch,
-        // Not Running: the PTY is launching but the agent hasn't reported activity
-        // yet. SessionStart flips it to Running moments later (Claude adapter hook).
-        initial_status: AgentStatus::Spawning,
+        initial_status,
     };
     let result = registry.register(args)?;
     let depth = registry

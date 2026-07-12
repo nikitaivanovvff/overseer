@@ -25,7 +25,7 @@ pub enum PendingAction {
     Search,
 }
 
-/// Active when the user is typing a task description for `n`/`s`.
+/// Active while the user is typing a repo path, child name, or search query.
 pub struct InputState {
     pub action: PendingAction,
     pub buffer: String,

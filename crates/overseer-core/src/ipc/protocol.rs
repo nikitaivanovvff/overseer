@@ -111,6 +111,12 @@ pub enum Request {
         adapter: Option<String>,
         cwd: std::path::PathBuf,
     },
+    /// TUI-only path for a named, taskless child that inherits its parent's
+    /// configured harness and waits idle for the human's first prompt.
+    TuiSpawnChild {
+        parent_id: AgentId,
+        name: String,
+    },
     /// Kill the agent's PTY and deregister it (+ its subtree if `recursive`).
     /// Root agents can only be dropped through the TUI, not this command.
     Drop {

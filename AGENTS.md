@@ -107,6 +107,8 @@ The daemon owns `AgentRegistry` and `SessionManager`; the TUI is its first, rich
 
 `Request::Attach` upgrades a connection: one `AttachEvent::Snapshot` (every agent, as of that instant), then a stream:
 
+`Request::TuiSpawnChild` is the TUI's `s` path: it carries only the selected parent and child name. The daemon inherits the parent's configured harness, launches without an initial task, and registers the child idle for the human to prompt manually. CLI `Request::Spawn` remains task-bearing and unchanged.
+
 | Event | When |
 |-------|------|
 | `AgentRegistered` / `AgentRemoved` | A `start`/`spawn`/`drop` mutates the registry — pushed from `AgentRegistry`'s broadcast channel, not polled |
@@ -165,7 +167,7 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_DEPTH` — derived tree depth (`1`, `2`, or `3`)
 - `OVERSEER_PARENT_ID` — parent UUID (absent for a workspace)
 - `OVERSEER_REPO` — repository name
-- `OVERSEER_TASK` — the child's assignment, verbatim (children only; absent for a workspace). Also delivered as the child's initial prompt — the env var just lets it re-read the assignment mid-session.
+- `OVERSEER_TASK` — the child's assignment for CLI-spawned children; absent for a workspace or TUI-created child waiting for a manual first prompt.
 
 Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE`:
 - Workspaces: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is supported — a claude workspace may spawn an opencode or pi child and vice versa.
@@ -274,7 +276,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
 | `n` | Spawn a workspace in a chosen repo (default cwd). If any adapter is installed, first opens a picker (`j`/`k`, `Enter` to confirm, `Esc` to cancel) — every `overseer install`ed adapter plus "bare terminal" — then the repo-path prompt; skips straight to the prompt (bare shell) if nothing is installed |
-| `s` | Spawn child under selected agent (adapter-launched, same as before) |
+| `s` | Ask for a child name, then create an idle child with the parent's configured harness for manual prompting |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
 | `q` / `Ctrl-C` | Quit immediately, no confirm — detaches, never kills any agent or the daemon (see Cleanup) |

@@ -79,12 +79,10 @@ export default function (pi) {{
   }}
   const push = (status) => execFile(OVERSEER_BIN, ["status", status], () => {{}});
 
-  // Root (bare shell the human ran pi inside) is waiting on the human to
-  // prompt it, not doing anything yet -- pushes idle. A spawned child
-  // already has its task as the initial prompt and is working the instant
-  // it launches -- pushes running.
+  // Roots and taskless TUI-created children wait for a human prompt;
+  // CLI-spawned children already have their initial task.
   pi.on("session_start", () => {{
-    const initial = process.env.OVERSEER_ROLE === "root" ? "idle" : "running";
+    const initial = process.env.OVERSEER_TASK ? "running" : "idle";
     execFile(OVERSEER_BIN, ["status", initial, "--adapter", "pi"], () => {{}});
   }});
   pi.on("agent_start", () => push("running"));
@@ -231,9 +229,9 @@ mod tests {
     }
 
     #[test]
-    fn extension_session_start_pushes_idle_for_root_running_for_child() {
+    fn extension_session_start_status_uses_task_presence() {
         let content = make_adapter().extension_content();
-        assert!(content.contains(r#"OVERSEER_ROLE === "root""#));
+        assert!(content.contains("process.env.OVERSEER_TASK"));
         assert!(content.contains(r#""idle""#));
         assert!(content.contains(r#""running""#));
     }

@@ -615,7 +615,7 @@ fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
             (format!(" new workspace: {name} "), "repo path:", "spawn")
         }
         PendingAction::SpawnRoot { adapter: None } => (" new workspace ".to_string(), "repo path:", "spawn"),
-        PendingAction::SpawnChild { .. } => (" spawn child ".to_string(), "task:", "spawn"),
+        PendingAction::SpawnChild { .. } => (" spawn child ".to_string(), "name:", "spawn"),
         PendingAction::Search => (" search ".to_string(), "agent name:", "jump"),
     };
 
