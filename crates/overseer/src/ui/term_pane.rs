@@ -1,6 +1,6 @@
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -41,21 +41,12 @@ pub fn render_term_pane(
         return inner;
     };
 
-    // A freshly spawned agent's harness (claude/opencode/pi, or a bare
-    // shell) hasn't painted anything yet — the PTY exists and streams a
-    // real (all-blank) grid well before the process's first visible output,
-    // so with no marker the pane just looks stuck for however long the
-    // harness takes to boot (measured ~1.6s+, worse with MCP-heavy configs).
-    // Only for `Spawning`: a running/idle agent that happens to have a
-    // blank screen is showing real content (or the real absence of it) and
-    // must never be lied about — and the instant any visible cell shows up,
-    // this branch stops applying on its own since `grid_is_blank` goes
-    // false.
-    if node.status == AgentStatus::Spawning && grid.is_none_or(grid_is_blank) {
-        frame.render_widget(
-            placeholder(format!("launching {}… (waiting for first output)", node.adapter)),
-            inner,
-        );
+    // Adapter-selected workspaces launch through an interactive shell so
+    // exiting the harness returns to a usable prompt. Keep that implementation
+    // detail hidden until the harness's startup hook moves it out of Spawning.
+    // Status, not terminal output, is the initialization boundary.
+    if node.status == AgentStatus::Spawning {
+        frame.render_widget(loader(&node.adapter), inner);
         return inner;
     }
 
@@ -70,15 +61,17 @@ fn placeholder(text: impl Into<String>) -> Paragraph<'static> {
     Paragraph::new(text.into()).style(Style::default().fg(Color::DarkGray))
 }
 
-/// True when every cell is either absent or whitespace — i.e. the harness
-/// hasn't painted anything a user would perceive as content yet. One
-/// O(cols×lines) scan; only ever called for the single selected pane, once
-/// per frame (see `render_term_pane`'s `Spawning` branch).
-fn grid_is_blank(grid: &GridSnapshot) -> bool {
-    grid.cells.iter().all(|cell| match cell {
-        None => true,
-        Some(c) => c.ch.is_whitespace(),
-    })
+fn loader(adapter: &str) -> Paragraph<'static> {
+    let view = format!(
+        "     .----------------.\n\
+         ----|    OVERSEER    |----\n\
+             '----------------'\n\n\
+         starting {adapter}..."
+    );
+    Paragraph::new(view)
+        .alignment(Alignment::Center)
+        .centered()
+        .style(Style::default().fg(Color::DarkGray))
 }
 
 /// Pure — the pane border's title. `alive` wins over everything else that
@@ -190,7 +183,6 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
 mod tests {
     use super::*;
     use overseer_core::agent::{AgentId, AgentRole};
-    use overseer_core::ipc::protocol::CellDto;
     use overseer_core::session::snapshot_from_bytes;
 
     fn flat_node(status: AgentStatus, adapter: &str) -> FlatNode {
@@ -353,8 +345,6 @@ mod tests {
         assert_eq!(pane_title(false, 10, false), " agent [exited] ");
     }
 
-    // ── grid_is_blank ─────────────────────────────────────────────────────────
-
     fn blank_cell_grid(cols: u16, lines: u16) -> GridSnapshot {
         GridSnapshot {
             cols,
@@ -370,47 +360,13 @@ mod tests {
         }
     }
 
-    fn space_cell() -> CellDto {
-        CellDto {
-            ch: ' ',
-            fg: ColorDto::Reset,
-            bg: ColorDto::Reset,
-            bold: false,
-            italic: false,
-            underline: false,
-            inverse: false,
-        }
-    }
-
-    #[test]
-    fn grid_is_blank_true_for_empty_grid() {
-        let grid = blank_cell_grid(5, 2);
-        assert!(grid_is_blank(&grid));
-    }
-
-    #[test]
-    fn grid_is_blank_false_when_a_cell_has_visible_content() {
-        let mut grid = blank_cell_grid(5, 2);
-        grid.cells[3] = Some(CellDto { ch: 'x', ..space_cell() });
-        assert!(!grid_is_blank(&grid));
-    }
-
-    #[test]
-    fn grid_is_blank_true_when_every_cell_is_whitespace() {
-        let mut grid = blank_cell_grid(3, 1);
-        for cell in grid.cells.iter_mut() {
-            *cell = Some(space_cell());
-        }
-        assert!(grid_is_blank(&grid));
-    }
-
-    // ── render_term_pane: spawning placeholder ──────────────────────────────
+    // ── render_term_pane: spawning loader ───────────────────────────────────
 
     fn rendered_content(grid: Option<&GridSnapshot>, selected: Option<&FlatNode>) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let backend = TestBackend::new(80, 5);
+        let backend = TestBackend::new(80, 9);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -421,28 +377,28 @@ mod tests {
     }
 
     #[test]
-    fn spawning_with_blank_grid_shows_launching_placeholder() {
+    fn spawning_with_blank_grid_shows_loader() {
         let node = flat_node(AgentStatus::Spawning, "claude");
         let grid = blank_cell_grid(20, 3);
         let content = rendered_content(Some(&grid), Some(&node));
-        assert!(content.contains("launching claude"), "expected placeholder, got: {content}");
-        assert!(content.contains("waiting for first output"));
+        assert!(content.contains("OVERSEER"), "expected loader, got: {content}");
+        assert!(content.contains("starting claude"));
     }
 
     #[test]
-    fn spawning_with_no_grid_shows_launching_placeholder() {
+    fn spawning_with_no_grid_shows_loader() {
         let node = flat_node(AgentStatus::Spawning, "opencode");
         let content = rendered_content(None, Some(&node));
-        assert!(content.contains("launching opencode"), "expected placeholder, got: {content}");
+        assert!(content.contains("starting opencode"), "expected loader, got: {content}");
     }
 
     #[test]
-    fn spawning_with_visible_content_paints_the_real_grid_not_the_placeholder() {
+    fn spawning_with_visible_content_still_hides_the_shell_bootstrap() {
         let node = flat_node(AgentStatus::Spawning, "claude");
         let grid = snapshot_from_bytes(20, 3, b"hi");
         let content = rendered_content(Some(&grid), Some(&node));
-        assert!(!content.contains("launching"), "must not show placeholder once content exists: {content}");
-        assert!(content.contains('h') && content.contains('i'));
+        assert!(content.contains("starting claude"), "expected loader, got: {content}");
+        assert!(!content.contains("hi"), "must hide terminal output while spawning: {content}");
     }
 
     #[test]
@@ -453,6 +409,6 @@ mod tests {
         let node = flat_node(AgentStatus::Running, "claude");
         let grid = blank_cell_grid(20, 3);
         let content = rendered_content(Some(&grid), Some(&node));
-        assert!(!content.contains("launching"), "must not show placeholder for a running agent: {content}");
+        assert!(!content.contains("starting"), "must not show loader for a running agent: {content}");
     }
 }
