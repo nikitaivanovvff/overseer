@@ -1,6 +1,6 @@
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -36,17 +36,8 @@ pub fn render_term_pane(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(node) = selected else {
+    if selected.is_none() {
         frame.render_widget(placeholder("no agent selected"), inner);
-        return inner;
-    };
-
-    // Adapter-selected workspaces launch through an interactive shell so
-    // exiting the harness returns to a usable prompt. Keep that implementation
-    // detail hidden until the harness's startup hook moves it out of Spawning.
-    // Status, not terminal output, is the initialization boundary.
-    if node.status == AgentStatus::Spawning {
-        frame.render_widget(loader(&node.adapter), inner);
         return inner;
     }
 
@@ -59,19 +50,6 @@ pub fn render_term_pane(
 
 fn placeholder(text: impl Into<String>) -> Paragraph<'static> {
     Paragraph::new(text.into()).style(Style::default().fg(Color::DarkGray))
-}
-
-fn loader(adapter: &str) -> Paragraph<'static> {
-    let view = format!(
-        "     .----------------.\n\
-         ----|    OVERSEER    |----\n\
-             '----------------'\n\n\
-         starting {adapter}..."
-    );
-    Paragraph::new(view)
-        .alignment(Alignment::Center)
-        .centered()
-        .style(Style::default().fg(Color::DarkGray))
 }
 
 /// Pure — the pane border's title. `alive` wins over everything else that
@@ -182,24 +160,7 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overseer_core::agent::{AgentId, AgentRole};
     use overseer_core::session::snapshot_from_bytes;
-
-    fn flat_node(status: AgentStatus, adapter: &str) -> FlatNode {
-        FlatNode {
-            id: AgentId::new(),
-            name: "agent".to_string(),
-            status,
-            role: AgentRole::Child,
-            repo: "repo".to_string(),
-            branch: "main".to_string(),
-            context_pct: None,
-            has_children: false,
-            prefix: String::new(),
-            status_since: std::time::Instant::now(),
-            adapter: adapter.to_string(),
-        }
-    }
 
     #[test]
     fn plain_text_renders_into_top_left() {
@@ -345,70 +306,4 @@ mod tests {
         assert_eq!(pane_title(false, 10, false), " agent [exited] ");
     }
 
-    fn blank_cell_grid(cols: u16, lines: u16) -> GridSnapshot {
-        GridSnapshot {
-            cols,
-            lines,
-            cells: vec![None; cols as usize * lines as usize],
-            cursor: None,
-            app_cursor_mode: false,
-            bracketed_paste_mode: false,
-            mouse_reporting_mode: false,
-            sgr_mouse_mode: false,
-            utf8_mouse_mode: false,
-            display_offset: 0,
-        }
-    }
-
-    // ── render_term_pane: spawning loader ───────────────────────────────────
-
-    fn rendered_content(grid: Option<&GridSnapshot>, selected: Option<&FlatNode>) -> String {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let backend = TestBackend::new(80, 9);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_term_pane(frame, frame.area(), grid, selected, false);
-            })
-            .unwrap();
-        terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect()
-    }
-
-    #[test]
-    fn spawning_with_blank_grid_shows_loader() {
-        let node = flat_node(AgentStatus::Spawning, "claude");
-        let grid = blank_cell_grid(20, 3);
-        let content = rendered_content(Some(&grid), Some(&node));
-        assert!(content.contains("OVERSEER"), "expected loader, got: {content}");
-        assert!(content.contains("starting claude"));
-    }
-
-    #[test]
-    fn spawning_with_no_grid_shows_loader() {
-        let node = flat_node(AgentStatus::Spawning, "opencode");
-        let content = rendered_content(None, Some(&node));
-        assert!(content.contains("starting opencode"), "expected loader, got: {content}");
-    }
-
-    #[test]
-    fn spawning_with_visible_content_still_hides_the_shell_bootstrap() {
-        let node = flat_node(AgentStatus::Spawning, "claude");
-        let grid = snapshot_from_bytes(20, 3, b"hi");
-        let content = rendered_content(Some(&grid), Some(&node));
-        assert!(content.contains("starting claude"), "expected loader, got: {content}");
-        assert!(!content.contains("hi"), "must hide terminal output while spawning: {content}");
-    }
-
-    #[test]
-    fn running_with_blank_grid_paints_the_real_blank_grid_not_a_placeholder() {
-        // Only `Spawning` gets the launching placeholder — a running (or
-        // idle) agent with a genuinely blank screen must never be lied
-        // about by pretending it's still launching.
-        let node = flat_node(AgentStatus::Running, "claude");
-        let grid = blank_cell_grid(20, 3);
-        let content = rendered_content(Some(&grid), Some(&node));
-        assert!(!content.contains("starting"), "must not show loader for a running agent: {content}");
-    }
 }

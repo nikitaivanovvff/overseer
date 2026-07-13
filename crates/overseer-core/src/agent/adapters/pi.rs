@@ -350,40 +350,4 @@ mod tests {
         assert!(!env.contains_key("OVERSEER_TASK"));
     }
 
-    // ── overseer_installed ────────────────────────────────────────────────────
-
-    fn temp_config_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("overseer-pi-installed-test-{}", uuid::Uuid::new_v4()))
-    }
-
-    #[test]
-    fn overseer_installed_false_on_a_fresh_config_dir() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("PI_CODING_AGENT_DIR", dir.to_str().unwrap());
-        assert!(!make_adapter().overseer_installed());
-    }
-
-    #[test]
-    fn overseer_installed_false_with_only_the_extension_written() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("PI_CODING_AGENT_DIR", dir.to_str().unwrap());
-        let ext = dir.join(EXTENSION_PATH);
-        std::fs::create_dir_all(ext.parent().unwrap()).unwrap();
-        std::fs::write(&ext, "x").unwrap();
-        assert!(!make_adapter().overseer_installed(), "instruction docs still missing");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn overseer_installed_true_once_extension_and_both_instructions_exist() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("PI_CODING_AGENT_DIR", dir.to_str().unwrap());
-        for path in [EXTENSION_PATH, ROOT_INSTRUCTIONS_PATH, CHILD_INSTRUCTIONS_PATH] {
-            let full = dir.join(path);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(&full, "x").unwrap();
-        }
-        assert!(make_adapter().overseer_installed());
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

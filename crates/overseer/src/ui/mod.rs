@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use std::collections::HashSet;
 
 use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
-use crate::app::{InputState, PendingAction, PickerOption, PickerState};
+use crate::app::{InputState, PendingAction};
 use overseer_core::config::{Action, Keybindings, Theme};
 use overseer_core::ipc::protocol::GridSnapshot;
 
@@ -84,7 +84,6 @@ pub fn render(
     tick: u64,
     prompt: Option<&str>,
     input: Option<&InputState>,
-    picker: Option<&PickerState>,
     pane_grid: Option<&GridSnapshot>,
     pane_focused: bool,
     theme: &Theme,
@@ -155,10 +154,6 @@ pub fn render(
     // already-narrow pane).
     if let Some(input) = input {
         render_input_modal(frame, area, input);
-    }
-
-    if let Some(picker) = picker {
-        render_picker_modal(frame, area, picker);
     }
 
     if show_help {
@@ -608,13 +603,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
 
 fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
     let (title, label, submit_hint) = match &input.action {
-        // Names the adapter picked in step 1, if any — "new workspace" alone
-        // for the bare-terminal choice (or the no-picker skip path), same
-        // wording as before this picker existed.
-        PendingAction::SpawnRoot { adapter: Some(name) } => {
-            (format!(" new workspace: {name} "), "repo path:", "spawn")
-        }
-        PendingAction::SpawnRoot { adapter: None } => (" new workspace ".to_string(), "repo path:", "spawn"),
+        PendingAction::SpawnRoot => (" new workspace ".to_string(), "repo path:", "spawn"),
         PendingAction::SpawnChild { .. } => (" spawn child ".to_string(), "name:", "spawn"),
         PendingAction::Search => (" search ".to_string(), "agent name:", "jump"),
     };
@@ -654,63 +643,6 @@ fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ])),
         rows[2],
-    );
-}
-
-/// Step 1 of `n` — every `overseer_installed()` adapter plus a literal "bare
-/// terminal" entry, `j`/`k`-navigable (see `handle_picker_key`). Only ever
-/// rendered when `PickerState` exists, which itself only happens when there
-/// was at least one option to offer beyond "bare terminal" — an empty
-/// `options` list can't occur in practice, but the row count still drives
-/// the popup height either way.
-fn render_picker_modal(frame: &mut Frame, area: Rect, picker: &PickerState) {
-    let height = picker.options.len() as u16 + 3; // rows + border(2) + hint line(1)
-    let Some(popup) = centered_rect(area, 44, height) else { return };
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" new workspace: choose a harness ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(inner);
-
-    let items: Vec<ListItem> = picker
-        .options
-        .iter()
-        .enumerate()
-        .map(|(i, option)| {
-            let label = match option {
-                PickerOption::Adapter(name) => name.clone(),
-                PickerOption::BareTerminal => "bare terminal".to_string(),
-            };
-            let line = if i == picker.selected {
-                Line::from(Span::styled(
-                    format!("❯ {label}"),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(Span::styled(format!("  {label}"), Style::default().fg(Color::DarkGray)))
-            };
-            ListItem::new(line)
-        })
-        .collect();
-    frame.render_widget(List::new(items), rows[0]);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("↵ ", Style::default().fg(Color::Yellow)),
-            Span::styled("choose   ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc ", Style::default().fg(Color::Yellow)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
-        ])),
-        rows[1],
     );
 }
 

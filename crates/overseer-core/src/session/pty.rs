@@ -141,9 +141,8 @@ pub struct SessionManager {
     current_size: Mutex<GridSize>,
     /// Test-only seam: in dry-run mode there's no real PTY for `write()` to
     /// send bytes to, so it records them here instead — lets tests assert
-    /// what would have been typed into the PTY (e.g.
-    /// `spawn_root_with_adapter`'s auto-typed harness command line) without
-    /// spawning a real process. Keyed by agent id, bytes appended in write order.
+    /// what would have been typed into the PTY without spawning a real
+    /// process. Keyed by agent id, bytes appended in write order.
     #[cfg(any(test, feature = "test-util"))]
     dry_run_writes: Mutex<HashMap<AgentId, Vec<u8>>>,
 }
@@ -349,8 +348,8 @@ impl SessionManager {
     }
 
     /// Forwards raw bytes to the agent's PTY — the input path for jump-in
-    /// keystrokes (Task 3) as well as this module's own query-reply writes
-    /// (e.g. `spawn_root_with_adapter` auto-typing the harness command).
+    /// keystrokes (Task 3) as well as forwarded mouse-wheel reports and
+    /// `overseer prompt`'s scripted writes.
     pub fn write(&self, id: &AgentId, bytes: Vec<u8>) {
         #[cfg(any(test, feature = "test-util"))]
         if matches!(self.mode, Mode::DryRun { .. }) {

@@ -16,8 +16,7 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use overseer_core::agent::{AgentId, AgentTree};
 use crate::app::{
-    App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction, PickerOption,
-    PickerState,
+    App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction,
 };
 use overseer_core::config::{Action, Config, KeyBinding, Keybindings};
 use overseer_core::daemon;
@@ -169,7 +168,6 @@ fn run_app<B: ratatui::backend::Backend>(
                     tick,
                     prompt.as_deref(),
                     input,
-                    app.picker.as_ref(),
                     pane_grid.as_ref(),
                     pane_focused,
                     theme,
@@ -238,9 +236,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             match app.focus {
                                 Focus::Pane => handle_pane_key(app, key),
                                 Focus::Tree => {
-                                    if app.picker.is_some() {
-                                        handle_picker_key(app, key, keybindings);
-                                    } else if app.input.is_some() {
+                                    if app.input.is_some() {
                                         handle_input_key(app, key);
                                     } else if app.confirm.is_some() {
                                         if !handle_confirm_key(app, key) {
@@ -381,11 +377,10 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: 
 /// agent's TUI because Overseer forwards wheel reports, not UI clicks. A click on an already-focused pane
 /// is a no-op rather than a re-`jump_in`, so it never resets a wheel-scrolled
 /// position back to the live bottom. Clicks while any modal is open (search
-/// input, spawn input, root-spawn adapter picker, drop/shutdown confirm, help
-/// popup) stay no-ops, mirroring how keyboard tree nav is unreachable in
-/// those states.
+/// input, spawn input, drop/shutdown confirm, help popup) stay no-ops,
+/// mirroring how keyboard tree nav is unreachable in those states.
 fn handle_left_click(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
-    if app.input.is_some() || app.confirm.is_some() || app.picker.is_some() || app.show_help {
+    if app.input.is_some() || app.confirm.is_some() || app.show_help {
         return;
     }
     let pos = Position::new(mouse.column, mouse.row);
@@ -511,7 +506,6 @@ fn handle_mouse_wheel(app: &mut App, mouse: &MouseEvent, pane_rect: Rect) -> i32
 fn tree_arrow_scroll_delta(app: &App, key: &KeyEvent) -> Option<i32> {
     if app.focus != Focus::Tree
         || app.show_help
-        || app.picker.is_some()
         || app.input.is_some()
         || app.confirm.is_some()
         || key.modifiers != KeyModifiers::NONE
@@ -625,64 +619,13 @@ fn build_prompt(app: &App) -> Option<String> {
     app.status_message.clone()
 }
 
-/// `n`: step 1 of the root-spawn flow. Skips straight to the repo-path prompt
-/// (today's pre-picker behavior, unchanged) when no adapter is
-/// `overseer_installed()`; otherwise opens the adapter picker with every
-/// installed adapter plus a literal "bare terminal" entry, letting
-/// `handle_picker_key`'s Enter open the same prompt with whatever got picked.
+/// `n`: opens the repo-path prompt for a new workspace — always a bare shell
+/// in the chosen repo, asking for nothing but the directory. Run your own
+/// agent inside it whenever you're ready.
 fn start_spawn_root(app: &mut App) {
     app.status_message = None;
-    let installed = overseer_core::agent::adapters::installed_adapter_names();
-    if installed.is_empty() {
-        open_spawn_root_prompt(app, None);
-        return;
-    }
-    let mut options: Vec<PickerOption> = installed.into_iter().map(PickerOption::Adapter).collect();
-    options.push(PickerOption::BareTerminal);
-    app.picker = Some(PickerState { options, selected: 0 });
-}
-
-/// Step 2 of the root-spawn flow (unchanged from before the picker existed,
-/// modulo carrying `adapter` through to `submit_input`'s `Request::Start`).
-fn open_spawn_root_prompt(app: &mut App, adapter: Option<String>) {
     let default_cwd = std::env::current_dir().map(|p| display_path_from_home(&p)).unwrap_or_default();
-    app.input = Some(InputState { action: PendingAction::SpawnRoot { adapter }, buffer: default_cwd });
-}
-
-/// Root-spawn picker key handling (step 1 of `n`) — `j`/`k` (or whatever
-/// `nav_down`/`nav_up` are remapped to) move the selection, `Enter` confirms
-/// into the repo-path prompt, `Esc` cancels back to the tree with no root
-/// spawned at all. Mirrors `handle_tree_key`'s nav-action lookup rather than
-/// hardcoding `j`/`k` literally, so a remap applies here too.
-fn handle_picker_key(app: &mut App, key: KeyEvent, keybindings: &Keybindings) {
-    match key.code {
-        KeyCode::Esc => {
-            app.picker = None;
-            return;
-        }
-        KeyCode::Enter => {
-            let Some(picker) = app.picker.take() else { return };
-            let adapter = match picker.options.get(picker.selected) {
-                Some(PickerOption::Adapter(name)) => Some(name.clone()),
-                Some(PickerOption::BareTerminal) | None => None,
-            };
-            open_spawn_root_prompt(app, adapter);
-            return;
-        }
-        _ => {}
-    }
-
-    let Some(binding) = key_binding_from_event(&key) else { return };
-    let Some(action) = keybindings.action_for_key(binding) else { return };
-    let Some(picker) = app.picker.as_mut() else { return };
-    match action {
-        Action::NavDown => {
-            let last = picker.options.len().saturating_sub(1);
-            picker.selected = (picker.selected + 1).min(last);
-        }
-        Action::NavUp => picker.selected = picker.selected.saturating_sub(1),
-        _ => {}
-    }
+    app.input = Some(InputState { action: PendingAction::SpawnRoot, buffer: default_cwd });
 }
 
 /// `s`: opens a name prompt for a taskless child under the selected node. Whether
@@ -750,14 +693,14 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 /// already, so an empty buffer only happens if the user deliberately cleared it.
 fn submit_input(app: &mut App, input: InputState) {
     match input.action {
-        PendingAction::SpawnRoot { adapter } => {
+        PendingAction::SpawnRoot => {
             let path_text = input.buffer.trim();
             let cwd = if path_text.is_empty() {
                 std::env::current_dir().ok()
             } else {
                 Some(expand_repo_path(path_text))
             };
-            dispatch_and_report(app, Request::Start { cwd, adapter });
+            dispatch_and_report(app, Request::Start { cwd });
         }
         PendingAction::SpawnChild { parent_id } => {
             let name = input.buffer.trim().to_string();
@@ -870,21 +813,6 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
 mod tests {
     use super::*;
     use overseer_core::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
-
-    /// Points every adapter's config-dir env var at a fresh, empty temp dir
-    /// at once, so `installed_adapter_names()` reports nothing installed
-    /// regardless of what's actually on this machine — the deterministic
-    /// baseline every `n`-key test needs (a dev/CI box with a real adapter
-    /// installed would otherwise open the picker where these tests expect
-    /// the pre-picker straight-to-prompt behavior, or vice versa).
-    fn with_no_adapters_installed() -> overseer_core::test_env::EnvGuard {
-        let dir = std::env::temp_dir().join(format!("overseer-tui-no-adapters-test-{}", uuid::Uuid::new_v4()));
-        overseer_core::test_env::EnvGuard::set_all(&[
-            ("CLAUDE_CONFIG_DIR", dir.join("claude").to_str().unwrap()),
-            ("XDG_CONFIG_HOME", dir.join("xdg").to_str().unwrap()),
-            ("PI_CODING_AGENT_DIR", dir.join("pi").to_str().unwrap()),
-        ])
-    }
 
     #[test]
     fn mock_ctx_never_gets_a_real_session_manager() {
@@ -1323,7 +1251,6 @@ mod tests {
 
     #[test]
     fn handle_tree_key_respects_a_remapped_action() {
-        let _env = with_no_adapters_installed();
         let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
         register_agent(&ctx, None);
         let kb = Keybindings { spawn_root: KeyBinding::Char('a'), ..Keybindings::default() };
@@ -1332,122 +1259,18 @@ mod tests {
         handle_tree_key(&mut app, key(KeyCode::Char('n'), KeyModifiers::NONE), 24, &kb);
         assert!(app.input.is_none(), "'n' must be inert once spawn_root is remapped to 'a'");
 
-        // 'a' (the remap) must trigger it instead. Nothing is installed
-        // (env above), so this goes straight to the prompt, not the picker.
+        // 'a' (the remap) must trigger it instead.
         handle_tree_key(&mut app, key(KeyCode::Char('a'), KeyModifiers::NONE), 24, &kb);
-        assert!(matches!(
-            app.input.as_ref().map(|i| &i.action),
-            Some(PendingAction::SpawnRoot { adapter: None })
-        ));
+        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::SpawnRoot)));
     }
 
-    // ── root-spawn adapter picker (`n` step 1) ────────────────────────────────
-
-    /// Points every adapter's config-dir env var away from this machine's real
-    /// state, then writes claude's own install artifacts (its actual
-    /// `install_files()` list, not a hand-picked path) so only claude reports
-    /// `overseer_installed()`.
-    fn with_only_claude_installed() -> overseer_core::test_env::EnvGuard {
-        let dir = std::env::temp_dir().join(format!("overseer-tui-picker-test-{}", uuid::Uuid::new_v4()));
-        let claude_dir = dir.join("claude");
-        let env = overseer_core::test_env::EnvGuard::set_all(&[
-            ("CLAUDE_CONFIG_DIR", claude_dir.to_str().unwrap()),
-            ("XDG_CONFIG_HOME", dir.join("xdg").to_str().unwrap()),
-            ("PI_CODING_AGENT_DIR", dir.join("pi").to_str().unwrap()),
-        ]);
-        let adapter = overseer_core::agent::adapters::adapter_for("claude").unwrap();
-        for file in adapter.install_files() {
-            if matches!(file.merge, overseer_core::agent::adapters::MergeStrategy::Overwrite) {
-                let full = claude_dir.join(&file.path);
-                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-                std::fs::write(&full, "x").unwrap();
-            }
-        }
-        env
-    }
+    // ── root-spawn prompt (`n`) ───────────────────────────────────────────────
 
     #[test]
-    fn start_spawn_root_skips_the_picker_when_nothing_installed() {
-        let _env = with_no_adapters_installed();
+    fn start_spawn_root_opens_the_repo_path_prompt_directly() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
         start_spawn_root(&mut app);
-        assert!(app.picker.is_none());
-        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::SpawnRoot { adapter: None })));
-    }
-
-    #[test]
-    fn start_spawn_root_opens_the_picker_when_an_adapter_is_installed() {
-        let _env = with_only_claude_installed();
-        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
-        start_spawn_root(&mut app);
-        assert!(app.input.is_none(), "the picker opens first, not the repo-path prompt");
-        let picker = app.picker.as_ref().expect("picker should be open");
-        assert_eq!(
-            picker.options,
-            vec![PickerOption::Adapter("claude".to_string()), PickerOption::BareTerminal]
-        );
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn handle_picker_key_nav_down_and_up_clamp_at_the_ends() {
-        let _env = with_only_claude_installed();
-        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
-        start_spawn_root(&mut app);
-        let kb = Keybindings::default();
-
-        // Two options (claude, bare terminal) — nav down twice must clamp at 1.
-        handle_picker_key(&mut app, key(KeyCode::Char('j'), KeyModifiers::NONE), &kb);
-        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
-        handle_picker_key(&mut app, key(KeyCode::Char('j'), KeyModifiers::NONE), &kb);
-        assert_eq!(app.picker.as_ref().unwrap().selected, 1, "must clamp at the last option");
-
-        handle_picker_key(&mut app, key(KeyCode::Char('k'), KeyModifiers::NONE), &kb);
-        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
-        handle_picker_key(&mut app, key(KeyCode::Char('k'), KeyModifiers::NONE), &kb);
-        assert_eq!(app.picker.as_ref().unwrap().selected, 0, "must clamp at zero");
-    }
-
-    #[test]
-    fn handle_picker_key_enter_on_an_adapter_opens_the_prompt_with_that_adapter() {
-        let _env = with_only_claude_installed();
-        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
-        start_spawn_root(&mut app);
-        let kb = Keybindings::default();
-
-        handle_picker_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &kb);
-        assert!(app.picker.is_none());
-        assert!(matches!(
-            app.input.as_ref().map(|i| &i.action),
-            Some(PendingAction::SpawnRoot { adapter: Some(name) }) if name == "claude"
-        ));
-    }
-
-    #[test]
-    fn handle_picker_key_enter_on_bare_terminal_opens_the_prompt_with_no_adapter() {
-        let _env = with_only_claude_installed();
-        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
-        start_spawn_root(&mut app);
-        let kb = Keybindings::default();
-
-        handle_picker_key(&mut app, key(KeyCode::Char('j'), KeyModifiers::NONE), &kb); // -> bare terminal
-        handle_picker_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &kb);
-        assert!(matches!(
-            app.input.as_ref().map(|i| &i.action),
-            Some(PendingAction::SpawnRoot { adapter: None })
-        ));
-    }
-
-    #[test]
-    fn handle_picker_key_esc_cancels_without_opening_the_prompt() {
-        let _env = with_only_claude_installed();
-        let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
-        start_spawn_root(&mut app);
-        let kb = Keybindings::default();
-
-        handle_picker_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE), &kb);
-        assert!(app.picker.is_none());
-        assert!(app.input.is_none());
+        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::SpawnRoot)));
     }
 
     // ── fuzzy search (PHASE5B.md Task 1) ─────────────────────────────────────

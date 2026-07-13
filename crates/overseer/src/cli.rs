@@ -284,7 +284,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             Ok(Some(Request::Agent { agent_id }))
         }
-        Command::Start { cwd } => Ok(Some(Request::Start { cwd, adapter: None })),
+        Command::Start { cwd } => Ok(Some(Request::Start { cwd })),
         Command::Spawn { task, name, adapter } => {
             let parent_id_str = std::env::var("OVERSEER_AGENT_ID").map_err(|_| {
                 anyhow::anyhow!("overseer spawn must be run from an agent session (missing $OVERSEER_AGENT_ID)")
@@ -338,7 +338,7 @@ mod tests {
     fn build_request_start_returns_start() {
         let cmd = Command::Start { cwd: Some(PathBuf::from("/tmp/myrepo")) };
         let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
-        assert!(matches!(req, Request::Start { cwd, adapter: None } if cwd == Some(PathBuf::from("/tmp/myrepo"))));
+        assert!(matches!(req, Request::Start { cwd } if cwd == Some(PathBuf::from("/tmp/myrepo"))));
     }
 
     #[test]

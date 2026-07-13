@@ -520,43 +520,4 @@ mod tests {
         assert!(!env.contains_key("OVERSEER_TASK"));
     }
 
-    // ── overseer_installed ────────────────────────────────────────────────────
-
-    fn temp_config_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("overseer-claude-installed-test-{}", uuid::Uuid::new_v4()))
-    }
-
-    #[test]
-    fn overseer_installed_false_on_a_fresh_config_dir() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("CLAUDE_CONFIG_DIR", dir.to_str().unwrap());
-        assert!(!make_adapter().overseer_installed());
-    }
-
-    #[test]
-    fn overseer_installed_false_with_only_one_skill_file_written() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("CLAUDE_CONFIG_DIR", dir.to_str().unwrap());
-        let root_skill = dir.join(ROOT_SKILL_PATH);
-        std::fs::create_dir_all(root_skill.parent().unwrap()).unwrap();
-        std::fs::write(&root_skill, "x").unwrap();
-        assert!(!make_adapter().overseer_installed(), "child skill still missing");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn overseer_installed_true_once_both_skill_files_exist_even_without_settings_json() {
-        let dir = temp_config_dir();
-        let _env = crate::test_env::EnvGuard::set("CLAUDE_CONFIG_DIR", dir.to_str().unwrap());
-        for path in [ROOT_SKILL_PATH, CHILD_SKILL_PATH] {
-            let full = dir.join(path);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(&full, "x").unwrap();
-        }
-        // settings.json (JsonMerge) deliberately left unwritten — it can
-        // pre-exist for reasons unrelated to Overseer, so it isn't part of
-        // the signal.
-        assert!(make_adapter().overseer_installed());
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

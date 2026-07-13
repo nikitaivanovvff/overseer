@@ -32,19 +32,13 @@ pub struct SpawnRequest {
     /// blank falls back to `task` verbatim (`spawn_child_agent`).
     pub name: Option<String>,
     /// Child-only: which harness to launch (required, validated against
-    /// `config.adapters`). Ignored for a root — see `root_adapter` instead.
+    /// `config.adapters`). Ignored for a root, which is always a bare shell.
     pub adapter_name: String,
     pub cwd: PathBuf,
     pub repo: String,
     /// Explicit branch override (used by `start --branch`-style callers). `None` lets
     /// the registry apply its default ("main" for root, "overseer/<id>" for child).
     pub branch: Option<String>,
-    /// Root-only: `Some(name)` launches that adapter directly (empty task,
-    /// same launch path a child uses) instead of a bare shell — the TUI's
-    /// two-step `n` picker's second field. `None`/blank preserves the
-    /// bare-shell default. Ignored for a child (which always uses
-    /// `adapter_name` instead).
-    pub root_adapter: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -61,9 +55,8 @@ pub enum SpawnError {
 
 /// Registers a new agent and launches its PTY session in one step.
 /// The single shared orchestration entry point for root (`start`) and child (`spawn`)
-/// launches — dispatches to a role-specific path since root additionally branches
-/// on whether an adapter was chosen (bare shell vs. adapter-driven), while a
-/// child is always adapter-driven.
+/// launches — dispatches to a role-specific path since root is always a bare
+/// shell, while a child is always adapter-driven.
 pub fn spawn_agent(
     registry: &AgentRegistry,
     sessions: &SessionManager,
@@ -72,7 +65,7 @@ pub fn spawn_agent(
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
     match req.role.clone() {
-        AgentRole::Root => spawn_root(registry, sessions, socket, config, req),
+        AgentRole::Root => spawn_root(registry, sessions, socket, req),
         AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Spawning),
     }
 }
@@ -87,28 +80,12 @@ pub fn spawn_manual_child(
     spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Idle)
 }
 
-/// Root path: bare shell by default, or — if `req.root_adapter` names one —
-/// that adapter launched directly instead (the TUI's two-step `n` picker's
-/// second step, once at least one adapter is `overseer_installed()`).
-fn spawn_root(
-    registry: &AgentRegistry,
-    sessions: &SessionManager,
-    socket: &Path,
-    config: &Config,
-    req: SpawnRequest,
-) -> Result<RegisterResult, SpawnError> {
-    match req.root_adapter.clone().filter(|n| !n.trim().is_empty()) {
-        Some(adapter_name) => spawn_root_with_adapter(registry, sessions, socket, config, req, adapter_name),
-        None => spawn_root_bare_shell(registry, sessions, socket, req),
-    }
-}
-
 /// No `AgentAdapter`, no configured agent binary — just a plain shell in the
 /// chosen repo, registered `Idle`. Whatever the user later runs inside (e.g.
 /// `claude`) inherits the identity env vars via the PTY's normal
 /// process-environment inheritance, and the existing PostToolUse/Stop hooks pick
 /// it up from there — no new detection/polling code, this is pure push.
-fn spawn_root_bare_shell(
+fn spawn_root(
     registry: &AgentRegistry,
     sessions: &SessionManager,
     socket: &Path,
@@ -150,105 +127,10 @@ fn resolve_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-/// Root path when an adapter was actually chosen (picker step 2, or a
-/// hand-built `Request::Start { adapter: Some(_), .. }`) — launched like the
-/// bare-shell root (a live, interactive shell as the PTY child), with the
-/// adapter's own launch command auto-typed into it. Registers `Spawning` so
-/// the TUI can hide that shell bootstrap until the harness's own
-/// `SessionStart`-equivalent hook flips status to `Idle`
-/// (every adapter's install hook already branches on `$OVERSEER_ROLE` to
-/// push `idle` for a root regardless of who typed the launch command).
-///
-/// Exec'ing the harness binary directly as the PTY child (the previous
-/// approach) meant exiting the harness killed the whole PTY — the exit
-/// watcher then flipped the workspace straight to `done`/`error` and the
-/// pane froze on the harness's last frame. Going through a shell first means
-/// exiting the harness drops back to a live shell prompt (workspace stays
-/// up), and only exiting *that* shell ends the workspace — exactly how a
-/// bare-shell root already behaves. Side benefit: the pane shows a live
-/// shell prompt and the typed command within milliseconds instead of being
-/// blank for the harness's entire boot time.
-fn spawn_root_with_adapter(
-    registry: &AgentRegistry,
-    sessions: &SessionManager,
-    socket: &Path,
-    config: &Config,
-    req: SpawnRequest,
-    adapter_name: String,
-) -> Result<RegisterResult, SpawnError> {
-    let (adapter, adapter_config) = resolve_adapter(config, &adapter_name)?;
-
-    let args = RegisterArgs {
-        id: None,
-        name: req.repo.clone(), // still named after the repo, same as the bare-shell root
-        role: AgentRole::Root,
-        parent_id: None,
-        adapter: adapter_name, // label = the chosen adapter, not "shell"
-        repo: req.repo.clone(),
-        cwd: req.cwd.clone(),
-        branch: req.branch,
-        initial_status: AgentStatus::Spawning,
-    };
-    let result = registry.register(args)?;
-
-    let launch_ctx = LaunchContext {
-        agent_id: result.id.clone(),
-        role: AgentRole::Root,
-        parent_id: None,
-        socket: socket.to_path_buf(),
-        cwd: req.cwd.clone(),
-        repo: req.repo,
-        command: adapter_config.command.clone(),
-        extra_args: adapter_config.extra_args.clone(),
-        task: String::new(), // a root has no task, same as the bare-shell path
-        depth: 1,
-    };
-    // The harness invocation to type in, not to exec directly — see the
-    // doc comment above for why exec'ing it here would recreate the bug.
-    let harness_cmd = adapter.spawn_command(&launch_ctx);
-    let env = adapter.env_inject(&launch_ctx);
-
-    let shell_cmd = Command::new(resolve_shell());
-    if let Err(e) = sessions.launch(result.id.clone(), &req.cwd, &shell_cmd, &env) {
-        registry.remove(&result.id);
-        return Err(SpawnError::Launch(e));
-    }
-
-    let command_line = format!("{}\n", shell_command_line(&harness_cmd));
-    sessions.write(&result.id, command_line.into_bytes());
-
-    Ok(result)
-}
-
-/// POSIX single-quote-quotes `cmd`'s program and each argument, joined by
-/// spaces — safe to type verbatim into an interactive shell. Single-quoting
-/// (rather than double-quoting or escaping) is the simplest form that's
-/// correct for arbitrary bytes: the only special case is an embedded `'`,
-/// which becomes `'\''` (close the quote, an escaped literal quote, reopen
-/// the quote). Needed because some adapters' args are absolute paths that
-/// may contain spaces (pi's `--extension <path>`, `--append-system-prompt
-/// <path>`).
-fn shell_command_line(cmd: &Command) -> String {
-    let mut parts = Vec::new();
-    parts.push(shell_quote(&cmd.get_program().to_string_lossy()));
-    for arg in cmd.get_args() {
-        parts.push(shell_quote(&arg.to_string_lossy()));
-    }
-    parts.join(" ")
-}
-
-/// Single-quotes `s` for a POSIX shell, escaping any embedded `'`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// Looks up `adapter_name`'s `AgentAdapter` impl + its resolved `config.adapters`
-/// entry (command/extra_args) — the shared resolution both `spawn_child_agent`
-/// and `spawn_root_with_adapter` need before they can launch. `is_installed()`
-/// (not `overseer_installed()`) is the check here: this guards against a launch
-/// that would crash outright (HARNESSES.md), not against "did the user ever run
-/// `overseer install`" — the TUI's own picker already filters on the latter
-/// before this is ever reached from that path.
+/// entry (command/extra_args) — the shared resolution `spawn_child_agent` needs
+/// before it can launch. `is_installed()` guards against a launch that would
+/// crash outright (HARNESSES.md).
 fn resolve_adapter<'a>(
     config: &'a Config,
     adapter_name: &str,
@@ -364,7 +246,6 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             repo: "overseer".to_string(),
             branch: None,
-            root_adapter: None,
         }
     }
 
@@ -665,146 +546,4 @@ mod tests {
         assert!(registry.snapshot().is_empty());
     }
 
-    // ── root-adapter launch (the `n` picker's second step) ───────────────────
-
-    fn root_request_with_adapter(adapter: &str) -> SpawnRequest {
-        let mut req = base_request(AgentRole::Root, None);
-        req.root_adapter = Some(adapter.to_string());
-        req
-    }
-
-    #[test]
-    fn spawn_agent_root_with_adapter_registers_spawning_with_that_adapter_label() {
-        let (registry, sessions) = make_registry_and_sessions();
-        let config = Config::default();
-        let result = spawn_agent(
-            &registry,
-            &sessions,
-            &PathBuf::from("/tmp/overseer.sock"),
-            &config,
-            root_request_with_adapter("claude"),
-        )
-        .unwrap();
-        let dto = registry.get(&result.id).unwrap();
-        // The harness's startup hook changes this to Idle once initialization
-        // completes. Until then the TUI hides the shell bootstrap.
-        assert_eq!(dto.adapter, "claude");
-        assert_eq!(dto.status, AgentStatus::Spawning);
-    }
-
-    #[test]
-    fn spawn_agent_root_with_adapter_still_names_node_after_repo_not_task() {
-        let (registry, sessions) = make_registry_and_sessions();
-        let config = Config::default();
-        let mut req = root_request_with_adapter("claude");
-        req.task = "this text should never become the name".to_string();
-        req.repo = "distinct-repo-name".to_string();
-        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
-            .unwrap();
-        let dto = registry.get(&result.id).unwrap();
-        assert_eq!(dto.name, "distinct-repo-name");
-    }
-
-    #[test]
-    fn spawn_agent_root_with_blank_adapter_falls_back_to_bare_shell() {
-        // An empty/whitespace-only `root_adapter` means "no adapter was
-        // actually chosen" — same as `None`, not "launch an adapter named ''".
-        let (registry, sessions) = make_registry_and_sessions();
-        let config = Config::default();
-        let mut req = base_request(AgentRole::Root, None);
-        req.root_adapter = Some("   ".to_string());
-        let result = spawn_agent(&registry, &sessions, &PathBuf::from("/tmp/overseer.sock"), &config, req)
-            .unwrap();
-        let dto = registry.get(&result.id).unwrap();
-        assert_eq!(dto.adapter, "shell");
-        assert_eq!(dto.status, AgentStatus::Idle);
-    }
-
-    #[test]
-    fn spawn_agent_root_with_unknown_adapter_errors_and_registers_nothing() {
-        let (registry, sessions) = make_registry_and_sessions();
-        let config = Config::default();
-        let err = spawn_agent(
-            &registry,
-            &sessions,
-            &PathBuf::from("/tmp/overseer.sock"),
-            &config,
-            root_request_with_adapter("nonexistent"),
-        )
-        .unwrap_err();
-        assert!(matches!(err, SpawnError::UnknownAdapter(name) if name == "nonexistent"));
-        assert!(registry.snapshot().is_empty());
-    }
-
-    #[test]
-    fn spawn_agent_root_with_adapter_rolls_back_registration_on_launch_failure() {
-        let registry = AgentRegistry::new();
-        let failing_sessions = SessionManager::dry_run_failing_launch();
-        let config = Config::default();
-        let err = spawn_agent(
-            &registry,
-            &failing_sessions,
-            &PathBuf::from("/tmp/overseer.sock"),
-            &config,
-            root_request_with_adapter("claude"),
-        )
-        .unwrap_err();
-        assert!(matches!(err, SpawnError::Launch(_)));
-        assert!(registry.snapshot().is_empty());
-    }
-
-    /// The PTY child launched is a shell (not the harness binary), and the
-    /// harness invocation gets typed into it as a follow-up write, ending in
-    /// a newline to submit it — this is what actually fixes ROOT-SHELL-FALLBACK:
-    /// exiting the harness now drops to a live shell instead of killing the PTY.
-    #[test]
-    fn spawn_agent_root_with_adapter_launches_a_shell_and_types_the_harness_command() {
-        let _env = crate::test_env::EnvGuard::set("SHELL", "/bin/zsh");
-        let (registry, sessions) = make_registry_and_sessions();
-        let mut config = Config::default();
-        config.adapters.insert(
-            "claude".to_string(),
-            crate::config::AdapterConfig {
-                command: "claude".to_string(),
-                extra_args: vec!["--dangerously-skip-permissions".to_string()],
-            },
-        );
-        let result = spawn_agent(
-            &registry,
-            &sessions,
-            &PathBuf::from("/tmp/overseer.sock"),
-            &config,
-            root_request_with_adapter("claude"),
-        )
-        .unwrap();
-
-        let typed = String::from_utf8(sessions.dry_run_written_bytes(&result.id)).unwrap();
-        assert_eq!(typed, "'claude' '--dangerously-skip-permissions'\n");
-    }
-
-    // ── shell_command_line ────────────────────────────────────────────────────
-
-    #[test]
-    fn shell_command_line_quotes_plain_program_and_args() {
-        let mut cmd = Command::new("claude");
-        cmd.arg("--dangerously-skip-permissions");
-        assert_eq!(shell_command_line(&cmd), "'claude' '--dangerously-skip-permissions'");
-    }
-
-    #[test]
-    fn shell_command_line_quotes_args_containing_spaces() {
-        let mut cmd = Command::new("pi");
-        cmd.arg("--append-system-prompt").arg("/Users/me/My Documents/overseer-root.md");
-        assert_eq!(
-            shell_command_line(&cmd),
-            "'pi' '--append-system-prompt' '/Users/me/My Documents/overseer-root.md'"
-        );
-    }
-
-    #[test]
-    fn shell_command_line_escapes_embedded_single_quotes() {
-        let mut cmd = Command::new("claude");
-        cmd.arg("it's a task");
-        assert_eq!(shell_command_line(&cmd), r"'claude' 'it'\''s a task'");
-    }
 }
