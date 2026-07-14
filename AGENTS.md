@@ -37,7 +37,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 |------|-------------|------------|-------------|
 | **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
-| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and context %. | `ui::render_agent_detail` |
+| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, and `since`. | `ui::render_agent_detail` |
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
@@ -211,6 +211,8 @@ Status meanings: `spawning` (registered, launching) → `running` (working) → 
 
 Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the detail pane always shows it under `status:`.
 
+Claude Code sessions also carry `context_pct` (`--from-hook` reads it off the transcript, see the `overseer status` row above) — kept in the wire protocol and `overseer list`/`overseer agent` JSON for scripting, but **no longer rendered in the TUI** (removed from both the tree row and the Details pane, 2026-07-15). The removed display computed a % of a hardcoded 200,000-token window, which is wrong for any account on a larger context variant (e.g. Claude's 1M-token Sonnet) — rather than keep showing a number that can silently be wrong depending on account config, it was pulled from the view entirely. Re-adding it to the UI needs an honestly-sourced per-adapter signal (see `HARNESS-CAPABILITIES.md`'s `context_usage` capability), not a bigger hardcoded guess.
+
 ### Attention Surfacing
 
 A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tree's own `!` badge, both edge-triggered (fire once on the transition, not on a repeated push):
@@ -242,9 +244,9 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 ┌───────────────────────────┬─────────────────────────────────────────┐
 │ WORKSPACES                │                                         │
 │ ◌ overseer            idle│   the selected agent's live grid,       │
-│   ├ ⠸ auth-module 8%      │   painted directly into this same       │
-│   ├ ! tests blocked 2m 91%│   ratatui frame by ui/term_pane —       │
-│   └ ✓ docs             62%│   real color, real interaction          │
+│   ├ ⠸ auth-module         │   painted directly into this same       │
+│   ├ ! tests    blocked 2m │   ratatui frame by ui/term_pane —       │
+│   └ ✓ docs                │   real color, real interaction          │
 │ ! refactor-api  blocked 5m│   once focused (Ctrl-l)                 │
 ├───────────────────────────┤                                         │
 │ task:   auth-module       │                                         │
@@ -252,14 +254,13 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ branch: ovsr/a            │                                         │
 │ status: running           │                                         │
 │ since:  4m                │                                         │
-│ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
  OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
 
-Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention.
+Each tree row right-aligns the status word in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention. Context % is no longer surfaced in the UI (tree or Details) — see the note under "Status meanings" below.
 
 Status badges: `●` running · `!` blocked (needs you) · `◌` idle · `✓` done · `✗` error · `…` spawning
 

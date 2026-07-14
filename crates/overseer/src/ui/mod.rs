@@ -327,11 +327,9 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     // need a clock, it's actively doing something.
     let age = matches!(node.status, AgentStatus::Blocked | AgentStatus::Idle)
         .then(|| format_age(node.status_since.elapsed()));
-    let layout =
-        format_tree_row(&node.name, node.status.label(), age.as_deref(), node.context_pct, row_width);
-    let gap = row_width
-        .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
-        .max(1);
+    let layout = format_tree_row(&node.name, node.status.label(), age.as_deref(), row_width);
+    let gap =
+        row_width.saturating_sub(layout.name.chars().count() + layout.status_word.chars().count()).max(1);
 
     // A dimmed (ancestor-context-only) row during search stays legible but
     // visually recedes behind actual matches — everything in `theme.idle`,
@@ -353,41 +351,31 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
         Span::styled(layout.status_word, row_status_style),
-        Span::styled(layout.pct_suffix, Style::default().fg(Color::DarkGray)),
     ])
 }
 
 /// Pure. Lays out one tree row's text: the name (truncated with `…` if it would
-/// otherwise overflow `width`) and a right-aligned `<status> <pct>%` block —
-/// `pct_suffix` is empty while the context % is unknown. Kept free of styling so
-/// `tree_row` can color the status word specially when blocked; this function
-/// only owns the width arithmetic.
+/// otherwise overflow `width`) and a right-aligned status word. Kept free of
+/// styling so `tree_row` can color the status word specially when blocked;
+/// this function only owns the width arithmetic.
 struct TreeRowLayout {
     name: String,
     status_word: String,
-    pct_suffix: String,
 }
 
-fn format_tree_row(
-    name: &str,
-    status_label: &str,
-    age: Option<&str>,
-    pct: Option<u8>,
-    width: usize,
-) -> TreeRowLayout {
+fn format_tree_row(name: &str, status_label: &str, age: Option<&str>, width: usize) -> TreeRowLayout {
     let status_word = match age {
         Some(age) => format!("{status_label} {age}"),
         None => status_label.to_string(),
     };
-    let pct_suffix = pct.map(|p| format!(" {p}%")).unwrap_or_default();
-    let right_len = status_word.chars().count() + pct_suffix.chars().count();
+    let right_len = status_word.chars().count();
     // Reserve at least 1 column of gap between name and the right block; if the
     // row is too narrow even for the right block alone, let the name collapse to
     // nothing rather than underflow — render() just clips an over-length line,
     // same as any other ratatui `Line`.
     let name_budget = width.saturating_sub(right_len + 1);
     let name = truncate_with_ellipsis(name, name_budget);
-    TreeRowLayout { name, status_word, pct_suffix }
+    TreeRowLayout { name, status_word }
 }
 
 /// Pure. Formats an elapsed duration as a single-unit age (ATTENTION.md):
@@ -453,15 +441,6 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
                 Span::styled(
                     if node.branch.is_empty() { "—".to_string() } else { node.branch.clone() },
                     Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("ctx:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    node.context_pct
-                        .map(|p| format!("{p}%  {}", context_bar(p)))
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(Color::White),
                 ),
             ]),
             Line::from(vec![
@@ -660,11 +639,6 @@ fn tail(text: &str, width: u16) -> String {
     }
 }
 
-fn context_bar(pct: u8) -> String {
-    let filled = (pct as usize * 8 / 100).min(8);
-    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
-}
-
 fn focused_border(focused: bool, theme: &Theme) -> Style {
     if focused {
         Style::default().fg(term_pane::map_dto_color(theme.border_focused))
@@ -701,22 +675,14 @@ mod tests {
 
     #[test]
     fn format_tree_row_fits_without_truncation_in_a_roomy_width() {
-        let layout = format_tree_row("auth-module", "idle", None, Some(62), 40);
+        let layout = format_tree_row("auth-module", "idle", None, 40);
         assert_eq!(layout.name, "auth-module");
         assert_eq!(layout.status_word, "idle");
-        assert_eq!(layout.pct_suffix, " 62%");
-    }
-
-    #[test]
-    fn format_tree_row_omits_pct_when_unknown() {
-        let layout = format_tree_row("write-tests", "running", None, None, 40);
-        assert_eq!(layout.pct_suffix, "");
-        assert_eq!(layout.status_word, "running");
     }
 
     #[test]
     fn format_tree_row_truncates_long_name_with_ellipsis() {
-        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, Some(91), 20);
+        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, 20);
         assert!(layout.name.ends_with('…'));
         assert!(layout.name.chars().count() < "a-very-long-task-description-here".chars().count());
     }
@@ -724,25 +690,23 @@ mod tests {
     #[test]
     fn format_tree_row_narrow_width_does_not_panic() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "blocked", None, Some(5), width);
-            // Right block (status + pct) always survives intact even if the name collapses.
+            let layout = format_tree_row("some-task", "blocked", None, width);
+            // Right block (status word) always survives intact even if the name collapses.
             assert_eq!(layout.status_word, "blocked");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
     #[test]
     fn format_tree_row_appends_age_to_the_status_word() {
-        let layout = format_tree_row("update-docs", "blocked", Some("2m"), Some(5), 40);
+        let layout = format_tree_row("update-docs", "blocked", Some("2m"), 40);
         assert_eq!(layout.status_word, "blocked 2m");
     }
 
     #[test]
-    fn format_tree_row_age_survives_at_a_narrow_width_alongside_pct() {
+    fn format_tree_row_age_survives_at_a_narrow_width() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "idle", Some("12m"), Some(5), width);
+            let layout = format_tree_row("some-task", "idle", Some("12m"), width);
             assert_eq!(layout.status_word, "idle 12m");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
