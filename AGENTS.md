@@ -6,7 +6,7 @@ The agents are already smart. Overseer does **not** reimplement what they do —
 
 The usual shape is **one workspace per repository**. `n` spawns a workspace: it asks for a repo path (default: cwd) and launches a bare shell there — no adapter is launched on your behalf. The row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks once you run one yourself (its own `idle` sticks until then). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
 
-The hierarchy is intentionally capped at **depth 3**: a workspace (depth 1) can spawn children (depth 2), and those children can spawn visible leaf agents (depth 3). Depth-3 agents cannot spawn. Every parent also has a configurable direct-child cap (`[defaults] max_children`, default 8), keeping the tree readable and preventing runaway PTY/token costs. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is just a bare shell with nothing running yet, same as a human just opening it. The adapter (claude, opencode, pi) is shown in the detail panel; a workspace always starts labeled `shell` until you run a real harness inside it yourself.
+The hierarchy is intentionally capped at **depth 3**: a workspace (depth 1) can spawn children (depth 2), and those children can spawn visible leaf agents (depth 3). Depth-3 agents cannot spawn. Every parent also has a configurable direct-child cap (`[defaults] max_children`, default 8), keeping the tree readable and preventing runaway PTY/token costs. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is just a bare shell with nothing running yet, same as a human just opening it. The adapter (claude, opencode, pi) is shown as a 1-letter glyph fused to each tree row's status badge (`C`/`O`/`P`, derived generically from the adapter name rather than a hardcoded match); a workspace always starts labeled `shell` until you run a real harness inside it yourself, and its glyph stays blank until then.
 
 ---
 
@@ -37,7 +37,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 |------|-------------|------------|-------------|
 | **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
-| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and context %. | `ui::render_agent_detail` |
+| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, and `since`. | `ui::render_agent_detail` |
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
@@ -211,6 +211,8 @@ Status meanings: `spawning` (registered, launching) → `running` (working) → 
 
 Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the detail pane always shows it under `status:`.
 
+Claude Code sessions also carry `context_pct` (`--from-hook` reads it off the transcript, see the `overseer status` row above) — kept in the wire protocol and `overseer list`/`overseer agent` JSON for scripting, but **no longer rendered in the TUI** (removed from both the tree row and the Details pane, 2026-07-15). The removed display computed a % of a hardcoded 200,000-token window, which is wrong for any account on a larger context variant (e.g. Claude's 1M-token Sonnet) — rather than keep showing a number that can silently be wrong depending on account config, it was pulled from the view entirely. Re-adding it to the UI needs an honestly-sourced per-adapter signal (see `HARNESS-CAPABILITIES.md`'s `context_usage` capability), not a bigger hardcoded guess.
+
 ### Attention Surfacing
 
 A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tree's own `!` badge, both edge-triggered (fire once on the transition, not on a repeated push):
@@ -241,27 +243,28 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 ```
 ┌───────────────────────────┬─────────────────────────────────────────┐
 │ WORKSPACES                │                                         │
-│ ◌ overseer            idle│   the selected agent's live grid,       │
-│   ├ ⠸ auth-module 8%      │   painted directly into this same       │
-│   ├ ! tests blocked 2m 91%│   ratatui frame by ui/term_pane —       │
-│   └ ✓ docs             62%│   real color, real interaction          │
-│ ! refactor-api  blocked 5m│   once focused (Ctrl-l)                 │
+│ ◌  overseer           idle│   the selected agent's live grid,       │
+│   ├ ⠸O auth-module        │   painted directly into this same       │
+│   ├ !C tests   blocked 2m │   ratatui frame by ui/term_pane —       │
+│   └ ✓P docs               │   real color, real interaction          │
+│ !C refactor-api blocked 5m│   once focused (Ctrl-l)                 │
 ├───────────────────────────┤                                         │
 │ task:   auth-module       │                                         │
 │ repo:   overseer          │                                         │
 │ branch: ovsr/a            │                                         │
 │ status: running           │                                         │
 │ since:  4m                │                                         │
-│ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
  OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
 
-Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention.
+Each tree row right-aligns the status word in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention. Context % is no longer surfaced in the UI (tree or Details) — see the note under "Status meanings" below.
 
 Status badges: `●` running · `!` blocked (needs you) · `◌` idle · `✓` done · `✗` error · `…` spawning
+
+Immediately after the badge, with no gap between them, a dim 1-letter harness glyph (`harness_glyph`, `ui/mod.rs`) shows which adapter that row is running — `C`/`O`/`P` for claude/opencode/pi, derived generically from the adapter name's first letter (uppercased) rather than a hardcoded match, so a future fourth adapter needs no change here. A bare-shell workspace (no harness launched yet) renders a blank glyph instead of claiming one, and the slot fills in the instant a real harness's SessionStart-equivalent hook reports in. Styled in the same dim `theme.idle` color as the tree's other chrome (not a new `[theme]` field) so it doesn't compete with the status badge's own color, the row's one attention-grabbing signal.
 
 **Keybinding house style: nvim.** `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` between panes. New bindings extend this vocabulary, never a parallel one or a prefix-key/chord model. Keys an agent's own TUI relies on (e.g. `Ctrl-j` = Claude Code's insert-newline) pass through to a focused pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while focused (real Backspace still works: terminals send `DEL`, not `^H`).
 

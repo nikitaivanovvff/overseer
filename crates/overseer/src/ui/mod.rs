@@ -304,6 +304,21 @@ fn render_agent_tree(
     frame.render_widget(List::new(items).block(block), area);
 }
 
+/// Pure. The 1-column harness indicator fused directly to the status badge
+/// (TREE-METADATA.md): the adapter's first letter, uppercased. Derived
+/// generically rather than matched against `"claude"`/`"opencode"`/`"pi"` by
+/// name, so a future fourth adapter needs no change here. A bare workspace
+/// that hasn't run a real harness yet (`adapter == "shell"`) renders blank
+/// instead of claiming one — the empty slot is itself legible ("no harness
+/// running here yet") and self-corrects the moment the session's own
+/// SessionStart-equivalent hook pushes its real adapter name.
+fn harness_glyph(adapter: &str) -> char {
+    if adapter == "shell" {
+        return ' ';
+    }
+    adapter.chars().next().and_then(|c| c.to_uppercase().next()).unwrap_or(' ')
+}
+
 fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Line<'static> {
     let name_style = if dimmed {
         Style::default().fg(term_pane::map_dto_color(theme.idle))
@@ -319,19 +334,18 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     } else {
         status_badge(&node.status).to_string()
     };
+    let harness = harness_glyph(&node.adapter);
 
-    // prefix + badge (always 1 column wide) + the space separating badge from name.
-    let left_fixed = node.prefix.chars().count() + 1 + 1;
+    // prefix + badge (1) + harness glyph (1) + the space separating the badge cluster from the name.
+    let left_fixed = node.prefix.chars().count() + 1 + 1 + 1;
     let row_width = width.saturating_sub(left_fixed);
     // Age only for blocked/idle (ATTENTION.md) — a running agent doesn't
     // need a clock, it's actively doing something.
     let age = matches!(node.status, AgentStatus::Blocked | AgentStatus::Idle)
         .then(|| format_age(node.status_since.elapsed()));
-    let layout =
-        format_tree_row(&node.name, node.status.label(), age.as_deref(), node.context_pct, row_width);
-    let gap = row_width
-        .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
-        .max(1);
+    let layout = format_tree_row(&node.name, node.status.label(), age.as_deref(), row_width);
+    let gap =
+        row_width.saturating_sub(layout.name.chars().count() + layout.status_word.chars().count()).max(1);
 
     // A dimmed (ancestor-context-only) row during search stays legible but
     // visually recedes behind actual matches — everything in `theme.idle`,
@@ -349,45 +363,36 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
         Span::styled(badge, badge_style),
+        Span::styled(harness.to_string(), Style::default().fg(term_pane::map_dto_color(theme.idle))),
         Span::raw(" "),
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
         Span::styled(layout.status_word, row_status_style),
-        Span::styled(layout.pct_suffix, Style::default().fg(Color::DarkGray)),
     ])
 }
 
 /// Pure. Lays out one tree row's text: the name (truncated with `…` if it would
-/// otherwise overflow `width`) and a right-aligned `<status> <pct>%` block —
-/// `pct_suffix` is empty while the context % is unknown. Kept free of styling so
-/// `tree_row` can color the status word specially when blocked; this function
-/// only owns the width arithmetic.
+/// otherwise overflow `width`) and a right-aligned status word. Kept free of
+/// styling so `tree_row` can color the status word specially when blocked;
+/// this function only owns the width arithmetic.
 struct TreeRowLayout {
     name: String,
     status_word: String,
-    pct_suffix: String,
 }
 
-fn format_tree_row(
-    name: &str,
-    status_label: &str,
-    age: Option<&str>,
-    pct: Option<u8>,
-    width: usize,
-) -> TreeRowLayout {
+fn format_tree_row(name: &str, status_label: &str, age: Option<&str>, width: usize) -> TreeRowLayout {
     let status_word = match age {
         Some(age) => format!("{status_label} {age}"),
         None => status_label.to_string(),
     };
-    let pct_suffix = pct.map(|p| format!(" {p}%")).unwrap_or_default();
-    let right_len = status_word.chars().count() + pct_suffix.chars().count();
+    let right_len = status_word.chars().count();
     // Reserve at least 1 column of gap between name and the right block; if the
     // row is too narrow even for the right block alone, let the name collapse to
     // nothing rather than underflow — render() just clips an over-length line,
     // same as any other ratatui `Line`.
     let name_budget = width.saturating_sub(right_len + 1);
     let name = truncate_with_ellipsis(name, name_budget);
-    TreeRowLayout { name, status_word, pct_suffix }
+    TreeRowLayout { name, status_word }
 }
 
 /// Pure. Formats an elapsed duration as a single-unit age (ATTENTION.md):
@@ -453,15 +458,6 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
                 Span::styled(
                     if node.branch.is_empty() { "—".to_string() } else { node.branch.clone() },
                     Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("ctx:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    node.context_pct
-                        .map(|p| format!("{p}%  {}", context_bar(p)))
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(Color::White),
                 ),
             ]),
             Line::from(vec![
@@ -660,11 +656,6 @@ fn tail(text: &str, width: u16) -> String {
     }
 }
 
-fn context_bar(pct: u8) -> String {
-    let filled = (pct as usize * 8 / 100).min(8);
-    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
-}
-
 fn focused_border(focused: bool, theme: &Theme) -> Style {
     if focused {
         Style::default().fg(term_pane::map_dto_color(theme.border_focused))
@@ -697,26 +688,95 @@ mod tests {
         );
     }
 
+    // ── harness_glyph / tree_row (TREE-METADATA.md) ──────────────────────────
+
+    #[test]
+    fn harness_glyph_uses_first_letter_uppercased_for_known_adapters() {
+        assert_eq!(harness_glyph("claude"), 'C');
+        assert_eq!(harness_glyph("opencode"), 'O');
+        assert_eq!(harness_glyph("pi"), 'P');
+    }
+
+    #[test]
+    fn harness_glyph_blank_for_a_bare_shell_workspace() {
+        // A workspace registered by `overseer start` hasn't run a real
+        // harness yet — it shouldn't visually claim one.
+        assert_eq!(harness_glyph("shell"), ' ');
+    }
+
+    #[test]
+    fn harness_glyph_generic_first_letter_fallback_for_an_unknown_adapter() {
+        // Derived generically (first letter, not a hardcoded 3-way match),
+        // so a future/unconfigured adapter name still gets a sensible
+        // glyph instead of nothing — "aider" is AGENTS.md's own
+        // config-shape-example adapter with no real `AgentAdapter` impl.
+        assert_eq!(harness_glyph("aider"), 'A');
+    }
+
+    #[test]
+    fn harness_glyph_empty_adapter_does_not_panic() {
+        assert_eq!(harness_glyph(""), ' ');
+    }
+
+    fn flat_node_with_adapter(name: &str, status: AgentStatus, adapter: &str, prefix: &str) -> FlatNode {
+        FlatNode {
+            id: AgentId::new(),
+            name: name.to_string(),
+            status,
+            role: AgentRole::Child,
+            repo: "repo".to_string(),
+            branch: "main".to_string(),
+            context_pct: None,
+            has_children: false,
+            prefix: prefix.to_string(),
+            status_since: std::time::Instant::now(),
+            adapter: adapter.to_string(),
+        }
+    }
+
+    #[test]
+    fn tree_row_fuses_the_harness_glyph_to_the_badge_with_no_gap() {
+        let theme = Theme::default();
+        let node = flat_node_with_adapter("auth-module", AgentStatus::Idle, "opencode", "");
+        let line = tree_row(&node, false, false, 0, &theme, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Badge ("◌") immediately followed by the harness letter, no space
+        // between them — only one space separates the cluster from the name.
+        assert!(text.contains("◌O auth-module"), "expected fused badge+glyph, got: {text}");
+    }
+
+    #[test]
+    fn tree_row_harness_glyph_blank_for_shell_leaves_a_bare_badge() {
+        let theme = Theme::default();
+        let node = flat_node_with_adapter("overseer", AgentStatus::Idle, "shell", "");
+        let line = tree_row(&node, false, false, 0, &theme, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("◌  overseer"), "expected a blank glyph slot, got: {text}");
+    }
+
+    #[test]
+    fn tree_row_narrow_width_does_not_panic_with_a_harness_glyph() {
+        let theme = Theme::default();
+        for width in 0..8 {
+            for adapter in ["claude", "opencode", "pi", "shell", ""] {
+                let node = flat_node_with_adapter("some-task", AgentStatus::Blocked, adapter, "  └ ");
+                let _ = tree_row(&node, false, false, 0, &theme, width);
+            }
+        }
+    }
+
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
 
     #[test]
     fn format_tree_row_fits_without_truncation_in_a_roomy_width() {
-        let layout = format_tree_row("auth-module", "idle", None, Some(62), 40);
+        let layout = format_tree_row("auth-module", "idle", None, 40);
         assert_eq!(layout.name, "auth-module");
         assert_eq!(layout.status_word, "idle");
-        assert_eq!(layout.pct_suffix, " 62%");
-    }
-
-    #[test]
-    fn format_tree_row_omits_pct_when_unknown() {
-        let layout = format_tree_row("write-tests", "running", None, None, 40);
-        assert_eq!(layout.pct_suffix, "");
-        assert_eq!(layout.status_word, "running");
     }
 
     #[test]
     fn format_tree_row_truncates_long_name_with_ellipsis() {
-        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, Some(91), 20);
+        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, 20);
         assert!(layout.name.ends_with('…'));
         assert!(layout.name.chars().count() < "a-very-long-task-description-here".chars().count());
     }
@@ -724,25 +784,23 @@ mod tests {
     #[test]
     fn format_tree_row_narrow_width_does_not_panic() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "blocked", None, Some(5), width);
-            // Right block (status + pct) always survives intact even if the name collapses.
+            let layout = format_tree_row("some-task", "blocked", None, width);
+            // Right block (status word) always survives intact even if the name collapses.
             assert_eq!(layout.status_word, "blocked");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
     #[test]
     fn format_tree_row_appends_age_to_the_status_word() {
-        let layout = format_tree_row("update-docs", "blocked", Some("2m"), Some(5), 40);
+        let layout = format_tree_row("update-docs", "blocked", Some("2m"), 40);
         assert_eq!(layout.status_word, "blocked 2m");
     }
 
     #[test]
-    fn format_tree_row_age_survives_at_a_narrow_width_alongside_pct() {
+    fn format_tree_row_age_survives_at_a_narrow_width() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "idle", Some("12m"), Some(5), width);
+            let layout = format_tree_row("some-task", "idle", Some("12m"), width);
             assert_eq!(layout.status_word, "idle 12m");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
