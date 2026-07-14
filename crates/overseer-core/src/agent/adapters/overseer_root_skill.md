@@ -100,11 +100,21 @@ never does this for you.
 
 ## Cleanup
 
-Once a child is `done` and you've reviewed its branch, drop it:
+Once a child is `done` and you've reviewed its branch, drop it — and remove
+its worktree in the same pass, from your own checkout, not the child's (never
+`cd` into a worktree you're about to delete):
 
 ```
+git worktree remove --force ../<repo>-<slug>   # untracked build output is expected here, --force is safe
+git branch -d ovsr/<slug>                      # only after merging; refuses if not fully merged
 overseer drop <id>
 ```
+
+Worktrees are real checkouts and add up fast — a Rust project's `target/`
+alone can be a gigabyte per child. Don't let them pile up silently; clean up
+as you go rather than batching it for later. If you ever want to check for
+strays across a longer session, `git worktree list` shows every one still
+registered, alive or not.
 
 ## Hard rules
 
