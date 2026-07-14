@@ -12,7 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use std::collections::HashSet;
 
-use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
+use overseer_core::agent::adapters::{capabilities_for, CapabilitySupport};
+use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, Attention, AttentionKind, FlatNode};
 use crate::app::{InputState, PendingAction};
 use overseer_core::config::{Action, Keybindings, Theme};
 use overseer_core::ipc::protocol::GridSnapshot;
@@ -31,6 +32,18 @@ pub(crate) fn status_badge(status: &AgentStatus) -> &'static str {
         AgentStatus::Idle => "◌",
         AgentStatus::Done => "✓",
         AgentStatus::Error => "✗",
+    }
+}
+
+/// Attention outranks lifecycle for the one-column tree badge. Provider-limit
+/// reasons use `$`; permission uses `!`; otherwise lifecycle owns the badge.
+/// This keeps overlap deterministic even if a blocked lifecycle and provider
+/// attention arrive together.
+pub(crate) fn agent_badge<'a>(status: &'a AgentStatus, attention: Option<&Attention>) -> &'a str {
+    match attention.map(|attention| attention.kind) {
+        Some(AttentionKind::RateLimit | AttentionKind::QuotaLimit | AttentionKind::Billing) => "$",
+        Some(AttentionKind::Permission) => "!",
+        _ => status_badge(status),
     }
 }
 
@@ -111,7 +124,7 @@ pub fn render(
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(7)])
+        .constraints([Constraint::Min(0), Constraint::Length(17)])
         .split(columns[0]);
 
     let flat = tree.flatten();
@@ -313,11 +326,11 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         Style::default()
     };
 
-    let badge = if node.status == AgentStatus::Running {
+    let badge = if node.status == AgentStatus::Running && node.attention.is_none() {
         let frame = (tick as usize / 2) % SPINNER_FRAMES.len();
         SPINNER_FRAMES[frame].to_string()
     } else {
-        status_badge(&node.status).to_string()
+        agent_badge(&node.status, node.attention.as_ref()).to_string()
     };
 
     // prefix + badge (always 1 column wide) + the space separating badge from name.
@@ -327,17 +340,21 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     // need a clock, it's actively doing something.
     let age = matches!(node.status, AgentStatus::Blocked | AgentStatus::Idle)
         .then(|| format_age(node.status_since.elapsed()));
-    let layout =
-        format_tree_row(&node.name, node.status.label(), age.as_deref(), node.context_pct, row_width);
+    let layout = format_tree_row(&node.name, node.status.label(), age.as_deref(), row_width);
     let gap = row_width
-        .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count() + layout.pct_suffix.chars().count())
+        .saturating_sub(layout.name.chars().count() + layout.status_word.chars().count())
         .max(1);
 
     // A dimmed (ancestor-context-only) row during search stays legible but
     // visually recedes behind actual matches — everything in `theme.idle`,
     // badge included, regardless of the node's real status color.
-    let badge_style =
-        if dimmed { Style::default().fg(term_pane::map_dto_color(theme.idle)) } else { status_style(&node.status, theme) };
+    let badge_style = if dimmed {
+        Style::default().fg(term_pane::map_dto_color(theme.idle))
+    } else if node.attention.is_some() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        status_style(&node.status, theme)
+    };
     let row_status_style = if dimmed {
         Style::default().fg(term_pane::map_dto_color(theme.idle))
     } else if node.status == AgentStatus::Blocked {
@@ -353,41 +370,36 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
         Span::styled(layout.status_word, row_status_style),
-        Span::styled(layout.pct_suffix, Style::default().fg(Color::DarkGray)),
     ])
 }
 
 /// Pure. Lays out one tree row's text: the name (truncated with `…` if it would
-/// otherwise overflow `width`) and a right-aligned `<status> <pct>%` block —
-/// `pct_suffix` is empty while the context % is unknown. Kept free of styling so
+/// otherwise overflow `width`) and a right-aligned status block. Kept free of styling so
 /// `tree_row` can color the status word specially when blocked; this function
 /// only owns the width arithmetic.
 struct TreeRowLayout {
     name: String,
     status_word: String,
-    pct_suffix: String,
 }
 
 fn format_tree_row(
     name: &str,
     status_label: &str,
     age: Option<&str>,
-    pct: Option<u8>,
     width: usize,
 ) -> TreeRowLayout {
     let status_word = match age {
         Some(age) => format!("{status_label} {age}"),
         None => status_label.to_string(),
     };
-    let pct_suffix = pct.map(|p| format!(" {p}%")).unwrap_or_default();
-    let right_len = status_word.chars().count() + pct_suffix.chars().count();
+    let right_len = status_word.chars().count();
     // Reserve at least 1 column of gap between name and the right block; if the
     // row is too narrow even for the right block alone, let the name collapse to
     // nothing rather than underflow — render() just clips an over-length line,
     // same as any other ratatui `Line`.
     let name_budget = width.saturating_sub(right_len + 1);
     let name = truncate_with_ellipsis(name, name_budget);
-    TreeRowLayout { name, status_word, pct_suffix }
+    TreeRowLayout { name, status_word }
 }
 
 /// Pure. Formats an elapsed duration as a single-unit age (ATTENTION.md):
@@ -425,7 +437,8 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 
 fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>, theme: &Theme) {
     let content = match selected {
-        Some(node) => vec![
+        Some(node) => {
+            let mut lines = vec![
             Line::from(vec![
                 // A root's name is the repo it was spawned in, not a task
                 // description (Part A: roots are a bare shell, no task text) —
@@ -456,19 +469,54 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
                 ),
             ]),
             Line::from(vec![
-                Span::styled("ctx:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    node.context_pct
-                        .map(|p| format!("{p}%  {}", context_bar(p)))
-                        .unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
                 Span::styled("id:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(node.id.short(), Style::default().fg(Color::DarkGray)),
             ]),
-        ],
+            ];
+            if let Some(attention) = &node.attention {
+                let age = attention.observed_at.elapsed().unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("attention: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} ({})", attention.kind.label(), format_age(age)),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                if let Some(message) = &attention.message {
+                    lines.push(Line::from(vec![
+                        Span::styled("message: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(truncate_with_ellipsis(message, 80)),
+                    ]));
+                }
+                if let Some(retry_at) = attention.retry_at {
+                    let retry = retry_at.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled("retry:  ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(if retry.is_zero() { "now".to_string() } else { format!("in {}", format_age(retry)) }),
+                    ]));
+                }
+            }
+            let capabilities = capabilities_for(&node.adapter);
+            for (label, support) in [
+                ("lifecycle", capabilities.lifecycle),
+                ("permissions", capabilities.permission_requests),
+                ("limits", capabilities.provider_limits),
+                ("context", capabilities.context_usage),
+            ] {
+                match support {
+                    CapabilitySupport::Unsupported { reason } => lines.push(Line::from(vec![
+                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("unsupported ({reason})")),
+                    ])),
+                    CapabilitySupport::Experimental { note } => lines.push(Line::from(vec![
+                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("experimental ({note})")),
+                    ])),
+                    CapabilitySupport::Supported => {}
+                }
+            }
+            lines
+        }
         None => vec![Line::from(Span::styled(
             "  no agent selected",
             Style::default().fg(Color::DarkGray),
@@ -480,8 +528,9 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
         .borders(Borders::ALL)
         .border_style(focused_border(false, theme));
 
-    frame.render_widget(Paragraph::new(content).block(block), area);
+    frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }).block(block), area);
 }
+
 
 /// Pure — builds the status line's content so `render()` can measure its
 /// wrapped height before laying out the rest of the frame. `?` now opens the
@@ -571,6 +620,7 @@ pub fn help_rows(kb: &Keybindings) -> Vec<(String, &'static str)> {
     rows.push(("enter/o".to_string(), "jump in (fixed alias)"));
     rows.push(("ctrl-c".to_string(), "quit (fixed alias)"));
     rows.push(("ctrl-h".to_string(), "leave pane (the only key a focused pane intercepts)"));
+    rows.push(("$/!".to_string(), "limit/permission attention; no badge may mean unsupported"));
     rows
 }
 
@@ -660,11 +710,6 @@ fn tail(text: &str, width: u16) -> String {
     }
 }
 
-fn context_bar(pct: u8) -> String {
-    let filled = (pct as usize * 8 / 100).min(8);
-    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
-}
-
 fn focused_border(focused: bool, theme: &Theme) -> Style {
     if focused {
         Style::default().fg(term_pane::map_dto_color(theme.border_focused))
@@ -697,26 +742,59 @@ mod tests {
         );
     }
 
+    fn test_attention(kind: AttentionKind) -> Attention {
+        Attention {
+            kind,
+            message: None,
+            retry_at: None,
+            observed_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn provider_limit_badge_precedes_blocked_lifecycle() {
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::RateLimit))), "$");
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::QuotaLimit))), "$");
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::Billing))), "$");
+    }
+
+    #[test]
+    fn permission_badge_precedes_non_blocked_lifecycle() {
+        assert_eq!(agent_badge(&AgentStatus::Running, Some(&test_attention(AttentionKind::Permission))), "!");
+    }
+
+    #[test]
+    fn attention_badge_survives_narrow_tree_widths() {
+        let mut tree = AgentTree::new();
+        let mut root = node("long-agent-name", vec![]);
+        root.status = AgentStatus::Blocked;
+        root.attention = Some(test_attention(AttentionKind::RateLimit));
+        tree.add_root(root);
+        let flat = tree.flatten();
+        for width in 0..6 {
+            let line = tree_row(&flat[0], false, false, 0, &Theme::default(), width);
+            assert_eq!(line.spans[1].content, "$", "badge must survive width {width}");
+        }
+    }
+
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
 
     #[test]
     fn format_tree_row_fits_without_truncation_in_a_roomy_width() {
-        let layout = format_tree_row("auth-module", "idle", None, Some(62), 40);
+        let layout = format_tree_row("auth-module", "idle", None, 40);
         assert_eq!(layout.name, "auth-module");
         assert_eq!(layout.status_word, "idle");
-        assert_eq!(layout.pct_suffix, " 62%");
     }
 
     #[test]
-    fn format_tree_row_omits_pct_when_unknown() {
-        let layout = format_tree_row("write-tests", "running", None, None, 40);
-        assert_eq!(layout.pct_suffix, "");
+    fn format_tree_row_formats_running_status() {
+        let layout = format_tree_row("write-tests", "running", None, 40);
         assert_eq!(layout.status_word, "running");
     }
 
     #[test]
     fn format_tree_row_truncates_long_name_with_ellipsis() {
-        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, Some(91), 20);
+        let layout = format_tree_row("a-very-long-task-description-here", "blocked", None, 20);
         assert!(layout.name.ends_with('…'));
         assert!(layout.name.chars().count() < "a-very-long-task-description-here".chars().count());
     }
@@ -724,25 +802,23 @@ mod tests {
     #[test]
     fn format_tree_row_narrow_width_does_not_panic() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "blocked", None, Some(5), width);
-            // Right block (status + pct) always survives intact even if the name collapses.
+            let layout = format_tree_row("some-task", "blocked", None, width);
+            // The status block survives intact even if the name collapses.
             assert_eq!(layout.status_word, "blocked");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
     #[test]
     fn format_tree_row_appends_age_to_the_status_word() {
-        let layout = format_tree_row("update-docs", "blocked", Some("2m"), Some(5), 40);
+        let layout = format_tree_row("update-docs", "blocked", Some("2m"), 40);
         assert_eq!(layout.status_word, "blocked 2m");
     }
 
     #[test]
-    fn format_tree_row_age_survives_at_a_narrow_width_alongside_pct() {
+    fn format_tree_row_age_survives_at_a_narrow_width() {
         for width in 0..6 {
-            let layout = format_tree_row("some-task", "idle", Some("12m"), Some(5), width);
+            let layout = format_tree_row("some-task", "idle", Some("12m"), width);
             assert_eq!(layout.status_word, "idle 12m");
-            assert_eq!(layout.pct_suffix, " 5%");
         }
     }
 
@@ -973,6 +1049,7 @@ mod tests {
             adapter: "claude".to_string(),
             cwd: std::path::PathBuf::from("."),
             context_pct: None,
+            attention: None,
             children,
             expanded: true,
             status_since: std::time::Instant::now(),
@@ -1207,6 +1284,7 @@ mod tests {
             repo: "scratch".to_string(),
             branch: String::new(), // non-git root: no fake branch name
             context_pct: None,
+            attention: None,
             has_children: false,
             prefix: String::new(),
             status_since: std::time::Instant::now(),

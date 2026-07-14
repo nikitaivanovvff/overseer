@@ -327,7 +327,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
         AttachEvent::AgentRemoved { agent_id } => {
             state.tree.remove(&agent_id);
         }
-        AttachEvent::StatusChanged { agent_id, status, context_pct, message: _ } => {
+        AttachEvent::StatusChanged { agent_id, status, context_pct, attention, adapter, message: _ } => {
             if let Some(node) = state.tree.find_mut(&agent_id) {
                 // Same "compare before overwrite" rule as the registry
                 // itself (ATTENTION.md) — a repeated same-status push must
@@ -343,6 +343,8 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
                 // value before broadcasting (see `AgentRegistry::set_status`)
                 // — this is the definitive value, not a delta to fold in.
                 node.context_pct = context_pct;
+                node.attention = attention;
+                node.adapter = adapter;
             }
         }
         AttachEvent::Output { agent_id, grid } => {
@@ -376,6 +378,7 @@ fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
         adapter: dto.adapter,
         cwd: dto.cwd,
         context_pct: dto.context_pct,
+        attention: dto.attention,
         children: Vec::new(),
         expanded: true,
         status_since,
@@ -498,6 +501,8 @@ mod tests {
             branch: "main".to_string(),
             cwd: PathBuf::from("/tmp"),
             context_pct: None,
+            attention: None,
+            capabilities: Box::new(overseer_core::agent::adapters::capabilities_for("claude")),
             status_secs: 0,
         }
     }
@@ -623,6 +628,8 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: Some(42),
+            attention: None,
+            adapter: "claude".to_string(),
         });
         let node = state.tree.find(&root_id).unwrap();
         assert_eq!(node.status, AgentStatus::Blocked);
@@ -641,6 +648,8 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: None,
+            attention: None,
+            adapter: "claude".to_string(),
         });
 
         let after = state.tree.find(&root_id).unwrap().status_since;
@@ -660,6 +669,8 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: None,
+            attention: None,
+            adapter: "claude".to_string(),
         });
 
         let after = state.tree.find(&root_id).unwrap().status_since;
@@ -694,12 +705,16 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: Some(10),
+            attention: None,
+            adapter: "claude".to_string(),
         });
         apply_event(&mut state, AttachEvent::StatusChanged {
             agent_id: root_id.clone(),
             status: AgentStatus::Idle,
             message: None,
             context_pct: None,
+            attention: None,
+            adapter: "claude".to_string(),
         });
         assert_eq!(state.tree.find(&root_id).unwrap().context_pct, None);
     }

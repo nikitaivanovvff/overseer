@@ -43,48 +43,6 @@ pub fn classify_hook_status(status: AgentStatus, payload: Option<&HookPayload>) 
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Usage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-}
-
-const CONTEXT_WINDOW_TOKENS: f64 = 200_000.0;
-
-/// Extracts the `usage` object from one transcript JSONL line, if present.
-/// Claude Code transcripts nest it under `message.usage` for assistant turns;
-/// tolerate a top-level `usage` too rather than assume one exact shape.
-fn extract_usage(line: &str) -> Option<Usage> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let usage = value.get("message").and_then(|m| m.get("usage")).or_else(|| value.get("usage"))?;
-    serde_json::from_value(usage.clone()).ok()
-}
-
-/// Pure. Scans a transcript JSONL file's contents from the end for the most
-/// recent entry carrying token usage, and converts it to a 0-100 percentage of
-/// the model's context window. `None` if no line in the transcript has usage
-/// (e.g. an empty/fresh transcript) — callers push the status without a pct
-/// rather than treat that as an error.
-pub fn context_pct_from_transcript(contents: &str) -> Option<u8> {
-    for line in contents.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(usage) = extract_usage(line) {
-            let total = (usage.input_tokens
-                + usage.cache_read_input_tokens
-                + usage.cache_creation_input_tokens) as f64;
-            let pct = (total / CONTEXT_WINDOW_TOKENS * 100.0).round().clamp(0.0, 100.0);
-            return Some(pct as u8);
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {
@@ -154,58 +112,4 @@ mod tests {
         assert_eq!(classify_hook_status(AgentStatus::Blocked, Some(&payload)), AgentStatus::Idle);
     }
 
-    // ── context_pct_from_transcript ───────────────────────────────────────────
-
-    fn transcript_line(input: u64, cache_read: u64, cache_creation: u64) -> String {
-        format!(
-            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{input},"cache_read_input_tokens":{cache_read},"cache_creation_input_tokens":{cache_creation}}}}}}}"#
-        )
-    }
-
-    #[test]
-    fn context_pct_computes_percentage_of_200k_window() {
-        // 100_000 total tokens / 200_000 window = 50%.
-        let transcript = transcript_line(50_000, 30_000, 20_000);
-        assert_eq!(context_pct_from_transcript(&transcript), Some(50));
-    }
-
-    #[test]
-    fn context_pct_uses_the_last_usage_entry_not_the_first() {
-        let transcript = format!(
-            "{}\n{}\n{}",
-            transcript_line(1_000, 0, 0),
-            r#"{"type":"user","message":{"content":"no usage here"}}"#,
-            transcript_line(180_000, 0, 0), // 90%
-        );
-        assert_eq!(context_pct_from_transcript(&transcript), Some(90));
-    }
-
-    #[test]
-    fn context_pct_top_level_usage_is_also_recognized() {
-        let line = r#"{"usage":{"input_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
-        assert_eq!(context_pct_from_transcript(line), Some(50));
-    }
-
-    #[test]
-    fn context_pct_clamps_at_100() {
-        let transcript = transcript_line(300_000, 0, 0);
-        assert_eq!(context_pct_from_transcript(&transcript), Some(100));
-    }
-
-    #[test]
-    fn context_pct_none_when_no_usage_present() {
-        let transcript = r#"{"type":"user","message":{"content":"hello"}}"#;
-        assert_eq!(context_pct_from_transcript(transcript), None);
-    }
-
-    #[test]
-    fn context_pct_none_for_empty_transcript() {
-        assert_eq!(context_pct_from_transcript(""), None);
-    }
-
-    #[test]
-    fn context_pct_ignores_blank_lines_and_garbage() {
-        let transcript = format!("\n   \nnot json\n{}\n", transcript_line(20_000, 0, 0));
-        assert_eq!(context_pct_from_transcript(&transcript), Some(10));
-    }
 }

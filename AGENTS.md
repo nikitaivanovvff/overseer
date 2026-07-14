@@ -37,7 +37,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 |------|-------------|------------|-------------|
 | **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
-| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and context %. | `ui::render_agent_detail` |
+| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, attention, and unsupported/experimental harness capabilities. | `ui::render_agent_detail` |
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
@@ -88,7 +88,7 @@ Unix domain socket at `$XDG_RUNTIME_DIR/overseer/daemon.sock` (falling back to `
 | `overseer uninstall` | `<agent>` | Remove the user-level skill(s) + status hooks for an agent type. Direct top-level equivalent of `overseer install <agent> --uninstall`, both call the same `install::run_install`. |
 | `overseer daemon` | — | Runs the daemon itself: binds the socket, serves requests, streams attach events, watches session exits. Hidden from `--help` — not a user workflow, the TUI spawns one automatically. |
 | `overseer start` | `--cwd?` | Register a workspace and launch a bare shell for it in its own PTY (default cwd: current directory). No adapter is launched — run your own agent inside it. `--cwd` must exist and be a directory, but doesn't have to be a git repo: outside one, the workspace is named after the directory itself with an empty (`—` in the TUI) branch, rather than faking a repo/branch pair. |
-| `overseer status` | `<status> --message? --from-hook?` | Push a status update for the calling agent. No-op (silent exit 0) when not running under Overseer. `--from-hook` reads the Claude Code hook payload from stdin to classify a `blocked` push (idle nag vs. real permission request) and attach context % — Claude-specific; opencode's plugin and pi's extension push plain `overseer status <s>`, no `--from-hook`, since their own events are already precise. Each push carries a `pushed_at` wall-clock timestamp captured at process start (`main.rs`, before argument parsing) — every hook fire is its own short-lived process making its own socket connection with no ordering between connections, so a push that fired earlier can otherwise arrive later and clobber a fresher one; `AgentRegistry::set_status` drops any push older than the newest one already applied for that agent. |
+| `overseer status` | `<status> --message? --attention? --clear-attention?` | Push a lifecycle update plus an optional normalized attention delta for the calling agent. Attention kinds are `permission`, `rate-limit`, `quota-limit`, `billing`, and `provider-error`; `--retry-after` carries only a harness-supplied delay. Lifecycle-only pushes preserve permission attention, successful `running` clears provider-limit attention, and terminal status clears all attention. No-op outside Overseer. Each push carries a client-captured `pushed_at`; `AgentRegistry` drops the whole push when it is older than the newest accepted update, including attention. |
 | `overseer spawn` | `--task --name? --adapter?` | Request a child. Rejected if the result would exceed depth 3 or the parent's `max_children` cap. `--task` is the child's entire initial prompt; `--name` is a short, distinct tree-row label (falls back to `--task` verbatim if omitted or blank). |
 | `overseer drop` | `<id> --recursive?` | Kill the agent's PTY and deregister it. Overseer does not touch the agent's branch/worktree. Workspaces are rejected here — only the TUI's `d`/`D` (a distinct wire request, see below) can drop one. |
 | `overseer shutdown` | — | The kill switch: recursive-drops every workspace, then the daemon process exits. Same request the TUI's `Q` sends after its confirm. Unchanged, no timeout — assumes a healthy daemon; if it can't reach one, use `kill` instead. |
@@ -136,7 +136,7 @@ Two surfaces: **install** (install-time, user-level artifacts) and **launch** (r
 
 ```rust
 pub trait AgentAdapter: Send + Sync {
-    fn name(&self) -> &str;
+    fn capabilities(&self) -> AdapterCapabilities;
 
     // install (install-time): files written at the USER level, once
     fn user_config_dir(&self) -> Option<PathBuf>;      // e.g. ~/.claude
@@ -148,6 +148,8 @@ pub trait AgentAdapter: Send + Sync {
     fn env_inject(&self, ctx: &LaunchContext) -> HashMap<String, String>;
 }
 ```
+
+`AdapterCapabilities` declares `lifecycle`, `permission_requests`, `provider_limits`, and `context_usage` as `CapabilitySupport::Supported`, `Unsupported { reason }`, or `Experimental { note }`. This is a pure contract for what this Overseer version's installed integration can observe, not a dynamic plugin-health check. Unsupported is an expected, machine-readable result, never an adapter error.
 
 `InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
@@ -183,7 +185,7 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 | `UserPromptSubmit` | `running` | The point real work actually begins — covers both a session's first prompt and the user prompting again after the agent had gone `idle`. |
 | `PostToolUse` | `running` | Actively working. |
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
-| `Notification` | `blocked`, downgraded to `idle` for the ~60s idle nag | Fires for both a real permission prompt and the nag; `--from-hook` classifies which via the payload's message text. |
+| `Notification` (`permission_prompt`) | `blocked` + `attention=permission` | Live-probed on Claude Code 2.1.209. Approval reaches `PostToolUse`; denial reaches `Stop`; both clear permission attention. |
 
 **opencode** — a plugin at `~/.config/opencode/plugin/overseer.js`, auto-loaded (opencode scans that directory itself, no `opencode.jsonc` entry needed). Role instructions (`overseer-root.md`/`overseer-child.md`) merge into `opencode.jsonc`'s `instructions` array unconditionally — each file's own "only applies when `$OVERSEER_ROLE=...`" opening line makes loading both, every session, harmless:
 
@@ -192,9 +194,9 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 | `session.created` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | A workspace is a bare shell waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. Same reasoning as Claude's `SessionStart`. |
 | `session.status` (`status.type === "busy"`) | `running` | The actual "agent is actively working" signal — confirmed live; better grounded than proxying through `tool.execute.after`, which only fires around tool calls. |
 | `session.idle` | `idle` | Finished responding. |
-| `permission.ask` *(a separate hook, not the generic event bus)* | `blocked` | The moment a permission prompt appears. Never sets the hook's own `output.status` — Overseer only observes, the human still decides. |
-| `permission.replied` | `running` | The prompt resolved either way; work resumes. |
-| `session.error` | *(nothing)* | The exit watcher owns `error`, not a lifecycle push. |
+| `permission.asked` / `permission.v2.asked` (generic event bus) | `blocked` + `attention=permission` | Live-probed on OpenCode 1.17.20 for root and child sessions. The typed top-level `permission.ask` hook exists in the installed declarations but did not fire. Overseer never writes a permission decision. |
+| `permission.replied` / `permission.v2.replied` | `running`, clears permission attention | Both approval and denial resolve the attention condition. |
+| `session.error` with structured `APIError` | preserves active lifecycle + provider attention | HTTP 429 maps to `rate_limit`, 402 to `billing`, other structured API failures to `provider_error`; `Retry-After` is forwarded when supplied. Experimental until a real provider-limit response is live-probed. |
 
 **pi** — an extension loaded via `pi --extension <absolute-path>` at spawn time (bypasses pi's own package manager/`settings.json` entirely, so install/uninstall is just "write/delete one file"). Role instructions are selected **per role** at spawn time via `--append-system-prompt <path>`, so only the correct doc is ever loaded:
 
@@ -202,12 +204,14 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 |------|--------|-----|
 | `session_start` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | Mirrors Claude's `SessionStart`: a workspace is waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. |
 | `agent_start` | `running` | A turn begins. |
-| `agent_end` | `idle` | A turn ends. |
+| `agent_end` | `idle` + harness-computed context usage | `ctx.getContextUsage()` was live-probed on pi 0.80.2 and supplies both the active model window and percentage for machine-readable output. |
 | `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |
 
-**pi never pushes `blocked`** — no permission-request event exists in its `ExtensionEvent` union (permission gates are opt-in extensions in pi, not part of the base install). Documented as a caveat in `pi_root.md`, not faked with a different event.
+**pi never pushes `blocked`** — no permission-request event exists in its `ExtensionEvent` union (permission gates are opt-in extensions in pi, not part of the base install). Its typed `after_provider_response` event also did not fire in a live 0.80.2 request, so provider limits are explicitly unsupported rather than inferred.
 
 Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
+
+Attention is separate from lifecycle: `permission`, `rate_limit`, `quota_limit`, `billing`, or `provider_error`, with optional bounded message/retry time and an observed timestamp. `overseer list`/`agent` include both attention and the selected adapter's capability matrix. Claude and OpenCode context usage are unsupported because their lifecycle integrations do not expose an authoritative active window size; Claude's correct 1M-aware percentage exists only in the user's single-owner `statusLine` command, which Overseer does not replace. Context percentage is not rendered in the TUI.
 
 Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the detail pane always shows it under `status:`.
 
@@ -219,6 +223,8 @@ A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tr
 - **Desktop notification.** `osascript`/`notify-send`, off by default (`[notify] mode = "off"`). `"blocked"` fires on `→blocked` only; `"blocked+idle"` also fires on `→idle`.
 
 Both are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the last — identical for `--mock` and daemon-attached. Config in `[notify]` (see Config below). Out of scope: a supervision loop that auto-re-prompts an idle child — this surfaces, a human (or the workspace reading `overseer list`) decides.
+
+Normalized attention also renders independently of lifecycle: `$` for rate/quota/billing and `!` for permission, with `$` taking deterministic precedence over a simultaneously blocked lifecycle. Details show reason, bounded message, retry delay, age, and unsupported/experimental capabilities. The `?` popup explicitly warns that no badge may mean unsupported/unknown rather than healthy.
 
 ### Workspace
 
@@ -252,16 +258,15 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ branch: ovsr/a            │                                         │
 │ status: running           │                                         │
 │ since:  4m                │                                         │
-│ ctx:    8%  █░░░░░░░      │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
  OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
 
-Each tree row right-aligns `<status> <pct>%` in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention.
+Each tree row right-aligns status in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention.
 
-Status badges: `●` running · `!` blocked (needs you) · `◌` idle · `✓` done · `✗` error · `…` spawning
+Status badges: `$` rate/quota/billing attention (highest precedence) · `!` permission/blocked · `●` running · `◌` idle · `✓` done · `✗` error · `…` spawning. A missing attention badge does not prove health when that adapter declares the capability unsupported.
 
 **Keybinding house style: nvim.** `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` between panes. New bindings extend this vocabulary, never a parallel one or a prefix-key/chord model. Keys an agent's own TUI relies on (e.g. `Ctrl-j` = Claude Code's insert-newline) pass through to a focused pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while focused (real Backspace still works: terminals send `DEL`, not `^H`).
 

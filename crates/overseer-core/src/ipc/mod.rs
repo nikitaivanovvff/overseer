@@ -166,6 +166,8 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: None,
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
@@ -178,6 +180,8 @@ mod tests {
             status: AgentStatus::Done,
             message: Some("all PRs merged".to_string()),
             context_pct: None,
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
@@ -219,6 +223,8 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: Some(37),
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
@@ -236,6 +242,8 @@ mod tests {
             status: AgentStatus::Idle,
             message: None,
             context_pct: None,
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
@@ -351,6 +359,8 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: None,
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
@@ -481,11 +491,13 @@ mod tests {
             status: AgentStatus::Blocked,
             message: Some("needs you".to_string()),
             context_pct: Some(42),
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         });
         match next_event(&mut reader) {
-            AttachEvent::StatusChanged { agent_id, status, message, context_pct } => {
+            AttachEvent::StatusChanged { agent_id, status, message, context_pct, .. } => {
                 assert_eq!(agent_id, root_id);
                 assert_eq!(status, AgentStatus::Blocked);
                 assert_eq!(message.as_deref(), Some("needs you"));
@@ -522,6 +534,8 @@ mod tests {
                 status: AgentStatus::Running,
                 message: None,
                 context_pct: None,
+                clear_context: false,
+                attention: None,
                 adapter: None,
             pushed_at: std::time::SystemTime::now(),
             });

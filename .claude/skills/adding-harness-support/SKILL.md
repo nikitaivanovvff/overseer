@@ -10,30 +10,34 @@ its install-time content files. `src/agent/adapters/claude.rs`, `opencode.rs`,
 and `pi.rs` are the three reference implementations — read whichever is
 closest in shape to the new harness before writing anything.
 
-## The four deliverables
+## The five deliverables
 
-Every adapter must deliver all four, all already abstracted by the
+Every adapter must deliver all five, all already abstracted by the
 `AgentAdapter` trait (`src/agent/adapters/mod.rs`):
 
-1. **Launch** (`spawn_command` + `env_inject`) — start the harness in a PTY
+1. **Capabilities** (`capabilities`) — declare lifecycle, permission requests,
+   provider limits, and context usage as `Supported`, `Unsupported { reason }`,
+   or `Experimental { note }`. Never use a bool or claim `Supported` before a
+   live probe demonstrates the structured signal.
+2. **Launch** (`spawn_command` + `env_inject`) — start the harness in a PTY
    with the task as its initial prompt, staying interactive (never a
    one-shot/print mode); inject identity env (`identity_env`) +
    `OVERSEER_TASK` when the task is non-empty (never inject it for an empty
    task — that's a root's bare-shell case, no task exists).
-2. **Status wiring** (`install_files`, install-time) — a hook/plugin/extension
+3. **Status wiring** (`install_files`, install-time) — a hook/plugin/extension
    file that pushes `overseer status <s>` on the harness's own lifecycle
    events. Must be a no-op outside Overseer (guard on `$OVERSEER_AGENT_ID`
    being set) and must call the absolute Overseer binary path, embedded at
    generation time (`std::env::current_exe()`) — the harness's subprocess
    won't inherit the shell `$PATH` entry that made `overseer` findable in the
    terminal you're reading this in.
-3. **Role instructions** (`install_files`, install-time) — root/child
+4. **Role instructions** (`install_files`, install-time) — root/child
    behavior docs the harness will actually load. Content: spawn/monitor/drop
    for roots (bless cross-harness spawning: `--adapter claude|opencode|pi|...`
    — an agent doesn't have to run its own harness for its children), worktree
    isolation + explicit `overseer status done --message …` for children
    (**never** inferred from the harness going quiet or the session ending).
-4. **Uninstall** — `install_files()`'s `MergeStrategy` per file determines
+5. **Uninstall** — `install_files()`'s `MergeStrategy` per file determines
    this automatically: `Overwrite` files get deleted outright, `JsonMerge`/
    `JsonArrayMerge` files get exactly Overseer's entries stripped back out,
    leaving the user's own content untouched. `legacy_paths()` covers a rename
@@ -107,8 +111,8 @@ source of truth. Concretely, for a fresh harness integration:
    this is strictly more reliable than prose docs, which describe intent, not
    the exact runtime event/field names. If the harness ships a discriminated
    event union (`event.type === "..."`) or a generic `event`-bus-plus-
-   dedicated-hooks split (verified true for opencode: permission handling is
-   a *separate* hook from the generic lifecycle bus), that split usually
+    dedicated-hooks split (OpenCode 1.17.20's permission event is on the
+    generic bus even though a dedicated hook remains in its declarations), that split usually
    isn't obvious from docs alone — trace it in the types.
 4. **A real end-to-end spawn**: install for real, spawn a child through the
    actual daemon (not `--mock`) with a trivial, cheap prompt, and watch
@@ -132,6 +136,9 @@ source of truth. Concretely, for a fresh harness integration:
 
 - `install_files()` returns the expected files, in order, with the expected
   `MergeStrategy` per file.
+- `capabilities()` has a pure matrix test; every supported handler is present
+  in the installed artifact, and captured sanitized payload fixtures exercise
+  the event normalizer.
 - The generated hook/plugin/extension content: guards on `$OVERSEER_AGENT_ID`
   being unset (a no-op), embeds the absolute Overseer binary path, maps every
   status-relevant event to the right push (and — importantly — a test
@@ -156,8 +163,7 @@ source of truth. Concretely, for a fresh harness integration:
 
 - Auto-detecting which harnesses are installed on a machine — `overseer
   install <name>` is always an explicit, user-initiated step.
-- Per-harness context-percentage parity — best-effort only; if the harness
-  doesn't cleanly expose usable token-usage data inline (no transcript file
-  to parse, no small integer to read off an event payload), skip it. `ctx: —`
-  is an honest, acceptable state — do not invent a `--context-pct`
-  computation that isn't grounded in something the harness actually reports.
+- Per-harness context-percentage parity. Keep it machine-readable only when
+  the harness authoritatively supplies both usage and its active window size;
+  never divide transcript tokens by a hardcoded guessed constant. Context is
+  intentionally not rendered in the TUI.

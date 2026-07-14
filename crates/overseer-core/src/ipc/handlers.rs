@@ -6,7 +6,7 @@ use crate::agent::spawn::{spawn_agent, spawn_manual_child, SpawnRequest};
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::{dir_basename, GitClient};
-use crate::ipc::protocol::{OkBody, Request, Response, MAX_SPAWN_TASK_BYTES};
+use crate::ipc::protocol::{OkBody, Request, Response, MAX_ATTENTION_MESSAGE_BYTES, MAX_SPAWN_TASK_BYTES};
 use crate::session::SessionManager;
 
 /// Shared context injected into every IPC handler.
@@ -34,8 +34,24 @@ pub struct AppCtx {
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
 pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     match req {
-        Request::Status { agent_id, status, message, context_pct, adapter, pushed_at } => {
-            match ctx.registry.set_status(&agent_id, status, message, context_pct, adapter, pushed_at) {
+        Request::Status { agent_id, status, message, context_pct, clear_context, attention, adapter, pushed_at } => {
+            let attention = attention.map(|update| match update {
+                crate::agent::AttentionUpdate::Set { mut attention } => {
+                    attention.message = attention.message.map(sanitize_attention_message);
+                    crate::agent::AttentionUpdate::Set { attention }
+                }
+                clear => clear,
+            });
+            match ctx.registry.set_status_update(
+                &agent_id,
+                status,
+                message,
+                context_pct,
+                clear_context,
+                attention,
+                adapter,
+                pushed_at,
+            ) {
                 Ok(()) => Response::ok(None),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -44,7 +60,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         Request::List => Response::ok(Some(OkBody::Agents { agents: ctx.registry.snapshot() })),
 
         Request::Agent { agent_id } => match ctx.registry.get(&agent_id) {
-            Some(agent) => Response::ok(Some(OkBody::Agent { agent })),
+            Some(agent) => Response::ok(Some(OkBody::Agent { agent: Box::new(agent) })),
             None => Response::err(format!("unknown agent: {}", agent_id.short())),
         },
 
@@ -218,6 +234,18 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     }
 }
 
+fn sanitize_attention_message(message: String) -> String {
+    let mut sanitized = String::new();
+    for ch in message.chars() {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        if sanitized.len() + ch.len_utf8() > MAX_ATTENTION_MESSAGE_BYTES {
+            break;
+        }
+        sanitized.push(ch);
+    }
+    sanitized
+}
+
 fn spawn_parent(ctx: &AppCtx, parent_id: &AgentId) -> Result<crate::ipc::protocol::AgentDto, Response> {
     let Some(parent) = ctx.registry.get(parent_id) else {
         return Err(Response::err(format!("unknown agent: {}", parent_id.short())));
@@ -270,6 +298,8 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: None,
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         };
@@ -287,6 +317,8 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: Some(17),
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         };
@@ -294,6 +326,15 @@ mod tests {
         assert!(resp.ok);
         assert!(resp.data.is_none());
         assert_eq!(ctx.registry.get(&agent_id).unwrap().context_pct, Some(17));
+    }
+
+    #[test]
+    fn attention_messages_are_sanitized_and_utf8_bounded() {
+        let input = format!("secret\n{}", "é".repeat(MAX_ATTENTION_MESSAGE_BYTES));
+        let output = sanitize_attention_message(input);
+        assert!(!output.contains('\n'));
+        assert!(output.len() <= MAX_ATTENTION_MESSAGE_BYTES);
+        assert!(output.is_char_boundary(output.len()));
     }
 
     #[test]

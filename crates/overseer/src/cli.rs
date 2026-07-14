@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use overseer_core::agent;
-use overseer_core::agent::{AgentId, AgentStatus};
+use overseer_core::agent::{AgentId, AgentStatus, Attention, AttentionKind, AttentionUpdate};
 use overseer_core::ipc;
 use overseer_core::ipc::protocol::Request;
 
@@ -30,10 +30,8 @@ pub enum Command {
         status: StatusArg,
         #[arg(long)]
         message: Option<String>,
-        /// Read the Claude Code hook payload JSON from stdin: classifies a
-        /// `blocked` push as the idle nag vs. a real permission request, and
-        /// (once a transcript is available) attaches context %. Never fails the
-        /// hook — malformed/missing stdin just means less context on the push.
+        /// Read the Claude Code hook payload JSON from stdin to classify a
+        /// `blocked` push as the idle nag vs. a real permission request.
         #[arg(long)]
         from_hook: bool,
         /// Self-identifies the calling session's actual harness (e.g.
@@ -44,6 +42,21 @@ pub enum Command {
         /// `overseer spawn` inherits from.
         #[arg(long)]
         adapter: Option<String>,
+        /// Set a structured reason requiring attention, independently of lifecycle.
+        #[arg(long, value_enum)]
+        attention: Option<AttentionArg>,
+        /// Clear this attention reason after its structured resolution event.
+        #[arg(long, value_enum)]
+        clear_attention: Option<AttentionArg>,
+        /// Provider-supplied Retry-After delay in seconds. Never inferred.
+        #[arg(long)]
+        retry_after: Option<u64>,
+        /// Harness-computed context usage percentage (0-100).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        context_pct: Option<u8>,
+        /// Remove a stale context value when this harness cannot report one.
+        #[arg(long)]
+        clear_context: bool,
     },
     /// List all agents.
     List,
@@ -153,6 +166,27 @@ pub enum StatusArg {
     Error,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AttentionArg {
+    Permission,
+    RateLimit,
+    QuotaLimit,
+    Billing,
+    ProviderError,
+}
+
+impl From<AttentionArg> for AttentionKind {
+    fn from(value: AttentionArg) -> Self {
+        match value {
+            AttentionArg::Permission => AttentionKind::Permission,
+            AttentionArg::RateLimit => AttentionKind::RateLimit,
+            AttentionArg::QuotaLimit => AttentionKind::QuotaLimit,
+            AttentionArg::Billing => AttentionKind::Billing,
+            AttentionArg::ProviderError => AttentionKind::ProviderError,
+        }
+    }
+}
+
 impl From<StatusArg> for AgentStatus {
     fn from(s: StatusArg) -> Self {
         match s {
@@ -215,36 +249,6 @@ fn read_hook_payload() -> Option<agent::hook::HookPayload> {
     agent::hook::parse_hook_payload(&raw)
 }
 
-/// Max transcript bytes read when computing context % (SECURITY-AUDIT.md
-/// F8) — `path` comes straight from the hook's own JSON stdin, so an
-/// attacker-influenced payload pointing at a huge file must not turn this
-/// into its own unbounded-read DoS. Only the tail matters:
-/// `context_pct_from_transcript` scans from the end for the most recent
-/// usage entry, so reading just the last `MAX_TRANSCRIPT_READ_BYTES` bytes
-/// loses nothing a full read would have found for any transcript smaller
-/// than that.
-const MAX_TRANSCRIPT_READ_BYTES: u64 = 1024 * 1024;
-
-/// Reads the transcript at `path` and extracts a context %. `None` on any read
-/// failure or if the transcript has no usage data yet (e.g. brand new) —
-/// never fails the hook over this, it just means no pct on this push.
-fn read_context_pct(path: &str) -> Option<u8> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len > MAX_TRANSCRIPT_READ_BYTES {
-        file.seek(SeekFrom::Start(len - MAX_TRANSCRIPT_READ_BYTES)).ok()?;
-    }
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    // A truncating seek can land mid-codepoint at the very start of `buf`;
-    // lossy conversion turns that into a harmless leading garbage line that
-    // the line-skipping logic below already tolerates, rather than failing
-    // the whole read the way `read_to_string` would.
-    let contents = String::from_utf8_lossy(&buf);
-    agent::hook::context_pct_from_transcript(&contents)
-}
-
 /// Returns `Ok(None)` for the Status command when `$OVERSEER_AGENT_ID` is unset,
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 ///
@@ -254,7 +258,17 @@ fn read_context_pct(path: &str) -> Option<u8> {
 /// scheduling-jitter window the staleness guard exists to close (STATUS-RACE.md).
 fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Option<Request>> {
     match cmd {
-        Command::Status { status, message, from_hook, adapter } => {
+        Command::Status {
+            status,
+            message,
+            from_hook,
+            adapter,
+            attention,
+            clear_attention,
+            retry_after,
+            context_pct,
+            clear_context,
+        } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
                 Ok(s) => s,
                 // Not in an Overseer session — hook must be a silent no-op.
@@ -265,17 +279,34 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 .map_err(|e| anyhow::anyhow!("invalid $OVERSEER_AGENT_ID: {e}"))?;
 
             let mut status: AgentStatus = status.into();
-            let mut context_pct = None;
             if from_hook {
                 let payload = read_hook_payload();
                 status = agent::hook::classify_hook_status(status, payload.as_ref());
-                context_pct = payload
-                    .as_ref()
-                    .and_then(|p| p.transcript_path.as_deref())
-                    .and_then(read_context_pct);
             }
+            let attention = match (attention, clear_attention) {
+                (Some(_), Some(_)) => return Err(anyhow::anyhow!("--attention and --clear-attention are mutually exclusive")),
+                (Some(kind), None) => Some(AttentionUpdate::Set {
+                    attention: Attention {
+                        kind: kind.into(),
+                        message: message.clone(),
+                        retry_at: retry_after.map(|seconds| pushed_at + std::time::Duration::from_secs(seconds)),
+                        observed_at: pushed_at,
+                    },
+                }),
+                (None, Some(kind)) => Some(AttentionUpdate::Clear { kind: kind.into() }),
+                (None, None) => None,
+            };
 
-            Ok(Some(Request::Status { agent_id, status, message, context_pct, adapter, pushed_at }))
+            Ok(Some(Request::Status {
+                agent_id,
+                status,
+                message,
+                context_pct,
+                clear_context,
+                attention,
+                adapter,
+                pushed_at,
+            }))
         }
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
@@ -319,7 +350,17 @@ mod tests {
     #[test]
     fn build_request_status_no_env_var_returns_none() {
         let _env = EnvGuard::unset("OVERSEER_AGENT_ID");
-        let cmd = Command::Status { status: StatusArg::Running, message: None, from_hook: false, adapter: None };
+        let cmd = Command::Status {
+            status: StatusArg::Running,
+            message: None,
+            from_hook: false,
+            adapter: None,
+            attention: None,
+            clear_attention: None,
+            retry_after: None,
+            context_pct: None,
+            clear_context: false,
+        };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_none(), "Status without OVERSEER_AGENT_ID should be a silent no-op");
     }
@@ -328,10 +369,48 @@ mod tests {
     fn build_request_status_with_env_var_returns_request() {
         let id = AgentId::new();
         let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
-        let cmd = Command::Status { status: StatusArg::Done, message: None, from_hook: false, adapter: None };
+        let cmd = Command::Status {
+            status: StatusArg::Done,
+            message: None,
+            from_hook: false,
+            adapter: None,
+            attention: None,
+            clear_attention: None,
+            retry_after: None,
+            context_pct: None,
+            clear_context: false,
+        };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Request::Status { .. }));
+    }
+
+    #[test]
+    fn build_request_status_sets_normalized_attention_and_retry_time() {
+        let id = AgentId::new();
+        let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
+        let pushed_at = std::time::SystemTime::now();
+        let cmd = Command::Status {
+            status: StatusArg::Running,
+            message: Some("limited".to_string()),
+            from_hook: false,
+            adapter: None,
+            attention: Some(AttentionArg::RateLimit),
+            clear_attention: None,
+            retry_after: Some(30),
+            context_pct: None,
+            clear_context: false,
+        };
+        let request = build_request(cmd, pushed_at).unwrap().unwrap();
+        match request {
+            Request::Status { attention: Some(AttentionUpdate::Set { attention }), .. } => {
+                assert_eq!(attention.kind, AttentionKind::RateLimit);
+                assert_eq!(attention.message.as_deref(), Some("limited"));
+                assert_eq!(attention.observed_at, pushed_at);
+                assert_eq!(attention.retry_at, Some(pushed_at + std::time::Duration::from_secs(30)));
+            }
+            other => panic!("expected attention update, got {other:?}"),
+        }
     }
 
     #[test]
@@ -447,43 +526,4 @@ mod tests {
         );
     }
 
-    // ── read_context_pct ──────────────────────────────────────────────────────
-
-    #[test]
-    fn read_context_pct_reads_and_parses_a_real_file() {
-        let path = std::env::temp_dir().join(format!("overseer-transcript-test-{}", AgentId::new()));
-        std::fs::write(
-            &path,
-            r#"{"message":{"usage":{"input_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-        )
-        .unwrap();
-        assert_eq!(read_context_pct(path.to_str().unwrap()), Some(50));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn read_context_pct_missing_file_returns_none() {
-        assert_eq!(read_context_pct("/nonexistent/transcript.jsonl"), None);
-    }
-
-    /// F8: a transcript larger than `MAX_TRANSCRIPT_READ_BYTES` must still
-    /// yield the correct percentage from its tail, without reading the
-    /// whole file -- proves the seek-to-tail cap doesn't just avoid a crash,
-    /// it still finds the answer for any real (bounded) transcript.
-    #[test]
-    fn read_context_pct_finds_the_answer_in_a_transcript_larger_than_the_cap() {
-        let path = std::env::temp_dir().join(format!("overseer-transcript-big-test-{}", AgentId::new()));
-        let filler_line = "{\"type\":\"user\",\"message\":{\"content\":\"padding\"}}\n";
-        let filler_bytes_needed = MAX_TRANSCRIPT_READ_BYTES as usize + 4096;
-        let mut contents = filler_line.repeat(filler_bytes_needed / filler_line.len() + 1);
-        contents.push_str(
-            r#"{"message":{"usage":{"input_tokens":180000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-        );
-        assert!(contents.len() as u64 > MAX_TRANSCRIPT_READ_BYTES);
-        std::fs::write(&path, &contents).unwrap();
-
-        assert_eq!(read_context_pct(path.to_str().unwrap()), Some(90));
-
-        let _ = std::fs::remove_file(&path);
-    }
 }
