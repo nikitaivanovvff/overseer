@@ -304,6 +304,21 @@ fn render_agent_tree(
     frame.render_widget(List::new(items).block(block), area);
 }
 
+/// Pure. The 1-column harness indicator fused directly to the status badge
+/// (TREE-METADATA.md): the adapter's first letter, uppercased. Derived
+/// generically rather than matched against `"claude"`/`"opencode"`/`"pi"` by
+/// name, so a future fourth adapter needs no change here. A bare workspace
+/// that hasn't run a real harness yet (`adapter == "shell"`) renders blank
+/// instead of claiming one — the empty slot is itself legible ("no harness
+/// running here yet") and self-corrects the moment the session's own
+/// SessionStart-equivalent hook pushes its real adapter name.
+fn harness_glyph(adapter: &str) -> char {
+    if adapter == "shell" {
+        return ' ';
+    }
+    adapter.chars().next().and_then(|c| c.to_uppercase().next()).unwrap_or(' ')
+}
+
 fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Line<'static> {
     let name_style = if dimmed {
         Style::default().fg(term_pane::map_dto_color(theme.idle))
@@ -319,9 +334,10 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     } else {
         status_badge(&node.status).to_string()
     };
+    let harness = harness_glyph(&node.adapter);
 
-    // prefix + badge (always 1 column wide) + the space separating badge from name.
-    let left_fixed = node.prefix.chars().count() + 1 + 1;
+    // prefix + badge (1) + harness glyph (1) + the space separating the badge cluster from the name.
+    let left_fixed = node.prefix.chars().count() + 1 + 1 + 1;
     let row_width = width.saturating_sub(left_fixed);
     // Age only for blocked/idle (ATTENTION.md) — a running agent doesn't
     // need a clock, it's actively doing something.
@@ -347,6 +363,7 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
         Span::styled(badge, badge_style),
+        Span::styled(harness.to_string(), Style::default().fg(term_pane::map_dto_color(theme.idle))),
         Span::raw(" "),
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
@@ -669,6 +686,83 @@ mod tests {
             status_style(&AgentStatus::Blocked, &theme),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         );
+    }
+
+    // ── harness_glyph / tree_row (TREE-METADATA.md) ──────────────────────────
+
+    #[test]
+    fn harness_glyph_uses_first_letter_uppercased_for_known_adapters() {
+        assert_eq!(harness_glyph("claude"), 'C');
+        assert_eq!(harness_glyph("opencode"), 'O');
+        assert_eq!(harness_glyph("pi"), 'P');
+    }
+
+    #[test]
+    fn harness_glyph_blank_for_a_bare_shell_workspace() {
+        // A workspace registered by `overseer start` hasn't run a real
+        // harness yet — it shouldn't visually claim one.
+        assert_eq!(harness_glyph("shell"), ' ');
+    }
+
+    #[test]
+    fn harness_glyph_generic_first_letter_fallback_for_an_unknown_adapter() {
+        // Derived generically (first letter, not a hardcoded 3-way match),
+        // so a future/unconfigured adapter name still gets a sensible
+        // glyph instead of nothing — "aider" is AGENTS.md's own
+        // config-shape-example adapter with no real `AgentAdapter` impl.
+        assert_eq!(harness_glyph("aider"), 'A');
+    }
+
+    #[test]
+    fn harness_glyph_empty_adapter_does_not_panic() {
+        assert_eq!(harness_glyph(""), ' ');
+    }
+
+    fn flat_node_with_adapter(name: &str, status: AgentStatus, adapter: &str, prefix: &str) -> FlatNode {
+        FlatNode {
+            id: AgentId::new(),
+            name: name.to_string(),
+            status,
+            role: AgentRole::Child,
+            repo: "repo".to_string(),
+            branch: "main".to_string(),
+            context_pct: None,
+            has_children: false,
+            prefix: prefix.to_string(),
+            status_since: std::time::Instant::now(),
+            adapter: adapter.to_string(),
+        }
+    }
+
+    #[test]
+    fn tree_row_fuses_the_harness_glyph_to_the_badge_with_no_gap() {
+        let theme = Theme::default();
+        let node = flat_node_with_adapter("auth-module", AgentStatus::Idle, "opencode", "");
+        let line = tree_row(&node, false, false, 0, &theme, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Badge ("◌") immediately followed by the harness letter, no space
+        // between them — only one space separates the cluster from the name.
+        assert!(text.contains("◌O auth-module"), "expected fused badge+glyph, got: {text}");
+    }
+
+    #[test]
+    fn tree_row_harness_glyph_blank_for_shell_leaves_a_bare_badge() {
+        let theme = Theme::default();
+        let node = flat_node_with_adapter("overseer", AgentStatus::Idle, "shell", "");
+        let line = tree_row(&node, false, false, 0, &theme, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("◌  overseer"), "expected a blank glyph slot, got: {text}");
+    }
+
+    #[test]
+    fn tree_row_narrow_width_does_not_panic_with_a_harness_glyph() {
+        let theme = Theme::default();
+        for width in 0..8 {
+            for adapter in ["claude", "opencode", "pi", "shell", ""] {
+                let node = flat_node_with_adapter("some-task", AgentStatus::Blocked, adapter, "  └ ");
+                let _ = tree_row(&node, false, false, 0, &theme, width);
+            }
+        }
     }
 
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
