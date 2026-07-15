@@ -91,6 +91,12 @@ fn kill_recovers_a_daemon_via_ps_scan_when_its_pid_and_socket_are_both_gone() {
     let bound = wait_until(|| UnixStream::connect(&socket_for_probe).is_ok(), Duration::from_secs(5));
     assert!(bound, "daemon at {} never became reachable", socket.display());
 
+    // Keep this test on the forceful-recovery path now that a responsive
+    // daemon repairs an unlinked socket itself. A stopped daemon still holds
+    // its flock but cannot run the socket guard or answer graceful shutdown.
+    let stopped = unsafe { libc::kill(daemon_pid, libc::SIGSTOP) };
+    assert_eq!(stopped, 0, "failed to stop the test daemon");
+
     // Reproduce the 2026-07-11 incident's observed state: `daemon.pid`
     // truncated/unreadable and the socket file gone, while the daemon
     // itself is still alive and holding the flock (BUG A used to cause
