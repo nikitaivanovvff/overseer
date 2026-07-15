@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use overseer_core::agent::{AgentStatus, FlatNode};
+use overseer_core::agent::FlatNode;
 use overseer_core::ipc::protocol::{ColorDto, GridSnapshot};
 
 /// Renders the selected agent's live terminal grid into `area` — the pane
@@ -29,9 +29,11 @@ pub fn render_term_pane(
     // not a bug — but with no marker at all, a pane the user is still
     // looking at (or focused into) just silently stops responding with
     // zero explanation, which a real user reported as the pane having
-    // "frozen". `alive` mirrors `App::is_alive`'s own rule (not Done, not
-    // Error) so the title can say plainly why nothing more is happening.
-    let alive = selected.is_some_and(|n| !matches!(n.status, AgentStatus::Done | AgentStatus::Error));
+    // "frozen". `alive` reads `FlatNode::session_alive` directly — the same
+    // ground-truth signal `App::is_alive` uses — rather than re-deriving it
+    // from `status`: a self-reported `Done`/`Error` agent whose session is
+    // still running (e.g. re-prompted after saying "done") is not "exited".
+    let alive = selected.is_some_and(|n| n.session_alive);
     let block = Block::default().borders(Borders::ALL).title(pane_title(focused, offset, alive));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -160,6 +162,7 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use overseer_core::agent::AgentStatus;
     use overseer_core::session::snapshot_from_bytes;
 
     #[test]
@@ -306,4 +309,52 @@ mod tests {
         assert_eq!(pane_title(false, 10, false), " agent [exited] ");
     }
 
+    // ── render_term_pane's `alive` derivation (session_alive, not status) ────
+
+    fn flat_node_with(status: AgentStatus, session_alive: bool) -> FlatNode {
+        FlatNode {
+            id: overseer_core::agent::AgentId::new(),
+            name: "agent".to_string(),
+            status,
+            role: overseer_core::agent::AgentRole::Root,
+            repo: "repo".to_string(),
+            branch: "main".to_string(),
+            context_pct: None,
+            model_name: None,
+            attention: None,
+            session_alive,
+            has_children: false,
+            prefix: String::new(),
+            status_since: std::time::Instant::now(),
+            adapter: "claude".to_string(),
+        }
+    }
+
+    fn rendered_title(node: &FlatNode) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_term_pane(frame, frame.area(), None, Some(node), false);
+            })
+            .unwrap();
+        terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn render_term_pane_is_not_exited_for_a_done_agent_whose_session_is_still_alive() {
+        // The real bug: an agent that self-reports `done` while the user
+        // keeps prompting it must not look "[exited]" -- that title must
+        // come from `session_alive`, not from `status` being Done/Error.
+        let node = flat_node_with(AgentStatus::Done, true);
+        let content = rendered_title(&node);
+        assert!(!content.contains("exited"), "done-but-alive session must not render as exited: {content}");
+    }
+
+    #[test]
+    fn render_term_pane_shows_exited_once_the_session_has_actually_exited() {
+        let node = flat_node_with(AgentStatus::Done, false);
+        let content = rendered_title(&node);
+        assert!(content.contains("exited"), "a genuinely exited session must still show [exited]: {content}");
+    }
 }

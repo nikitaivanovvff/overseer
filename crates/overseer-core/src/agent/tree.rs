@@ -18,6 +18,7 @@ fn mock_root(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         context_pct: None,
         model_name: None,
         attention: None,
+        session_alive: true,
         children: Vec::new(),
         expanded: true,
         status_since: std::time::Instant::now(),
@@ -41,6 +42,7 @@ fn mock_child(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         context_pct: None,
         model_name: None,
         attention: None,
+        session_alive: true,
         children: Vec::new(),
         expanded: true,
         status_since: std::time::Instant::now(),
@@ -63,6 +65,10 @@ pub struct FlatNode {
     pub context_pct: Option<u8>,
     pub model_name: Option<String>,
     pub attention: Option<super::Attention>,
+    /// See `AgentNode::session_alive` — carried through so `ui::term_pane`
+    /// can tell a self-reported-done-but-still-running agent apart from one
+    /// whose PTY actually exited, without re-deriving it from `status`.
+    pub session_alive: bool,
     pub has_children: bool,
     pub prefix: String,
     /// When `status` last actually changed — see `AgentNode::status_since`.
@@ -291,6 +297,7 @@ fn flatten_node(
         context_pct: node.context_pct,
         model_name: node.model_name.clone(),
         attention: node.attention.clone(),
+        session_alive: node.session_alive,
         has_children: !node.children.is_empty(),
         prefix: format!("{indent}{connector}"),
         status_since: node.status_since,

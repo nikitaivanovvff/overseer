@@ -619,10 +619,11 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 /// (non-zero/signal). Synchronous and side-effect-only against
 /// `registry`/`sessions`, so it's directly unit-testable without a tokio runtime.
 ///
-/// Skips an agent that already reports `done`: that's an explicit push from
-/// the agent itself declaring the task complete, a stronger signal than this
-/// exit-code inference — its wrapping process exiting non-zero afterward
-/// (e.g. during its own teardown) must not silently downgrade it to `error`.
+/// Skips *the status update* for an agent that already reports `done`:
+/// that's an explicit push from the agent itself declaring the task
+/// complete, a stronger signal than this exit-code inference — its wrapping
+/// process exiting non-zero afterward (e.g. during its own teardown) must
+/// not silently downgrade it to `error`.
 ///
 /// This check is independent of (and not subsumed by)
 /// `AgentRegistry::set_status`'s `pushed_at` staleness guard: the exit is
@@ -632,8 +633,18 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 /// guard below is about *authority* (an explicit self-report outranks an
 /// inferred one), not about ordering — a different axis than the staleness
 /// guard, so both stay.
+///
+/// Liveness (`AgentRegistry::mark_session_exited`) is recorded unconditionally
+/// for every id `drain_exits()` yields, *before* that done-skip check —
+/// this sweep is the one and only place with ground truth that the PTY
+/// process has actually exited, and an agent that already self-reported
+/// `done` while still alive (task complete, session still running — see
+/// `AgentNode::session_alive`) needs that fact recorded exactly when it
+/// stops being true, not silently dropped because its status update is
+/// skipped.
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     for (id, success) in sessions.drain_exits() {
+        registry.mark_session_exited(&id);
         if registry.get(&id).is_some_and(|a| a.status == AgentStatus::Done) {
             continue;
         }
@@ -858,6 +869,43 @@ mod tests {
 
         let root = registry.get(&root_id).unwrap();
         assert_eq!(root.status, AgentStatus::Done, "explicit done must survive a later non-zero exit");
+    }
+
+    /// Real bug, reproduced here: an agent that self-reports `done` while its
+    /// PTY is still alive (e.g. the user keeps prompting it afterward) must
+    /// not be treated as dead. `session_alive` stays `true` until this sweep
+    /// actually observes the process exit — `drain_exits()` never yields an
+    /// id for a session that hasn't exited, so a `done` push alone must never
+    /// flip it.
+    #[test]
+    fn done_while_still_alive_keeps_session_alive_true_until_a_real_exit() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        registry.set_status(&root_id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
+
+        // The session never exited (no `simulate_exit`) -- a sweep tick must
+        // be a no-op for it, since `drain_exits()` yields nothing.
+        sweep_exited_sessions(&registry, &sessions);
+        let root = registry.get(&root_id).unwrap();
+        assert_eq!(root.status, AgentStatus::Done);
+        assert!(root.session_alive, "a done-but-still-running agent must not be reported as dead");
+
+        // Now the process actually exits -- this must flip session_alive
+        // even though the done-skip continues past the status-update branch.
+        sessions.simulate_exit(root_id.clone(), true);
+        sweep_exited_sessions(&registry, &sessions);
+        let root = registry.get(&root_id).unwrap();
+        assert_eq!(root.status, AgentStatus::Done, "status is untouched by the already-done skip");
+        assert!(!root.session_alive, "a real exit must be recorded even when the status update is skipped");
+    }
+
+    #[test]
+    fn freshly_registered_agent_starts_session_alive() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        assert!(registry.get(&root_id).unwrap().session_alive);
     }
 
     #[test]

@@ -152,6 +152,7 @@ mod tests {
             context_pct: None,
             model_name: None,
             attention: None,
+            session_alive: true,
             has_children: false,
             prefix: String::new(),
             status_since: std::time::Instant::now(),

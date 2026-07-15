@@ -30,6 +30,11 @@ pub enum RegistryEvent {
         model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
+        /// See `AgentNode::session_alive`. Carried on every `StatusChanged`
+        /// broadcast (not just ones from `mark_session_exited`) so a client
+        /// applying this event as the definitive value (`app::apply_event`)
+        /// never has a stale copy.
+        session_alive: bool,
     },
     /// The daemon itself is exiting (`overseer shutdown`) — distinct from any
     /// per-agent event. Broadcast explicitly via `announce_shutdown`, not a
@@ -120,6 +125,7 @@ impl AgentRegistry {
                     context_pct: None,
                     model_name: None,
                     attention: None,
+                    session_alive: true,
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
@@ -148,6 +154,7 @@ impl AgentRegistry {
                     context_pct: None,
                     model_name: None,
                     attention: None,
+                    session_alive: true,
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
@@ -317,13 +324,15 @@ impl AgentRegistry {
                             node.model_name.clone(),
                             node.attention.clone(),
                             node.adapter.clone(),
+                            node.session_alive,
                         ))
                     }
                 }
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
-        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter)) = applied else {
+        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter, session_alive)) = applied
+        else {
             return Ok(());
         };
         // Broadcast the node's actual resulting status, not necessarily the
@@ -338,8 +347,61 @@ impl AgentRegistry {
             model_name: new_model_name,
             attention: new_attention,
             adapter: new_adapter,
+            session_alive,
         });
         Ok(())
+    }
+
+    /// Records that `id`'s PTY has actually exited — the *only* writer of
+    /// `AgentNode::session_alive`, called unconditionally by the daemon's
+    /// exit-code sweep (`ipc::server::sweep_exited_sessions`) for every id
+    /// `SessionManager::drain_exits()` yields, independent of whatever
+    /// `status` already says. This is what lets a self-reported `done` agent
+    /// (task complete, session still running — see `AgentNode::session_alive`
+    /// doc comment) be told apart from one whose process has genuinely died,
+    /// which `status` alone can't distinguish (both read `Done`).
+    ///
+    /// No-op (and no broadcast) for an unknown id or one already marked
+    /// exited — `session_alive` only ever goes `true -> false`, once, so a
+    /// repeated sweep tick over the same exited id (shouldn't happen since
+    /// `drain_exits` only yields an id once, but cheap to guard) doesn't
+    /// spam attach clients with redundant events.
+    ///
+    /// Always broadcasts a `StatusChanged` when it does flip the flag, even
+    /// though `status` itself may be unchanged — an attach client needs this
+    /// pushed immediately (not just at the next full `Snapshot`), since
+    /// nothing else about this transition necessarily produces its own
+    /// status push.
+    pub fn mark_session_exited(&self, id: &AgentId) {
+        let applied = {
+            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.find_mut(id) {
+                Some(node) if node.session_alive => {
+                    node.session_alive = false;
+                    Some((
+                        node.status.clone(),
+                        node.context_pct,
+                        node.model_name.clone(),
+                        node.attention.clone(),
+                        node.adapter.clone(),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        let Some((status, context_pct, model_name, attention, adapter)) = applied else {
+            return;
+        };
+        let _ = self.events.send(RegistryEvent::StatusChanged {
+            agent_id: id.clone(),
+            status,
+            message: None,
+            context_pct,
+            model_name,
+            attention,
+            adapter,
+            session_alive: false,
+        });
     }
 
     /// Returns a flattened snapshot of all agents as wire DTOs, for `list`.
