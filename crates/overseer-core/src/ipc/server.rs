@@ -40,6 +40,12 @@ pub(super) const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 #[cfg(test)]
 pub(super) const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 
+/// A bound Unix listener remains usable by already-connected clients after its
+/// filesystem node is unlinked, but no new hook or CLI process can connect.
+/// Check often enough that lifecycle pushes recover promptly without adding a
+/// filesystem stat to the hot accept path.
+const SOCKET_REBIND_INTERVAL: Duration = Duration::from_millis(250);
+
 /// How long `handle_conn` will wait for a line before giving up on a
 /// connection that opened but never sent anything (SECURITY-AUDIT.md F9) —
 /// a slow-loris-style hold that ties up a connection slot (and, before F9,
@@ -147,13 +153,7 @@ pub async fn run(
         let _ = std::fs::remove_file(&socket);
     }
 
-    let listener = UnixListener::bind(&socket)?;
-    // The bound socket node otherwise inherits whatever the process umask
-    // allows -- the parent directory's 0700 mode (`daemon::ensure_socket_dir`)
-    // is the only thing actually restricting cross-user access today.
-    // Pin the node itself to owner-only too, in case that directory is ever
-    // undermined (SECURITY-AUDIT.md F5).
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let mut listener = bind_listener(&socket)?;
     if let Some(tx) = ready {
         let _ = tx.send(());
     }
@@ -169,6 +169,8 @@ pub async fn run(
     // degrades. 256 is far above any real usage (one TUI attach + a handful
     // of one-shot hook calls at a time) but still a hard ceiling.
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let mut socket_guard = tokio::time::interval(SOCKET_REBIND_INTERVAL);
+    socket_guard.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -192,6 +194,23 @@ pub async fn run(
                     drop(permit);
                 });
             }
+            _ = socket_guard.tick() => {
+                if !socket.exists() {
+                    match bind_listener(&socket) {
+                        Ok(new_listener) => {
+                            listener = new_listener;
+                            eprintln!("overseer: restored unlinked daemon socket at {}", socket.display());
+                        }
+                        Err(e) => {
+                            // Keep the old listener and retry. Existing attach
+                            // clients are still healthy even while the path is
+                            // absent, so a transient bind failure must not tear
+                            // down the daemon and every PTY it owns.
+                            eprintln!("overseer: failed to restore daemon socket at {}: {e}", socket.display());
+                        }
+                    }
+                }
+            }
             // `overseer shutdown`'s handler notifies this only after its own
             // response has already been written back to its caller — see
             // `handle_conn`. Stopping the accept loop and letting `run`
@@ -202,6 +221,14 @@ pub async fn run(
             }
         }
     }
+}
+
+fn bind_listener(socket: &std::path::Path) -> std::io::Result<UnixListener> {
+    let listener = UnixListener::bind(socket)?;
+    // The bound socket node otherwise inherits whatever the process umask
+    // allows. Keep it owner-only even when this is a recovery rebind.
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 async fn handle_conn(stream: tokio::net::UnixStream, ctx: Arc<AppCtx>) {
@@ -687,6 +714,45 @@ mod tests {
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_restores_an_unlinked_socket_without_losing_daemon_state() {
+        let id = &uuid::Uuid::new_v4().to_string()[..8];
+        let socket = PathBuf::from(format!("/tmp/ovsr-rebind-{id}.sock"));
+        let ctx = make_app_ctx();
+        let server_ctx = ctx.clone();
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { run(server_ctx, server_socket, None).await });
+
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+        std::fs::remove_file(&socket).unwrap();
+        assert!(!socket.exists());
+
+        tokio::time::advance(SOCKET_REBIND_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+        assert!(
+            socket.exists(),
+            "the live daemon must recreate its missing socket node"
+        );
+
+        let request_socket = socket.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::ipc::client::send(&request_socket, &Request::List)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            response.ok,
+            "new one-shot clients must reach the rebound listener"
+        );
+
+        ctx.shutdown_notify.notify_one();
+        server.await.unwrap().unwrap();
+        let _ = std::fs::remove_file(&socket);
     }
 
     /// A connection that opens but never sends a complete line must be
