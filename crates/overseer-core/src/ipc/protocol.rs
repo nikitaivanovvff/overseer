@@ -32,7 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus};
+use crate::agent::adapters::AdapterCapabilities;
+use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, Attention, AttentionUpdate};
 
 /// Max size of one `Write.data` payload (SECURITY-AUDIT.md F2). A single
 /// keystroke is a few bytes; a large paste is the only realistic case, and
@@ -44,6 +45,7 @@ pub const MAX_WRITE_DATA_BYTES: usize = 64 * 1024;
 /// becomes a process argv entry — well above any realistic initial prompt,
 /// but far below sizes that risk `E2BIG` from the OS after allocation.
 pub const MAX_SPAWN_TASK_BYTES: usize = 128 * 1024;
+pub const MAX_ATTENTION_MESSAGE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -56,6 +58,10 @@ pub enum Request {
         /// existing value untouched — most status pushes don't carry one.
         #[serde(default)]
         context_pct: Option<u8>,
+        #[serde(default)]
+        clear_context: bool,
+        #[serde(default)]
+        attention: Option<AttentionUpdate>,
         /// Self-identifies the pushing session's actual harness. `None`
         /// leaves the node's existing value untouched — only each adapter's
         /// own SessionStart-equivalent install hook passes this, once, so a
@@ -197,6 +203,8 @@ pub enum AttachEvent {
         status: AgentStatus,
         message: Option<String>,
         context_pct: Option<u8>,
+        attention: Option<Attention>,
+        adapter: String,
     },
     /// The watched agent's rendered terminal grid. Sent immediately on `Watch`,
     /// then whenever the terminal has produced new content since the last send
@@ -288,8 +296,8 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
         match event {
             RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
             RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
-                AttachEvent::StatusChanged { agent_id, status, message, context_pct }
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, attention, adapter } => {
+                AttachEvent::StatusChanged { agent_id, status, message, context_pct, attention, adapter }
             }
             RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
@@ -308,6 +316,8 @@ pub struct AgentDto {
     pub branch: String,
     pub cwd: std::path::PathBuf,
     pub context_pct: Option<u8>,
+    pub attention: Option<Attention>,
+    pub capabilities: Box<AdapterCapabilities>,
     /// How long `status` has held its current value, in whole seconds,
     /// computed at snapshot time (ATTENTION.md) — an age, not the
     /// `Instant` itself, since that has no meaning across the wire. Shown to
@@ -329,6 +339,8 @@ impl AgentDto {
             branch: node.branch.clone(),
             cwd: node.cwd.clone(),
             context_pct: node.context_pct,
+            attention: node.attention.clone(),
+            capabilities: Box::new(crate::agent::adapters::capabilities_for(&node.adapter)),
             status_secs: node.status_since.elapsed().as_secs(),
         }
     }
@@ -353,7 +365,7 @@ pub struct Response {
 pub enum OkBody {
     Registered { agent_id: AgentId, branch: String },
     Agents { agents: Vec<AgentDto> },
-    Agent { agent: AgentDto },
+    Agent { agent: Box<AgentDto> },
 }
 
 impl Response {
@@ -387,6 +399,19 @@ mod tests {
     }
 
     #[test]
+    fn capability_support_preserves_unsupported_reason_and_experimental_note() {
+        use crate::agent::adapters::CapabilitySupport;
+        let unsupported = CapabilitySupport::Unsupported { reason: "no event".to_string() };
+        let experimental = CapabilitySupport::Experimental { note: "probe pending".to_string() };
+        let unsupported_json = serde_json::to_value(&unsupported).unwrap();
+        let experimental_json = serde_json::to_value(&experimental).unwrap();
+        assert_eq!(unsupported_json["support"], "unsupported");
+        assert_eq!(unsupported_json["reason"], "no event");
+        assert_eq!(experimental_json["support"], "experimental");
+        assert_eq!(experimental_json["note"], "probe pending");
+    }
+
+    #[test]
     fn request_list_round_trip() {
         let req = Request::List;
         let s = serde_json::to_string(&req).unwrap();
@@ -403,6 +428,8 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: Some(42),
+            clear_context: false,
+            attention: None,
             adapter: None,
             pushed_at: std::time::SystemTime::now(),
         };

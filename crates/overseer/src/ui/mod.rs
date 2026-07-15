@@ -12,7 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use std::collections::HashSet;
 
-use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, FlatNode};
+use overseer_core::agent::adapters::{capabilities_for, CapabilitySupport};
+use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, Attention, AttentionKind, FlatNode};
 use crate::app::{InputState, PendingAction};
 use overseer_core::config::{Action, Keybindings, Theme};
 use overseer_core::ipc::protocol::GridSnapshot;
@@ -31,6 +32,18 @@ pub(crate) fn status_badge(status: &AgentStatus) -> &'static str {
         AgentStatus::Idle => "◌",
         AgentStatus::Done => "✓",
         AgentStatus::Error => "✗",
+    }
+}
+
+/// Attention outranks lifecycle for the one-column tree badge. Provider-limit
+/// reasons use `$`; permission uses `!`; otherwise lifecycle owns the badge.
+/// This keeps overlap deterministic even if a blocked lifecycle and provider
+/// attention arrive together.
+pub(crate) fn agent_badge<'a>(status: &'a AgentStatus, attention: Option<&Attention>) -> &'a str {
+    match attention.map(|attention| attention.kind) {
+        Some(AttentionKind::RateLimit | AttentionKind::QuotaLimit | AttentionKind::Billing) => "$",
+        Some(AttentionKind::Permission) => "!",
+        _ => status_badge(status),
     }
 }
 
@@ -111,7 +124,7 @@ pub fn render(
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(7)])
+        .constraints([Constraint::Min(0), Constraint::Length(17)])
         .split(columns[0]);
 
     let flat = tree.flatten();
@@ -328,11 +341,11 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         Style::default()
     };
 
-    let badge = if node.status == AgentStatus::Running {
+    let badge = if node.status == AgentStatus::Running && node.attention.is_none() {
         let frame = (tick as usize / 2) % SPINNER_FRAMES.len();
         SPINNER_FRAMES[frame].to_string()
     } else {
-        status_badge(&node.status).to_string()
+        agent_badge(&node.status, node.attention.as_ref()).to_string()
     };
     let harness = harness_glyph(&node.adapter);
 
@@ -350,8 +363,13 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     // A dimmed (ancestor-context-only) row during search stays legible but
     // visually recedes behind actual matches — everything in `theme.idle`,
     // badge included, regardless of the node's real status color.
-    let badge_style =
-        if dimmed { Style::default().fg(term_pane::map_dto_color(theme.idle)) } else { status_style(&node.status, theme) };
+    let badge_style = if dimmed {
+        Style::default().fg(term_pane::map_dto_color(theme.idle))
+    } else if node.attention.is_some() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        status_style(&node.status, theme)
+    };
     let row_status_style = if dimmed {
         Style::default().fg(term_pane::map_dto_color(theme.idle))
     } else if node.status == AgentStatus::Blocked {
@@ -430,7 +448,8 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 
 fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>, theme: &Theme) {
     let content = match selected {
-        Some(node) => vec![
+        Some(node) => {
+            let mut lines = vec![
             Line::from(vec![
                 // A root's name is the repo it was spawned in, not a task
                 // description (Part A: roots are a bare shell, no task text) —
@@ -464,7 +483,51 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
                 Span::styled("id:     ", Style::default().fg(Color::DarkGray)),
                 Span::styled(node.id.short(), Style::default().fg(Color::DarkGray)),
             ]),
-        ],
+            ];
+            if let Some(attention) = &node.attention {
+                let age = attention.observed_at.elapsed().unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("attention: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} ({})", attention.kind.label(), format_age(age)),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                if let Some(message) = &attention.message {
+                    lines.push(Line::from(vec![
+                        Span::styled("message: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(truncate_with_ellipsis(message, 80)),
+                    ]));
+                }
+                if let Some(retry_at) = attention.retry_at {
+                    let retry = retry_at.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled("retry:  ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(if retry.is_zero() { "now".to_string() } else { format!("in {}", format_age(retry)) }),
+                    ]));
+                }
+            }
+            let capabilities = capabilities_for(&node.adapter);
+            for (label, support) in [
+                ("lifecycle", capabilities.lifecycle),
+                ("permissions", capabilities.permission_requests),
+                ("limits", capabilities.provider_limits),
+                ("context", capabilities.context_usage),
+            ] {
+                match support {
+                    CapabilitySupport::Unsupported { reason } => lines.push(Line::from(vec![
+                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("unsupported ({reason})")),
+                    ])),
+                    CapabilitySupport::Experimental { note } => lines.push(Line::from(vec![
+                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("experimental ({note})")),
+                    ])),
+                    CapabilitySupport::Supported => {}
+                }
+            }
+            lines
+        }
         None => vec![Line::from(Span::styled(
             "  no agent selected",
             Style::default().fg(Color::DarkGray),
@@ -476,8 +539,9 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
         .borders(Borders::ALL)
         .border_style(focused_border(false, theme));
 
-    frame.render_widget(Paragraph::new(content).block(block), area);
+    frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }).block(block), area);
 }
+
 
 /// Pure — builds the status line's content so `render()` can measure its
 /// wrapped height before laying out the rest of the frame. `?` now opens the
@@ -567,6 +631,7 @@ pub fn help_rows(kb: &Keybindings) -> Vec<(String, &'static str)> {
     rows.push(("enter/o".to_string(), "jump in (fixed alias)"));
     rows.push(("ctrl-c".to_string(), "quit (fixed alias)"));
     rows.push(("ctrl-h".to_string(), "leave pane (the only key a focused pane intercepts)"));
+    rows.push(("$/!".to_string(), "limit/permission attention; no badge may mean unsupported"));
     rows
 }
 
@@ -727,6 +792,7 @@ mod tests {
             repo: "repo".to_string(),
             branch: "main".to_string(),
             context_pct: None,
+            attention: None,
             has_children: false,
             prefix: prefix.to_string(),
             status_since: std::time::Instant::now(),
@@ -765,6 +831,38 @@ mod tests {
         }
     }
 
+    // ── attention badges (HARNESS-CAPABILITIES.md) ───────────────────────────
+
+    fn test_attention(kind: AttentionKind) -> Attention {
+        Attention { kind, message: None, retry_at: None, observed_at: std::time::SystemTime::now() }
+    }
+
+    #[test]
+    fn provider_limit_badge_precedes_blocked_lifecycle() {
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::RateLimit))), "$");
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::QuotaLimit))), "$");
+        assert_eq!(agent_badge(&AgentStatus::Blocked, Some(&test_attention(AttentionKind::Billing))), "$");
+    }
+
+    #[test]
+    fn permission_badge_precedes_non_blocked_lifecycle() {
+        assert_eq!(agent_badge(&AgentStatus::Running, Some(&test_attention(AttentionKind::Permission))), "!");
+    }
+
+    #[test]
+    fn attention_badge_survives_narrow_tree_widths() {
+        let mut tree = AgentTree::new();
+        let mut root = node("long-agent-name", vec![]);
+        root.status = AgentStatus::Blocked;
+        root.attention = Some(test_attention(AttentionKind::RateLimit));
+        tree.add_root(root);
+        let flat = tree.flatten();
+        for width in 0..6 {
+            let line = tree_row(&flat[0], false, false, 0, &Theme::default(), width);
+            assert_eq!(line.spans[1].content, "$", "badge must survive width {width}");
+        }
+    }
+
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
 
     #[test]
@@ -772,6 +870,12 @@ mod tests {
         let layout = format_tree_row("auth-module", "idle", None, 40);
         assert_eq!(layout.name, "auth-module");
         assert_eq!(layout.status_word, "idle");
+    }
+
+    #[test]
+    fn format_tree_row_formats_running_status() {
+        let layout = format_tree_row("write-tests", "running", None, 40);
+        assert_eq!(layout.status_word, "running");
     }
 
     #[test]
@@ -785,7 +889,7 @@ mod tests {
     fn format_tree_row_narrow_width_does_not_panic() {
         for width in 0..6 {
             let layout = format_tree_row("some-task", "blocked", None, width);
-            // Right block (status word) always survives intact even if the name collapses.
+            // The status block survives intact even if the name collapses.
             assert_eq!(layout.status_word, "blocked");
         }
     }
@@ -1031,6 +1135,7 @@ mod tests {
             adapter: "claude".to_string(),
             cwd: std::path::PathBuf::from("."),
             context_pct: None,
+            attention: None,
             children,
             expanded: true,
             status_since: std::time::Instant::now(),
@@ -1265,6 +1370,7 @@ mod tests {
             repo: "scratch".to_string(),
             branch: String::new(), // non-git root: no fake branch name
             context_pct: None,
+            attention: None,
             has_children: false,
             prefix: String::new(),
             status_since: std::time::Instant::now(),

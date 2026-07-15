@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{AgentAdapter, InstalledFile, LaunchContext, MergeStrategy};
+use super::{AdapterCapabilities, AgentAdapter, CapabilitySupport, InstalledFile, LaunchContext, MergeStrategy};
 
 const PLUGIN_PATH: &str = "plugin/overseer.js";
 const ROOT_INSTRUCTIONS_PATH: &str = "overseer-root.md";
@@ -35,14 +35,10 @@ impl OpencodeAdapter {
     /// `$OVERSEER_AGENT_ID` is set (same conditional posture as every other
     /// Overseer-managed hook).
     ///
-    /// Event mapping verified against the installed `@opencode-ai/sdk` type
-    /// definitions and a live session (HARNESSES.md Task 0), not the spec's
-    /// original guess — two corrections worth calling out:
-    /// - The "a permission is being asked" moment is `permission.ask`, a
-    ///   *separate* hook (not part of the generic `event` bus) that opencode
-    ///   calls before every prompt; the bus's own `permission.updated` never
-    ///   fired for a same-process plugin in testing. `permission.replied`
-    ///   *does* fire on the bus and is used to push back to `running`.
+    /// Event mapping re-verified against opencode 1.17.20 types and live root
+    /// and child sessions. The top-level typed `permission.ask` hook did not
+    /// fire; the generic event bus emitted `permission.asked` and
+    /// `permission.replied`, so those are the supported conformance path.
     /// - `session.status`'s `properties.status.type === "busy"` is the actual
     ///   "the agent is actively working" signal — better than proxying via
     ///   `tool.execute.after`, which only fires around tool calls, not while
@@ -62,7 +58,9 @@ export const OverseerPlugin = async () => {{
     return {{}};
   }}
   const {{ execFile }} = await import("node:child_process");
-  const push = (status) => execFile(OVERSEER_BIN, ["status", status], () => {{}});
+  const push = (status, extra = []) => execFile(OVERSEER_BIN, ["status", status, ...extra], (error) => {{
+    if (error && process.env.OVERSEER_DEBUG) console.error(`overseer status push failed: ${{error.code || "unknown"}}`);
+  }});
 
   return {{
     event: async ({{ event }}) => {{
@@ -70,18 +68,25 @@ export const OverseerPlugin = async () => {{
         // Roots and taskless TUI-created children wait for a human prompt;
         // CLI-spawned children already have their initial task.
         const initial = process.env.OVERSEER_TASK ? "running" : "idle";
-        execFile(OVERSEER_BIN, ["status", initial, "--adapter", "opencode"], () => {{}});
+        execFile(OVERSEER_BIN, ["status", initial, "--adapter", "opencode", "--clear-context"], () => {{}});
       }} else if (event.type === "session.status" && event.properties?.status?.type === "busy") {{
         push("running");
       }} else if (event.type === "session.idle") {{
         push("idle");
-      }} else if (event.type === "permission.replied") {{
-        push("running");
+      }} else if (event.type === "permission.asked" || event.type === "permission.v2.asked") {{
+        push("blocked", ["--attention", "permission"]);
+      }} else if (event.type === "permission.replied" || event.type === "permission.v2.replied") {{
+        push("running", ["--clear-attention", "permission"]);
+      }} else if (event.type === "session.error" && event.properties?.error?.name === "APIError") {{
+        const error = event.properties.error.data || {{}};
+        const status = error.statusCode;
+        const kind = status === 429 ? "rate-limit" : status === 402 ? "billing" : "provider-error";
+        const extra = ["--attention", kind];
+        if (typeof error.message === "string") extra.push("--message", error.message.slice(0, 4096));
+        const retry = error.responseHeaders?.["retry-after"] ?? error.responseHeaders?.["Retry-After"];
+        if (retry) extra.push("--retry-after", String(retry));
+        push("running", extra);
       }}
-      // session.error: nothing -- the exit watcher owns error, not a lifecycle push.
-    }},
-    "permission.ask": async () => {{
-      push("blocked");
     }},
   }};
 }};
@@ -97,6 +102,23 @@ impl Default for OpencodeAdapter {
 }
 
 impl AgentAdapter for OpencodeAdapter {
+    fn capabilities(&self) -> AdapterCapabilities {
+        // Live-probed with opencode 1.17.20. Permission is emitted on the
+        // generic event bus as permission.asked/replied; the documented typed
+        // permission.ask hook was not invoked. APIError is structured but a
+        // real provider-limit response was not available to trigger safely.
+        AdapterCapabilities {
+            lifecycle: CapabilitySupport::Supported,
+            permission_requests: CapabilitySupport::Supported,
+            provider_limits: CapabilitySupport::Experimental {
+                note: "structured APIError status is available; real limit response not yet live-probed".to_string(),
+            },
+            context_usage: CapabilitySupport::Unsupported {
+                reason: "events expose token counts but not the active context-window size".to_string(),
+            },
+        }
+    }
+
     fn user_config_dir(&self) -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
             return Some(PathBuf::from(dir).join("opencode"));
@@ -231,6 +253,15 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_match_live_probed_opencode_1_17_20() {
+        let capabilities = make_adapter().capabilities();
+        assert_eq!(capabilities.lifecycle, CapabilitySupport::Supported);
+        assert_eq!(capabilities.permission_requests, CapabilitySupport::Supported);
+        assert!(matches!(capabilities.provider_limits, CapabilitySupport::Experimental { .. }));
+        assert!(matches!(capabilities.context_usage, CapabilitySupport::Unsupported { .. }));
+    }
+
+    #[test]
     fn plugin_guards_on_agent_id_and_embeds_absolute_bin_path() {
         let a = make_adapter();
         let content = a.plugin_content();
@@ -266,16 +297,48 @@ mod tests {
     fn plugin_maps_idle_and_permission_events() {
         let content = make_adapter().plugin_content();
         assert!(content.contains(r#""session.idle""#));
-        assert!(content.contains(r#""permission.ask""#));
+        assert!(content.contains(r#""permission.asked""#));
+        assert!(content.contains(r#""permission.v2.asked""#));
         assert!(content.contains(r#""permission.replied""#));
+        assert!(content.contains(r#""--attention", "permission""#));
+        assert!(content.contains(r#""--clear-attention", "permission""#));
     }
 
     #[test]
-    fn plugin_never_touches_output_status_in_permission_ask() {
+    fn plugin_never_writes_a_permission_decision() {
         // Overseer only observes the permission prompt; it must never
         // auto-resolve it (that decision stays the human's).
         let content = make_adapter().plugin_content();
         assert!(!content.contains("output.status"));
+        assert!(!content.contains(r#""permission.ask""#));
+    }
+
+    #[test]
+    fn captured_permission_fixture_matches_the_generic_event_bus_shape() {
+        let ask: serde_json::Value = serde_json::from_str(
+            r#"{"type":"permission.asked","properties":{"id":"redacted","sessionID":"redacted","permission":"bash","patterns":[],"metadata":{},"always":[],"tool":{"messageID":"redacted","callID":"redacted"}}}"#,
+        )
+        .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(
+            r#"{"type":"permission.replied","properties":{"sessionID":"redacted","requestID":"redacted","reply":"reject"}}"#,
+        )
+        .unwrap();
+        assert_eq!(ask["type"], "permission.asked");
+        assert_eq!(reply["type"], "permission.replied");
+        assert!(make_adapter().plugin_content().contains("event.type === \"permission.asked\""));
+    }
+
+    #[test]
+    fn structured_api_error_fixture_maps_only_status_codes_not_display_text() {
+        let fixture: serde_json::Value = serde_json::from_str(
+            r#"{"type":"session.error","properties":{"sessionID":"redacted","error":{"name":"APIError","data":{"message":"redacted","statusCode":429,"isRetryable":true,"responseHeaders":{"retry-after":"30"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(fixture["properties"]["error"]["name"], "APIError");
+        assert_eq!(fixture["properties"]["error"]["data"]["statusCode"], 429);
+        let content = make_adapter().plugin_content();
+        assert!(content.contains("status === 429"));
+        assert!(!content.contains("includes("), "provider classification must not match display text");
     }
 
     #[test]

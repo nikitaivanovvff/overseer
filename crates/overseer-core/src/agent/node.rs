@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{AgentId, AgentStatus};
+use super::{AgentId, AgentStatus, Attention};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +24,7 @@ pub struct AgentNode {
     pub adapter: String,
     pub cwd: PathBuf,
     pub context_pct: Option<u8>,
+    pub attention: Option<Attention>,
     pub children: Vec<AgentNode>,
     pub expanded: bool,
     /// When `status` last actually changed (ATTENTION.md) — reset by

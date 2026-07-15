@@ -1,4 +1,5 @@
 pub mod adapters;
+mod attention;
 pub mod drop;
 pub mod hook;
 mod id;
@@ -9,6 +10,7 @@ mod tree;
 pub mod spawn;
 
 pub use id::AgentId;
+pub use attention::{Attention, AttentionKind, AttentionUpdate};
 pub use node::{AgentNode, AgentRole};
 pub use registry::{AgentRegistry, RegistryEvent};
 pub use status::AgentStatus;

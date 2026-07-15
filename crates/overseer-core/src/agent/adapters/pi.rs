@@ -4,7 +4,7 @@ use std::process::Command;
 
 use crate::agent::AgentRole;
 
-use super::{AgentAdapter, InstalledFile, LaunchContext, MergeStrategy};
+use super::{AdapterCapabilities, AgentAdapter, CapabilitySupport, InstalledFile, LaunchContext, MergeStrategy};
 
 const EXTENSION_PATH: &str = "extensions/overseer.ts";
 const ROOT_INSTRUCTIONS_PATH: &str = "overseer-root.md";
@@ -77,7 +77,7 @@ export default function (pi) {{
   if (!process.env.OVERSEER_AGENT_ID) {{
     return;
   }}
-  const push = (status) => execFile(OVERSEER_BIN, ["status", status], () => {{}});
+  const push = (status, extra = []) => execFile(OVERSEER_BIN, ["status", status, ...extra], () => {{}});
 
   // Roots and taskless TUI-created children wait for a human prompt;
   // CLI-spawned children already have their initial task.
@@ -86,7 +86,11 @@ export default function (pi) {{
     execFile(OVERSEER_BIN, ["status", initial, "--adapter", "pi"], () => {{}});
   }});
   pi.on("agent_start", () => push("running"));
-  pi.on("agent_end", () => push("idle"));
+  pi.on("agent_end", (_event, ctx) => {{
+    const usage = ctx.getContextUsage();
+    const extra = usage?.percent == null ? [] : ["--context-pct", String(Math.round(usage.percent))];
+    push("idle", extra);
+  }});
   // session_shutdown: nothing -- the exit watcher owns error, not a lifecycle push.
 }}
 "#
@@ -101,6 +105,23 @@ impl Default for PiAdapter {
 }
 
 impl AgentAdapter for PiAdapter {
+    fn capabilities(&self) -> AdapterCapabilities {
+        // Live-probed with pi 0.80.2. getContextUsage() returned the active
+        // model's 272k window and computed percentage. No permission event is
+        // present. after_provider_response exists in types but did not fire in
+        // the live provider response probe, so this integration cannot claim it.
+        AdapterCapabilities {
+            lifecycle: CapabilitySupport::Supported,
+            permission_requests: CapabilitySupport::Unsupported {
+                reason: "pi exposes no built-in permission-request event".to_string(),
+            },
+            provider_limits: CapabilitySupport::Unsupported {
+                reason: "pi 0.80.2 did not emit its typed provider-response event in a live request".to_string(),
+            },
+            context_usage: CapabilitySupport::Supported,
+        }
+    }
+
     fn user_config_dir(&self) -> Option<PathBuf> {
         Some(self.config_dir())
     }
@@ -214,6 +235,15 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_match_live_probed_pi_0_80_2() {
+        let capabilities = make_adapter().capabilities();
+        assert_eq!(capabilities.lifecycle, CapabilitySupport::Supported);
+        assert!(matches!(capabilities.permission_requests, CapabilitySupport::Unsupported { .. }));
+        assert!(matches!(capabilities.provider_limits, CapabilitySupport::Unsupported { .. }));
+        assert_eq!(capabilities.context_usage, CapabilitySupport::Supported);
+    }
+
+    #[test]
     fn extension_guards_on_agent_id_and_embeds_absolute_bin_path() {
         let content = make_adapter().extension_content();
         assert!(content.contains("process.env.OVERSEER_AGENT_ID"));
@@ -226,6 +256,8 @@ mod tests {
         assert!(content.contains(r#""session_start""#));
         assert!(content.contains(r#""agent_start""#));
         assert!(content.contains(r#""agent_end""#));
+        assert!(content.contains("getContextUsage"));
+        assert!(content.contains("--context-pct"));
     }
 
     #[test]

@@ -22,14 +22,13 @@ src/
 │   ├── registry      AgentRegistry: in-memory tree of registered agents + a broadcast channel
 │   │                 of RegistryEvent (Registered/Removed/StatusChanged/Shutdown) for attach clients;
 │   │                 set_status's pushed_at staleness guard lives here
-│   ├── hook          Pure Claude Code hook-payload parsing: blocked-vs-idle-nag
-│   │                 classification, context % from transcript JSONL
+│   ├── hook          Pure Claude Code hook-payload parsing: blocked-vs-idle-nag classification
 │   ├── adapters/     Pluggable per-agent-type behaviour
-│   │   ├── mod       AgentAdapter trait (install_files, spawn_command, env_inject) +
+│   │   ├── mod       AgentAdapter trait (capabilities, install_files, spawn_command, env_inject) +
 │   │   │             identity_env(); the *.md files are the installed skills/instructions
 │   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
 │   │   ├── opencode  opencode adapter (auto-loaded plugin.js + instructions array)
-│   │   └── pi        pi adapter (--extension at spawn + --append-system-prompt, no blocked support)
+│   │   └── pi        pi adapter (--extension at spawn + authoritative context, no blocked support)
 │   ├── spawn         Orchestrates session launch + env injection + register — the one shared
 │   │                 path under Start and Spawn (spawn_root_shell vs spawn_child_agent)
 │   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it

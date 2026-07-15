@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::agent::{AgentId, AgentRole};
+use serde::{Deserialize, Serialize};
 
 pub mod claude;
 pub mod opencode;
@@ -99,7 +100,39 @@ pub enum MergeStrategy {
     JsonArrayMerge { key: &'static str, entries: Vec<String> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "support", rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported { reason: String },
+    Experimental { note: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterCapabilities {
+    pub lifecycle: CapabilitySupport,
+    pub permission_requests: CapabilitySupport,
+    pub provider_limits: CapabilitySupport,
+    pub context_usage: CapabilitySupport,
+}
+
+impl AdapterCapabilities {
+    pub fn unavailable(reason: &str) -> Self {
+        let unsupported = || CapabilitySupport::Unsupported { reason: reason.to_string() };
+        Self {
+            lifecycle: unsupported(),
+            permission_requests: unsupported(),
+            provider_limits: unsupported(),
+            context_usage: unsupported(),
+        }
+    }
+}
+
 pub trait AgentAdapter: Send + Sync {
+    /// Structured signals observable by this shipped integration. This is a
+    /// pure support declaration, not a live plugin-health check.
+    fn capabilities(&self) -> AdapterCapabilities;
+
     // --- install (install-time, pure) ---
 
     /// User config dir for this agent (e.g. `~/.claude`). Resolved at call time.
@@ -139,6 +172,12 @@ pub trait AgentAdapter: Send + Sync {
 
     /// Returns env vars to inject into the agent's PTY.
     fn env_inject(&self, ctx: &LaunchContext) -> HashMap<String, String>;
+}
+
+pub fn capabilities_for(name: &str) -> AdapterCapabilities {
+    adapter_for(name)
+        .map(|adapter| adapter.capabilities())
+        .unwrap_or_else(|| AdapterCapabilities::unavailable("no harness integration is active"))
 }
 
 /// Returns the adapter for the given name, or `None` if unknown.

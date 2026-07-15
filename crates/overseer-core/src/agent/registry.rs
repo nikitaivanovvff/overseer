@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
-use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree};
+use crate::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, Attention, AttentionUpdate};
 use crate::ipc::protocol::AgentDto;
 
 /// Capacity of the registry's broadcast channel — generous enough that a slow
@@ -27,6 +27,8 @@ pub enum RegistryEvent {
         status: AgentStatus,
         message: Option<String>,
         context_pct: Option<u8>,
+        attention: Option<Attention>,
+        adapter: String,
     },
     /// The daemon itself is exiting (`overseer shutdown`) — distinct from any
     /// per-agent event. Broadcast explicitly via `announce_shutdown`, not a
@@ -115,6 +117,7 @@ impl AgentRegistry {
                     adapter: args.adapter,
                     cwd: args.cwd,
                     context_pct: None,
+                    attention: None,
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
@@ -141,6 +144,7 @@ impl AgentRegistry {
                     adapter: args.adapter,
                     cwd: args.cwd,
                     context_pct: None,
+                    attention: None,
                     children: Vec::new(),
                     expanded: true,
                     status_since: std::time::Instant::now(),
@@ -214,6 +218,21 @@ impl AgentRegistry {
         adapter: Option<String>,
         pushed_at: std::time::SystemTime,
     ) -> Result<(), RegistryError> {
+        self.set_status_update(id, status, message, context_pct, false, None, adapter, pushed_at)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_status_update(
+        &self,
+        id: &AgentId,
+        status: AgentStatus,
+        message: Option<String>,
+        context_pct: Option<u8>,
+        clear_context: bool,
+        attention_update: Option<AttentionUpdate>,
+        adapter: Option<String>,
+        pushed_at: std::time::SystemTime,
+    ) -> Result<(), RegistryError> {
         let applied = {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
@@ -233,21 +252,40 @@ impl AgentRegistry {
                             if node.status != status {
                                 node.status_since = std::time::Instant::now();
                             }
-                            node.status = status;
+                            node.status = status.clone();
                         }
                         if let Some(pct) = context_pct {
                             node.context_pct = Some(pct);
+                        } else if clear_context {
+                            node.context_pct = None;
+                        }
+                        match attention_update {
+                            Some(AttentionUpdate::Set { attention }) => node.attention = Some(attention),
+                            Some(AttentionUpdate::Clear { kind }) => {
+                                if node.attention.as_ref().is_some_and(|current| current.kind == kind) {
+                                    node.attention = None;
+                                }
+                            }
+                            None if status == AgentStatus::Running
+                                && node.attention.as_ref().is_some_and(|a| a.kind.is_provider_limit()) =>
+                            {
+                                node.attention = None;
+                            }
+                            None => {}
+                        }
+                        if matches!(status, AgentStatus::Done | AgentStatus::Error) {
+                            node.attention = None;
                         }
                         if let Some(adapter) = adapter {
                             node.adapter = adapter;
                         }
-                        Some((node.status.clone(), node.context_pct))
+                        Some((node.status.clone(), node.context_pct, node.attention.clone(), node.adapter.clone()))
                     }
                 }
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
-        let Some((new_status, new_context_pct)) = applied else {
+        let Some((new_status, new_context_pct, new_attention, new_adapter)) = applied else {
             return Ok(());
         };
         // Broadcast the node's actual resulting status, not necessarily the
@@ -259,6 +297,8 @@ impl AgentRegistry {
             status: new_status,
             message,
             context_pct: new_context_pct,
+            attention: new_attention,
+            adapter: new_adapter,
         });
         Ok(())
     }
@@ -703,7 +743,7 @@ mod tests {
         let mut rx = reg.subscribe();
         reg.set_status(&result.id, AgentStatus::Blocked, Some("waiting".to_string()), None, None, std::time::SystemTime::now()).unwrap();
         match rx.try_recv().unwrap() {
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct } => {
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, .. } => {
                 assert_eq!(agent_id, result.id);
                 assert_eq!(status, AgentStatus::Blocked);
                 assert_eq!(message.as_deref(), Some("waiting"));
@@ -886,5 +926,132 @@ mod tests {
         reg.set_status(&result.id, AgentStatus::Idle, None, None, None, earlier).unwrap();
 
         assert_eq!(reg.get(&result.id).unwrap().status, AgentStatus::Done);
+    }
+
+    fn attention(kind: crate::agent::AttentionKind, observed_at: std::time::SystemTime) -> AttentionUpdate {
+        AttentionUpdate::Set {
+            attention: Attention { kind, message: None, retry_at: None, observed_at },
+        }
+    }
+
+    #[test]
+    fn unrelated_lifecycle_events_do_not_clear_permission_attention() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let now = std::time::SystemTime::now();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Blocked,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::Permission, now)),
+            None,
+            now,
+        )
+        .unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, now).unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().attention.unwrap().kind, crate::agent::AttentionKind::Permission);
+    }
+
+    #[test]
+    fn permission_reply_clears_only_permission_attention() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let now = std::time::SystemTime::now();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Blocked,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::Permission, now)),
+            None,
+            now,
+        )
+        .unwrap();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            Some(AttentionUpdate::Clear { kind: crate::agent::AttentionKind::Permission }),
+            None,
+            now,
+        )
+        .unwrap();
+        assert!(reg.get(&result.id).unwrap().attention.is_none());
+    }
+
+    #[test]
+    fn successful_activity_clears_provider_limit_attention() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let now = std::time::SystemTime::now();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::RateLimit, now)),
+            None,
+            now,
+        )
+        .unwrap();
+        reg.set_status(&result.id, AgentStatus::Running, None, None, None, now).unwrap();
+        assert!(reg.get(&result.id).unwrap().attention.is_none());
+    }
+
+    #[test]
+    fn stale_attention_cannot_overwrite_a_newer_signal() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let later = std::time::SystemTime::now();
+        let earlier = later - std::time::Duration::from_secs(1);
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::Billing, later)),
+            None,
+            later,
+        )
+        .unwrap();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Blocked,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::Permission, earlier)),
+            None,
+            earlier,
+        )
+        .unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().attention.unwrap().kind, crate::agent::AttentionKind::Billing);
+    }
+
+    #[test]
+    fn terminal_status_clears_attention() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let now = std::time::SystemTime::now();
+        reg.set_status_update(
+            &result.id,
+            AgentStatus::Blocked,
+            None,
+            None,
+            false,
+            Some(attention(crate::agent::AttentionKind::Permission, now)),
+            None,
+            now,
+        )
+        .unwrap();
+        reg.set_status(&result.id, AgentStatus::Done, None, None, None, now).unwrap();
+        assert!(reg.get(&result.id).unwrap().attention.is_none());
     }
 }

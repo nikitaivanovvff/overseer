@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{AgentAdapter, InstalledFile, LaunchContext, MergeStrategy};
+use super::{AdapterCapabilities, AgentAdapter, CapabilitySupport, InstalledFile, LaunchContext, MergeStrategy};
 
 const ROOT_SKILL_PATH: &str = "skills/overseer-root/SKILL.md";
 const CHILD_SKILL_PATH: &str = "skills/overseer-child/SKILL.md";
@@ -37,9 +37,9 @@ impl ClaudeAdapter {
     }
 
     fn settings_content(&self) -> String {
-        let running_cmd = self.hook_command("status running --from-hook");
-        let idle_cmd = self.hook_command("status idle --from-hook");
-        let blocked_cmd = self.hook_command("status blocked --from-hook");
+        let running_cmd = self.hook_command("status running --from-hook --clear-attention permission");
+        let idle_cmd = self.hook_command("status idle --from-hook --clear-attention permission");
+        let blocked_cmd = self.hook_command("status blocked --from-hook --attention permission");
         // SessionStart's own push additionally self-identifies as "claude" —
         // the only place this needs saying, since a bare-shell root's own
         // registered adapter is always the honest-but-uninformative "shell"
@@ -49,8 +49,8 @@ impl ClaudeAdapter {
         // bare-shell root would never stop looking like "shell" to a spawn
         // default. Every other hook re-asserts `running`/`idle`/`blocked`
         // only — no need to repeat the adapter identity on every push.
-        let session_start_running_cmd = self.hook_command("status running --from-hook --adapter claude");
-        let session_start_idle_cmd = self.hook_command("status idle --from-hook --adapter claude");
+        let session_start_running_cmd = self.hook_command("status running --from-hook --adapter claude --clear-context");
+        let session_start_idle_cmd = self.hook_command("status idle --from-hook --adapter claude --clear-context");
         // Roots and taskless TUI-created children wait for a human prompt;
         // CLI-spawned children already have their initial task.
         let session_start_status_cmd = format!(
@@ -100,11 +100,8 @@ impl ClaudeAdapter {
                     "_overseer": true,
                     "hooks": [{"type": "command", "command": idle_cmd}]
                 }],
-                // Notification also fires for the 60s idle nag, which is not a
-                // permission request — main.rs's --from-hook classification
-                // downgrades that case back to `idle` so this doesn't lie.
                 "Notification": [{
-                    "matcher": "",
+                    "matcher": "permission_prompt",
                     "_overseer": true,
                     "hooks": [{"type": "command", "command": blocked_cmd}]
                 }]
@@ -121,6 +118,24 @@ impl Default for ClaudeAdapter {
 }
 
 impl AgentAdapter for ClaudeAdapter {
+    fn capabilities(&self) -> AdapterCapabilities {
+        // Live-probed with Claude Code 2.1.209. Lifecycle hooks and the
+        // Notification(permission_prompt) payload fired with inherited identity.
+        // Claude's authoritative 1M-aware context and rate-limit fields exist
+        // only in the single, user-owned statusLine command slot; Overseer must
+        // not replace or wrap arbitrary user configuration to observe them.
+        AdapterCapabilities {
+            lifecycle: CapabilitySupport::Supported,
+            permission_requests: CapabilitySupport::Supported,
+            provider_limits: CapabilitySupport::Unsupported {
+                reason: "provider limits are exposed only to the user-owned statusLine command".to_string(),
+            },
+            context_usage: CapabilitySupport::Unsupported {
+                reason: "authoritative context percentage is exposed only to the user-owned statusLine command".to_string(),
+            },
+        }
+    }
+
     fn user_config_dir(&self) -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
             return Some(PathBuf::from(dir));
@@ -227,6 +242,15 @@ mod tests {
         assert!(matches!(files[1].merge, MergeStrategy::Overwrite));
         assert_eq!(files[2].path, Path::new(SETTINGS_PATH));
         assert!(matches!(files[2].merge, MergeStrategy::JsonMerge));
+    }
+
+    #[test]
+    fn capabilities_match_live_probed_claude_2_1_209() {
+        let capabilities = make_adapter().capabilities();
+        assert_eq!(capabilities.lifecycle, CapabilitySupport::Supported);
+        assert_eq!(capabilities.permission_requests, CapabilitySupport::Supported);
+        assert!(matches!(capabilities.provider_limits, CapabilitySupport::Unsupported { .. }));
+        assert!(matches!(capabilities.context_usage, CapabilitySupport::Unsupported { .. }));
     }
 
     #[test]
@@ -337,6 +361,8 @@ mod tests {
         assert!(v["hooks"]["Notification"].is_array());
         let cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status blocked"));
+        assert!(cmd.contains("--attention permission"));
+        assert_eq!(v["hooks"]["Notification"][0]["matcher"], "permission_prompt");
     }
 
     #[test]
