@@ -57,6 +57,17 @@ Then run `overseer`. It spawns a background daemon on first launch, and `n` open
 
 No prebuilt binaries or Homebrew tap yet — cross-compiled release CI exists (`.github/workflows/release.yml`) but no version has been tagged. Building from source is the only path today.
 
+## Danger Zone
+
+By design, Overseer does not bypass permission prompts for spawned children. A child asks for permission exactly like a human running the same harness would — that's the default, and it stays the default.
+
+If you want a child to run unattended without those prompts, that's your call and your risk to take, and there are two ways to make it:
+
+- **Per adapter**, already documented in `AGENTS.md`'s Config section: set `[adapters.<name>] extra_args` in `~/.config/overseer/config.toml` to whatever flags your harness accepts, e.g. `extra_args = ["--dangerously-skip-permissions"]` for Claude Code.
+- **Blanket, for every configured adapter**: set `[defaults] im_not_afraid_of_agents = true`. Overseer appends the equivalent auto-approve flag to every adapter that has one (`--dangerously-skip-permissions` for Claude Code, `--auto` for opencode) without you having to hand-list it per adapter.
+
+Either way, the consequence is the same: an agent running this way can take any action its harness allows — edit files, run shell commands, whatever the tool permits — without asking, unattended. Both flags are labeled dangerous by their own tools: Claude Code's is literally named `--dangerously-skip-permissions`, and opencode's own docs describe `--auto` as auto-approving permissions that aren't explicitly denied "(dangerous!)". Turn this on only if you mean it.
+
 ## Status
 
 Actively developed, pre-release (`0.1.0`), no tagged versions. See `AGENTS.md` for what's shipped and what's still open.
