@@ -54,6 +54,9 @@ pub enum Command {
         /// Harness-computed context usage percentage (0-100).
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         context_pct: Option<u8>,
+        /// Authoritative model identifier reported by the harness integration.
+        #[arg(long)]
+        model_name: Option<String>,
         /// Remove a stale context value when this harness cannot report one.
         #[arg(long)]
         clear_context: bool,
@@ -267,6 +270,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
             clear_attention,
             retry_after,
             context_pct,
+            mut model_name,
             clear_context,
         } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
@@ -282,6 +286,12 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
             if from_hook {
                 let payload = read_hook_payload();
                 status = agent::hook::classify_hook_status(status, payload.as_ref());
+                if model_name.is_none() {
+                    model_name = payload
+                        .and_then(|payload| payload.transcript_path)
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .and_then(|raw| agent::hook::latest_model_from_transcript(&raw));
+                }
             }
             let attention = match (attention, clear_attention) {
                 (Some(_), Some(_)) => return Err(anyhow::anyhow!("--attention and --clear-attention are mutually exclusive")),
@@ -303,6 +313,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 message,
                 context_pct,
                 clear_context,
+                model_name,
                 attention,
                 adapter,
                 pushed_at,
@@ -359,6 +370,7 @@ mod tests {
             clear_attention: None,
             retry_after: None,
             context_pct: None,
+            model_name: None,
             clear_context: false,
         };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
@@ -378,6 +390,7 @@ mod tests {
             clear_attention: None,
             retry_after: None,
             context_pct: None,
+            model_name: None,
             clear_context: false,
         };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
@@ -399,6 +412,7 @@ mod tests {
             clear_attention: None,
             retry_after: Some(30),
             context_pct: None,
+            model_name: None,
             clear_context: false,
         };
         let request = build_request(cmd, pushed_at).unwrap().unwrap();

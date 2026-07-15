@@ -327,7 +327,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
         AttachEvent::AgentRemoved { agent_id } => {
             state.tree.remove(&agent_id);
         }
-        AttachEvent::StatusChanged { agent_id, status, context_pct, attention, adapter, message: _ } => {
+        AttachEvent::StatusChanged { agent_id, status, context_pct, model_name, attention, adapter, message: _ } => {
             if let Some(node) = state.tree.find_mut(&agent_id) {
                 // Same "compare before overwrite" rule as the registry
                 // itself (ATTENTION.md) — a repeated same-status push must
@@ -343,6 +343,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
                 // value before broadcasting (see `AgentRegistry::set_status`)
                 // — this is the definitive value, not a delta to fold in.
                 node.context_pct = context_pct;
+                node.model_name = model_name;
                 node.attention = attention;
                 node.adapter = adapter;
             }
@@ -378,6 +379,7 @@ fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
         adapter: dto.adapter,
         cwd: dto.cwd,
         context_pct: dto.context_pct,
+        model_name: dto.model_name,
         attention: dto.attention,
         children: Vec::new(),
         expanded: true,
@@ -501,6 +503,7 @@ mod tests {
             branch: "main".to_string(),
             cwd: PathBuf::from("/tmp"),
             context_pct: None,
+            model_name: None,
             attention: None,
             capabilities: Box::new(overseer_core::agent::adapters::capabilities_for("claude")),
             status_secs: 0,
@@ -628,6 +631,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: Some(42),
+            model_name: None,
             attention: None,
             adapter: "claude".to_string(),
         });
@@ -648,6 +652,7 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: None,
+            model_name: None,
             attention: None,
             adapter: "claude".to_string(),
         });
@@ -669,6 +674,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: None,
+            model_name: None,
             attention: None,
             adapter: "claude".to_string(),
         });
@@ -705,6 +711,7 @@ mod tests {
             status: AgentStatus::Running,
             message: None,
             context_pct: Some(10),
+            model_name: None,
             attention: None,
             adapter: "claude".to_string(),
         });
@@ -713,6 +720,7 @@ mod tests {
             status: AgentStatus::Idle,
             message: None,
             context_pct: None,
+            model_name: None,
             attention: None,
             adapter: "claude".to_string(),
         });

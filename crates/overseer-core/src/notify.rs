@@ -150,6 +150,7 @@ mod tests {
             repo: "repo".to_string(),
             branch: "main".to_string(),
             context_pct: None,
+            model_name: None,
             attention: None,
             has_children: false,
             prefix: String::new(),

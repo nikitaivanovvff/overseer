@@ -16,6 +16,7 @@ fn mock_root(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         adapter: "claude".to_string(),
         cwd: PathBuf::from("."),
         context_pct: None,
+        model_name: None,
         attention: None,
         children: Vec::new(),
         expanded: true,
@@ -38,6 +39,7 @@ fn mock_child(name: impl Into<String>, repo: impl Into<String>) -> AgentNode {
         adapter: "claude".to_string(),
         cwd: PathBuf::from("."),
         context_pct: None,
+        model_name: None,
         attention: None,
         children: Vec::new(),
         expanded: true,
@@ -59,6 +61,7 @@ pub struct FlatNode {
     pub repo: String,
     pub branch: String,
     pub context_pct: Option<u8>,
+    pub model_name: Option<String>,
     pub attention: Option<super::Attention>,
     pub has_children: bool,
     pub prefix: String,
@@ -232,6 +235,7 @@ impl AgentTree {
 
         let mut child_a = mock_child("auth-module", "overseer");
         child_a.context_pct = Some(23);
+        child_a.model_name = Some("anthropic/claude-sonnet-5".to_string());
 
         let mut child_b = mock_child("write-tests", "overseer");
         child_b.status = AgentStatus::Done;
@@ -285,6 +289,7 @@ fn flatten_node(
         repo: node.repo.clone(),
         branch: node.branch.clone(),
         context_pct: node.context_pct,
+        model_name: node.model_name.clone(),
         attention: node.attention.clone(),
         has_children: !node.children.is_empty(),
         prefix: format!("{indent}{connector}"),

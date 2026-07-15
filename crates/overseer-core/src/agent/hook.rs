@@ -20,6 +20,20 @@ pub fn parse_hook_payload(raw: &str) -> Option<HookPayload> {
     serde_json::from_str(raw).ok()
 }
 
+/// Returns the model from the newest real assistant turn in a Claude Code
+/// transcript. Synthetic local messages are not model responses and must not
+/// replace a previously known model.
+pub fn latest_model_from_transcript(raw: &str) -> Option<String> {
+    raw.lines().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        if value.get("type")?.as_str()? != "assistant" {
+            return None;
+        }
+        let model = value.get("message")?.get("model")?.as_str()?;
+        (!model.is_empty() && model != "<synthetic>").then(|| model.to_string())
+    })
+}
+
 /// `Notification` fires for both permission requests and the ~60s idle nag. Only
 /// the idle nag should be downgraded from `blocked` to `idle` — everything else
 /// (permission prompts) stays `blocked`. Matched by substring against the known
@@ -67,6 +81,28 @@ mod tests {
     fn parse_hook_payload_garbage_returns_none() {
         assert!(parse_hook_payload("not json at all").is_none());
         assert!(parse_hook_payload("").is_none());
+    }
+
+    #[test]
+    fn latest_model_uses_newest_real_assistant_turn() {
+        let transcript = concat!(
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-1"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"next"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5"}}"#,
+        );
+        assert_eq!(latest_model_from_transcript(transcript).as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn latest_model_ignores_synthetic_and_malformed_entries() {
+        let transcript = concat!(
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5"}}"#,
+            "\nnot json\n",
+            r#"{"type":"assistant","message":{"model":"<synthetic>"}}"#,
+        );
+        assert_eq!(latest_model_from_transcript(transcript).as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]

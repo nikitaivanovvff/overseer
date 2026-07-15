@@ -78,9 +78,9 @@ pub struct RenderLayout {
     /// The tree list's outer rect (border included), for mapping a mouse
     /// click's (column, row) to a row index.
     pub tree_rect: Rect,
-    /// The ids of the rows actually drawn in the tree, top to bottom —
-    /// already search-filtered if a query was active, so row `i` here is
-    /// exactly what the user saw at that screen position.
+    /// The agent id occupying each terminal line in the tree, top to bottom.
+    /// Every two-line item contributes its id twice, and the vector is already
+    /// search-filtered, so line `i` exactly matches the screen position.
     pub tree_rows: Vec<AgentId>,
 }
 
@@ -155,7 +155,10 @@ pub fn render(
     };
 
     let tree_rect = left[0];
-    let tree_rows: Vec<AgentId> = display_flat.iter().map(|n| n.id.clone()).collect();
+    let tree_rows: Vec<AgentId> = display_flat
+        .iter()
+        .flat_map(|node| [node.id.clone(), node.id.clone()])
+        .collect();
     render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme);
     render_agent_detail(frame, left[1], &selected, theme);
     let pane_rect = render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused);
@@ -261,8 +264,9 @@ fn status_bar_height(text: &str, area_width: u16) -> u16 {
     lines
 }
 
-/// Maps a mouse click's screen `(column, row)` to the id of the tree row it
-/// landed on, given the layout the last `render` call drew. `tree_rect` is
+/// Maps a mouse click's screen `(column, row)` to the id occupying that tree
+/// line. Each two-line agent item appears twice in `tree_rows`, so either line
+/// selects the same agent. `tree_rect` is
 /// the `List`'s outer rect (border included) and `tree_rows` is the exact
 /// top-to-bottom id order `render_agent_tree` drew into it (already
 /// search-filtered/fold-aware, since it's read straight off `RenderLayout`
@@ -300,11 +304,11 @@ fn render_agent_tree(
             // itself a match) renders dimmed — `matched` is `None` outside
             // search, so nothing dims then.
             let dimmed = matched.is_some_and(|m| !m.contains(&node.id));
-            let line = tree_row(node, selected, dimmed, tick, theme, inner_width);
+            let lines = tree_row(node, selected, dimmed, tick, theme, inner_width);
             if selected {
-                ListItem::new(line).style(Style::default().bg(Color::DarkGray))
+                ListItem::new(lines).style(Style::default().bg(Color::DarkGray))
             } else {
-                ListItem::new(line)
+                ListItem::new(lines)
             }
         })
         .collect();
@@ -317,22 +321,7 @@ fn render_agent_tree(
     frame.render_widget(List::new(items).block(block), area);
 }
 
-/// Pure. The 1-column harness indicator fused directly to the status badge
-/// (TREE-METADATA.md): the adapter's first letter, uppercased. Derived
-/// generically rather than matched against `"claude"`/`"opencode"`/`"pi"` by
-/// name, so a future fourth adapter needs no change here. A bare workspace
-/// that hasn't run a real harness yet (`adapter == "shell"`) renders blank
-/// instead of claiming one — the empty slot is itself legible ("no harness
-/// running here yet") and self-corrects the moment the session's own
-/// SessionStart-equivalent hook pushes its real adapter name.
-fn harness_glyph(adapter: &str) -> char {
-    if adapter == "shell" {
-        return ' ';
-    }
-    adapter.chars().next().and_then(|c| c.to_uppercase().next()).unwrap_or(' ')
-}
-
-fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Line<'static> {
+fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let name_style = if dimmed {
         Style::default().fg(term_pane::map_dto_color(theme.idle))
     } else if selected {
@@ -347,10 +336,8 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
     } else {
         agent_badge(&node.status, node.attention.as_ref()).to_string()
     };
-    let harness = harness_glyph(&node.adapter);
-
-    // prefix + badge (1) + harness glyph (1) + the space separating the badge cluster from the name.
-    let left_fixed = node.prefix.chars().count() + 1 + 1 + 1;
+    // Prefix + badge + the space separating it from the name.
+    let left_fixed = node.prefix.chars().count() + 1 + 1;
     let row_width = width.saturating_sub(left_fixed);
     // Age only for blocked/idle (ATTENTION.md) — a running agent doesn't
     // need a clock, it's actively doing something.
@@ -378,15 +365,57 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         Style::default().fg(Color::DarkGray)
     };
 
-    Line::from(vec![
+    let primary = Line::from(vec![
         Span::styled(node.prefix.clone(), Style::default().fg(Color::DarkGray)),
         Span::styled(badge, badge_style),
-        Span::styled(harness.to_string(), Style::default().fg(term_pane::map_dto_color(theme.idle))),
         Span::raw(" "),
         Span::styled(layout.name, name_style),
         Span::raw(" ".repeat(gap)),
         Span::styled(layout.status_word, row_status_style),
-    ])
+    ]);
+
+    let metadata = format_tree_metadata(
+        &node.branch,
+        node.model_name.as_deref(),
+        &node.adapter,
+        width.saturating_sub(left_fixed),
+    );
+    let secondary = Line::from(vec![
+        Span::raw(" ".repeat(left_fixed)),
+        Span::styled(metadata, Style::default().fg(term_pane::map_dto_color(theme.idle))),
+    ]);
+
+    vec![primary, secondary]
+}
+
+/// Pure. Composes the secondary tree line from the branch and the best known
+/// harness identity. A verified model wins over the adapter fallback; a bare
+/// shell contributes neither. The result always fits `width`.
+fn format_tree_metadata(branch: &str, model_name: Option<&str>, adapter: &str, width: usize) -> String {
+    let harness = model_name
+        .filter(|name| !name.is_empty())
+        .or_else(|| (adapter != "shell" && !adapter.is_empty()).then_some(adapter));
+    let metadata = match (!branch.is_empty(), harness) {
+        (true, Some(harness)) => {
+            let full = format!("{branch} · {harness}");
+            if full.graphemes(true).count() <= width || width < 5 {
+                full
+            } else {
+                let content_width = width - 3;
+                let branch_width = content_width / 2;
+                let harness_width = content_width - branch_width;
+                format!(
+                    "{} · {}",
+                    truncate_with_ellipsis(branch, branch_width),
+                    truncate_with_ellipsis(harness, harness_width)
+                )
+            }
+        }
+        (true, None) => branch.to_string(),
+        (false, Some(harness)) => harness.to_string(),
+        (false, None) => String::new(),
+    };
+    truncate_with_ellipsis(&metadata, width)
 }
 
 /// Pure. Lays out one tree row's text: the name (truncated with `…` if it would
@@ -753,35 +782,7 @@ mod tests {
         );
     }
 
-    // ── harness_glyph / tree_row (TREE-METADATA.md) ──────────────────────────
-
-    #[test]
-    fn harness_glyph_uses_first_letter_uppercased_for_known_adapters() {
-        assert_eq!(harness_glyph("claude"), 'C');
-        assert_eq!(harness_glyph("opencode"), 'O');
-        assert_eq!(harness_glyph("pi"), 'P');
-    }
-
-    #[test]
-    fn harness_glyph_blank_for_a_bare_shell_workspace() {
-        // A workspace registered by `overseer start` hasn't run a real
-        // harness yet — it shouldn't visually claim one.
-        assert_eq!(harness_glyph("shell"), ' ');
-    }
-
-    #[test]
-    fn harness_glyph_generic_first_letter_fallback_for_an_unknown_adapter() {
-        // Derived generically (first letter, not a hardcoded 3-way match),
-        // so a future/unconfigured adapter name still gets a sensible
-        // glyph instead of nothing — "aider" is AGENTS.md's own
-        // config-shape-example adapter with no real `AgentAdapter` impl.
-        assert_eq!(harness_glyph("aider"), 'A');
-    }
-
-    #[test]
-    fn harness_glyph_empty_adapter_does_not_panic() {
-        assert_eq!(harness_glyph(""), ' ');
-    }
+    // ── tree row metadata ────────────────────────────────────────────────────
 
     fn flat_node_with_adapter(name: &str, status: AgentStatus, adapter: &str, prefix: &str) -> FlatNode {
         FlatNode {
@@ -792,6 +793,7 @@ mod tests {
             repo: "repo".to_string(),
             branch: "main".to_string(),
             context_pct: None,
+            model_name: None,
             attention: None,
             has_children: false,
             prefix: prefix.to_string(),
@@ -801,27 +803,29 @@ mod tests {
     }
 
     #[test]
-    fn tree_row_fuses_the_harness_glyph_to_the_badge_with_no_gap() {
+    fn tree_row_uses_two_lines_without_a_fused_harness_glyph() {
         let theme = Theme::default();
         let node = flat_node_with_adapter("auth-module", AgentStatus::Idle, "opencode", "");
-        let line = tree_row(&node, false, false, 0, &theme, 40);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        // Badge ("◌") immediately followed by the harness letter, no space
-        // between them — only one space separates the cluster from the name.
-        assert!(text.contains("◌O auth-module"), "expected fused badge+glyph, got: {text}");
+        let lines = tree_row(&node, false, false, 0, &theme, 40);
+        assert_eq!(lines.len(), 2);
+        let primary: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let secondary: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(primary.contains("◌ auth-module"), "expected badge then name, got: {primary}");
+        assert!(!primary.contains('O'), "primary line must not contain a harness glyph: {primary}");
+        assert_eq!(secondary.trim(), "main · opencode");
     }
 
     #[test]
-    fn tree_row_harness_glyph_blank_for_shell_leaves_a_bare_badge() {
+    fn tree_row_shell_workspace_omits_harness_metadata() {
         let theme = Theme::default();
         let node = flat_node_with_adapter("overseer", AgentStatus::Idle, "shell", "");
-        let line = tree_row(&node, false, false, 0, &theme, 40);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("◌  overseer"), "expected a blank glyph slot, got: {text}");
+        let lines = tree_row(&node, false, false, 0, &theme, 40);
+        let secondary: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(secondary.trim(), "main");
     }
 
     #[test]
-    fn tree_row_narrow_width_does_not_panic_with_a_harness_glyph() {
+    fn tree_row_narrow_width_does_not_panic() {
         let theme = Theme::default();
         for width in 0..8 {
             for adapter in ["claude", "opencode", "pi", "shell", ""] {
@@ -858,9 +862,44 @@ mod tests {
         tree.add_root(root);
         let flat = tree.flatten();
         for width in 0..6 {
-            let line = tree_row(&flat[0], false, false, 0, &Theme::default(), width);
-            assert_eq!(line.spans[1].content, "$", "badge must survive width {width}");
+            let lines = tree_row(&flat[0], false, false, 0, &Theme::default(), width);
+            assert_eq!(lines[0].spans[1].content, "$", "badge must survive width {width}");
         }
+    }
+
+    #[test]
+    fn metadata_prefers_model_over_harness_fallback() {
+        assert_eq!(
+            format_tree_metadata("ovsr/auth", Some("anthropic/claude-sonnet-5"), "claude", 80),
+            "ovsr/auth · anthropic/claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn metadata_composes_branch_and_harness_fallback() {
+        assert_eq!(format_tree_metadata("ovsr/auth", None, "opencode", 80), "ovsr/auth · opencode");
+        assert_eq!(format_tree_metadata("", None, "pi", 80), "pi");
+    }
+
+    #[test]
+    fn metadata_omits_bare_shell_and_supports_a_blank_line() {
+        assert_eq!(format_tree_metadata("main", None, "shell", 80), "main");
+        assert_eq!(format_tree_metadata("", None, "shell", 80), "");
+    }
+
+    #[test]
+    fn metadata_truncates_safely_at_narrow_widths() {
+        assert_eq!(format_tree_metadata("long-branch", None, "claude", 1), "…");
+        for width in 0..8 {
+            assert!(format_tree_metadata("long-branch", Some("provider/long-model"), "claude", width)
+                .graphemes(true)
+                .count()
+                <= width);
+        }
+        assert_eq!(
+            format_tree_metadata("overseer/12345678", Some("anthropic/claude-sonnet-5"), "claude", 17),
+            "overse… · anthro…"
+        );
     }
 
     // ── format_tree_row / truncate_with_ellipsis ─────────────────────────────
@@ -1135,6 +1174,7 @@ mod tests {
             adapter: "claude".to_string(),
             cwd: std::path::PathBuf::from("."),
             context_pct: None,
+            model_name: None,
             attention: None,
             children,
             expanded: true,
@@ -1200,7 +1240,7 @@ mod tests {
     }
 
     fn ids(flat: &[FlatNode]) -> Vec<AgentId> {
-        flat.iter().map(|n| n.id.clone()).collect()
+        flat.iter().flat_map(|node| [node.id.clone(), node.id.clone()]).collect()
     }
 
     #[test]
@@ -1234,12 +1274,15 @@ mod tests {
         let rows = ids(&flat);
         let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
 
-        // Row 0 ("implement-auth") sits at screen row 1 (row 0 is the top border).
+        // Both lines of item 0 ("implement-auth") select the root.
         assert_eq!(hit_test_tree(tree_rect, &rows, 5, 1), Some(rows[0].clone()));
-        // Row 1 ("auth-module").
-        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 2), Some(rows[1].clone()));
-        // Row 2 ("write-tests").
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 2), Some(rows[0].clone()));
+        // Both lines of item 1 ("auth-module").
         assert_eq!(hit_test_tree(tree_rect, &rows, 5, 3), Some(rows[2].clone()));
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 4), Some(rows[2].clone()));
+        // Both lines of item 2 ("write-tests").
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 5), Some(rows[4].clone()));
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 6), Some(rows[4].clone()));
     }
 
     #[test]
@@ -1254,11 +1297,12 @@ mod tests {
         let rows = ids(&filtered);
         let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
 
-        // Screen row 2 is now "write-tests" (row 1 in the filtered list),
+        // Screen rows 3-4 are now "write-tests" (item 1 in the filtered list),
         // not "auth-module" — hit-testing must follow the rows actually
         // drawn, not the full tree's positions.
-        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 2), Some(rows[1].clone()));
-        assert_ne!(hit_test_tree(tree_rect, &rows, 5, 2), Some(flat[1].id.clone()));
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 3), Some(rows[2].clone()));
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 4), Some(rows[2].clone()));
+        assert_ne!(hit_test_tree(tree_rect, &rows, 5, 3), Some(flat[1].id.clone()));
     }
 
     #[test]
@@ -1274,8 +1318,8 @@ mod tests {
     fn hit_test_tree_click_past_the_last_row_is_none() {
         let rows = ids(&click_tree().flatten());
         let tree_rect = Rect { x: 0, y: 0, width: 30, height: 10 };
-        // Only 3 rows are drawn (screen rows 1..=3); row 4 is blank list space.
-        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 4), None);
+        // Three two-line items occupy screen rows 1..=6; row 7 is blank.
+        assert_eq!(hit_test_tree(tree_rect, &rows, 5, 7), None);
     }
 
     #[test]
@@ -1370,6 +1414,7 @@ mod tests {
             repo: "scratch".to_string(),
             branch: String::new(), // non-git root: no fake branch name
             context_pct: None,
+            model_name: None,
             attention: None,
             has_children: false,
             prefix: String::new(),

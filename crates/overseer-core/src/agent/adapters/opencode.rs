@@ -63,6 +63,12 @@ export const OverseerPlugin = async () => {{
   }});
 
   return {{
+    "chat.message": async (input) => {{
+      if (input.model?.modelID) {{
+        const model = input.model.providerID ? `${{input.model.providerID}}/${{input.model.modelID}}` : input.model.modelID;
+        push("running", ["--model-name", model]);
+      }}
+    }},
     event: async ({{ event }}) => {{
       if (event.type === "session.created") {{
         // Roots and taskless TUI-created children wait for a human prompt;
@@ -302,6 +308,15 @@ mod tests {
         assert!(content.contains(r#""permission.replied""#));
         assert!(content.contains(r#""--attention", "permission""#));
         assert!(content.contains(r#""--clear-attention", "permission""#));
+    }
+
+    #[test]
+    fn plugin_reports_the_typed_chat_message_model() {
+        let content = make_adapter().plugin_content();
+        assert!(content.contains(r#""chat.message""#));
+        assert!(content.contains("input.model.providerID"));
+        assert!(content.contains("input.model.modelID"));
+        assert!(content.contains(r#""--model-name""#));
     }
 
     #[test]

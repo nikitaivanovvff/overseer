@@ -34,7 +34,17 @@ pub struct AppCtx {
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
 pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
     match req {
-        Request::Status { agent_id, status, message, context_pct, clear_context, attention, adapter, pushed_at } => {
+        Request::Status {
+            agent_id,
+            status,
+            message,
+            context_pct,
+            clear_context,
+            model_name,
+            attention,
+            adapter,
+            pushed_at,
+        } => {
             let attention = attention.map(|update| match update {
                 crate::agent::AttentionUpdate::Set { mut attention } => {
                     attention.message = attention.message.map(sanitize_attention_message);
@@ -42,12 +52,13 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 }
                 clear => clear,
             });
-            match ctx.registry.set_status_update(
+            match ctx.registry.set_status_update_with_model(
                 &agent_id,
                 status,
                 message,
                 context_pct,
                 clear_context,
+                model_name,
                 attention,
                 adapter,
                 pushed_at,
@@ -298,6 +309,7 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: None,
+            model_name: None,
             clear_context: false,
             attention: None,
             adapter: None,
@@ -317,6 +329,7 @@ mod tests {
             status: AgentStatus::Blocked,
             message: None,
             context_pct: Some(17),
+            model_name: None,
             clear_context: false,
             attention: None,
             adapter: None,
