@@ -17,14 +17,6 @@ cd ../$OVERSEER_REPO-<slug>
 
 Do all your work from inside that directory, not the one you were launched in. If that branch or path already exists (a sibling child picked the same slug), pick a more specific slug and retry — never reuse or touch another agent's branch or worktree.
 
-If this is a Cargo project, point your worktree's build output at a shared, gitignored location instead of a fresh `target/` (each full worktree otherwise recompiles the entire dependency tree from scratch, which adds up in both disk and CPU/heat once several of you are building at once):
-
-```
-mkdir -p .cargo && printf '[build]\ntarget-dir = "../%s-shared-target"\n' "$OVERSEER_REPO" > .cargo/config.toml
-```
-
-Sharing is safe across worktrees — Cargo locks the target dir per-invocation, so concurrent builds queue rather than corrupt anything, and only your own crate's changed code needs recompiling; the (larger) dependency tree is built once and reused. Skip this entirely for a non-Cargo project.
-
 ## Completion
 
 When the task is genuinely complete, report it explicitly:

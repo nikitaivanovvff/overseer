@@ -226,6 +226,14 @@ Both are driven by one pure diff (`notify::status_transitions`) comparing each f
 
 Overseer does **not** manage workspaces. A parent runs in the repo's existing checkout; a child sets up its own git worktree/branch — agents already know how to do this. Overseer never runs `git worktree`, creates branches, or merges. Integrating an agent's branch is the user's call.
 
+**Project-local convention (this repo only, not an Overseer feature):** since this repo happens to be the Cargo project Overseer is itself written in, a child working here should point its worktree's build output at a shared location instead of a fresh `target/` per worktree — each independent worktree otherwise recompiles the whole dependency tree from scratch, which adds up in disk and CPU/heat once a few children are building in parallel:
+
+```
+mkdir -p .cargo && printf '[build]\ntarget-dir = "../overseer-shared-target"\n' > .cargo/config.toml
+```
+
+Cargo locks the target dir per-invocation, so concurrent builds from sibling worktrees queue rather than corrupt anything. This is deliberately *not* baked into Overseer's generic, installed child-skill content — Overseer manages projects in any language, and a Cargo-specific step has no business in instructions every non-Rust project would also receive.
+
 ### Cleanup
 
 Dropping an agent kills its PTY and deregisters it — Overseer doesn't delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent. Workspaces can't be dropped via IPC, only the TUI (`Request::TuiDrop`).
