@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use overseer_core::agent::{AgentId, AgentNode, AgentStatus, AgentTree};
+use overseer_core::agent::{AgentId, AgentNode, AgentTree};
 use overseer_core::ipc::protocol::{AgentDto, AttachEvent, GridSnapshot, Request, Response};
 use overseer_core::ipc::AppCtx;
 
@@ -149,19 +149,16 @@ impl App {
     }
 
     /// Whether `id`'s session still has a live process behind it. Mock mode
-    /// asks `SessionManager` directly; daemon mode has no such handle, so it
-    /// leans on an invariant of the status model instead (AGENTS.md
-    /// Cleanup): `Done`/`Error` are set *only* when the PTY has already
-    /// exited (an explicit push or the exit-code sweep), and by every other
-    /// status the process is still running — so "not Done, not Error" is an
-    /// honest stand-in for "alive", not a guess.
+    /// asks `SessionManager` directly; daemon mode reads the daemon's own
+    /// `session_alive` flag (`AgentNode::session_alive`) mirrored onto the
+    /// client-side tree — *not* inferred from `status`. `Done`/`Error` is
+    /// reachable via an explicit self-report from an agent whose session is
+    /// still very much alive (e.g. the user keeps prompting it after it says
+    /// "done"), so "not Done, not Error" is not a safe stand-in for "alive".
     pub fn is_alive(&self, id: &AgentId) -> bool {
         match &self.backend {
             Backend::Mock(ctx) => ctx.0.sessions.is_alive(id),
-            Backend::Daemon(state) => state
-                .tree
-                .find(id)
-                .is_some_and(|n| !matches!(n.status, AgentStatus::Done | AgentStatus::Error)),
+            Backend::Daemon(state) => state.tree.find(id).is_some_and(|n| n.session_alive),
         }
     }
 
@@ -327,7 +324,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
         AttachEvent::AgentRemoved { agent_id } => {
             state.tree.remove(&agent_id);
         }
-        AttachEvent::StatusChanged { agent_id, status, context_pct, model_name, attention, adapter, message: _ } => {
+        AttachEvent::StatusChanged { agent_id, status, context_pct, model_name, attention, adapter, session_alive, message: _ } => {
             if let Some(node) = state.tree.find_mut(&agent_id) {
                 // Same "compare before overwrite" rule as the registry
                 // itself (ATTENTION.md) — a repeated same-status push must
@@ -346,6 +343,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
                 node.model_name = model_name;
                 node.attention = attention;
                 node.adapter = adapter;
+                node.session_alive = session_alive;
             }
         }
         AttachEvent::Output { agent_id, grid } => {
@@ -381,6 +379,7 @@ fn insert_dto(tree: &mut AgentTree, dto: AgentDto) {
         context_pct: dto.context_pct,
         model_name: dto.model_name,
         attention: dto.attention,
+        session_alive: dto.session_alive,
         children: Vec::new(),
         expanded: true,
         status_since,
@@ -458,7 +457,7 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overseer_core::agent::{AgentRegistry, AgentRole};
+    use overseer_core::agent::{AgentRegistry, AgentRole, AgentStatus};
     use overseer_core::git::GitClient;
     use overseer_core::session::SessionManager;
     use std::path::PathBuf;
@@ -505,6 +504,7 @@ mod tests {
             context_pct: None,
             model_name: None,
             attention: None,
+            session_alive: true,
             capabilities: Box::new(overseer_core::agent::adapters::capabilities_for("claude")),
             status_secs: 0,
         }
@@ -634,6 +634,7 @@ mod tests {
             model_name: None,
             attention: None,
             adapter: "claude".to_string(),
+            session_alive: true,
         });
         let node = state.tree.find(&root_id).unwrap();
         assert_eq!(node.status, AgentStatus::Blocked);
@@ -655,6 +656,7 @@ mod tests {
             model_name: None,
             attention: None,
             adapter: "claude".to_string(),
+            session_alive: true,
         });
 
         let after = state.tree.find(&root_id).unwrap().status_since;
@@ -677,6 +679,7 @@ mod tests {
             model_name: None,
             attention: None,
             adapter: "claude".to_string(),
+            session_alive: true,
         });
 
         let after = state.tree.find(&root_id).unwrap().status_since;
@@ -714,6 +717,7 @@ mod tests {
             model_name: None,
             attention: None,
             adapter: "claude".to_string(),
+            session_alive: true,
         });
         apply_event(&mut state, AttachEvent::StatusChanged {
             agent_id: root_id.clone(),
@@ -723,6 +727,7 @@ mod tests {
             model_name: None,
             attention: None,
             adapter: "claude".to_string(),
+            session_alive: true,
         });
         assert_eq!(state.tree.find(&root_id).unwrap().context_pct, None);
     }
@@ -799,22 +804,66 @@ mod tests {
     // ── App is_alive across backends ─────────────────────────────────────────
 
     #[test]
-    fn daemon_mode_is_alive_is_false_for_done_and_error_true_otherwise() {
+    fn daemon_mode_is_alive_reflects_session_alive_not_status() {
+        // The real bug this replaces: a self-reported `done` (or `error`)
+        // agent whose PTY is still running (the user keeps typing follow-up
+        // prompts into its pane) must still report alive -- `is_alive` must
+        // key off `session_alive`, never off `status` alone. Pairing each
+        // status with both `session_alive` values (including the sanity
+        // check on `Running`) proves that: if `is_alive` were still
+        // accidentally deriving from `status`, `Running`+`session_alive:
+        // false` would wrongly come back `true`.
         let mut state = empty_daemon_state();
-        for (status, expected) in [
-            (AgentStatus::Spawning, true),
-            (AgentStatus::Running, true),
-            (AgentStatus::Blocked, true),
-            (AgentStatus::Idle, true),
-            (AgentStatus::Done, false),
-            (AgentStatus::Error, false),
+        for (status, session_alive, expected) in [
+            (AgentStatus::Done, true, true),
+            (AgentStatus::Done, false, false),
+            (AgentStatus::Error, true, true),
+            (AgentStatus::Error, false, false),
+            (AgentStatus::Running, true, true),
+            (AgentStatus::Running, false, false),
         ] {
             let id = AgentId::new();
-            apply_event(&mut state, AttachEvent::AgentRegistered { agent: dto(id.clone(), None, status) });
+            let agent = AgentDto { session_alive, ..dto(id.clone(), None, status.clone()) };
+            apply_event(&mut state, AttachEvent::AgentRegistered { agent });
             let app = App::new_daemon_state_for_test(state);
-            assert_eq!(app.is_alive(&id), expected);
+            assert_eq!(
+                app.is_alive(&id),
+                expected,
+                "status={status:?} session_alive={session_alive} expected is_alive={expected}"
+            );
             state = app.into_daemon_state_for_test();
         }
+    }
+
+    #[test]
+    fn a_status_changed_push_with_session_alive_false_flips_is_alive_even_when_status_is_unchanged() {
+        // Mirrors the real wire sequence: an agent self-reports `done` while
+        // its PTY is still up (jump_in must still work), then later the PTY
+        // actually exits and the daemon's exit sweep
+        // (`AgentRegistry::mark_session_exited`) broadcasts a `StatusChanged`
+        // carrying the same `Done` status but `session_alive: false`.
+        let mut state = empty_daemon_state();
+        let id = AgentId::new();
+        apply_event(
+            &mut state,
+            AttachEvent::AgentRegistered { agent: dto(id.clone(), None, AgentStatus::Done) },
+        );
+        let app = App::new_daemon_state_for_test(state);
+        assert!(app.is_alive(&id), "self-reported done with a live session must still be alive");
+        let mut state = app.into_daemon_state_for_test();
+
+        apply_event(&mut state, AttachEvent::StatusChanged {
+            agent_id: id.clone(),
+            status: AgentStatus::Done,
+            message: None,
+            context_pct: None,
+            model_name: None,
+            attention: None,
+            adapter: "claude".to_string(),
+            session_alive: false,
+        });
+        let app = App::new_daemon_state_for_test(state);
+        assert!(!app.is_alive(&id), "a real exit must flip is_alive even though status stayed Done");
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub struct AgentNode {
     pub context_pct: Option<u8>,
     pub model_name: Option<String>,
     pub attention: Option<Attention>,
+    /// Ground truth for whether this agent's PTY process has actually
+    /// exited, tracked independently of `status` (a self-reported `Done`
+    /// does not mean the session died — see `AgentRegistry::mark_session_exited`).
+    /// Defaults `true` at registration; the daemon's exit-code sweep is the
+    /// only thing that ever flips it to `false`, and never back.
+    pub session_alive: bool,
     pub children: Vec<AgentNode>,
     pub expanded: bool,
     /// When `status` last actually changed (ATTENTION.md) — reset by

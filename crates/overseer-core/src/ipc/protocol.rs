@@ -210,6 +210,9 @@ pub enum AttachEvent {
         model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
+        /// See `AgentNode::session_alive` — the definitive value, applied
+        /// directly by `app::apply_event` same as every other field here.
+        session_alive: bool,
     },
     /// The watched agent's rendered terminal grid. Sent immediately on `Watch`,
     /// then whenever the terminal has produced new content since the last send
@@ -301,8 +304,8 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
         match event {
             RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
             RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter } => {
-                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter }
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, session_alive } => {
+                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, session_alive }
             }
             RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
@@ -323,6 +326,8 @@ pub struct AgentDto {
     pub context_pct: Option<u8>,
     pub model_name: Option<String>,
     pub attention: Option<Attention>,
+    /// See `AgentNode::session_alive`.
+    pub session_alive: bool,
     pub capabilities: Box<AdapterCapabilities>,
     /// How long `status` has held its current value, in whole seconds,
     /// computed at snapshot time (ATTENTION.md) — an age, not the
@@ -347,6 +352,7 @@ impl AgentDto {
             context_pct: node.context_pct,
             model_name: node.model_name.clone(),
             attention: node.attention.clone(),
+            session_alive: node.session_alive,
             capabilities: Box::new(crate::agent::adapters::capabilities_for(&node.adapter)),
             status_secs: node.status_since.elapsed().as_secs(),
         }
