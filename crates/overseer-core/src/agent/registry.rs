@@ -27,6 +27,7 @@ pub enum RegistryEvent {
         status: AgentStatus,
         message: Option<String>,
         context_pct: Option<u8>,
+        model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
     },
@@ -117,6 +118,7 @@ impl AgentRegistry {
                     adapter: args.adapter,
                     cwd: args.cwd,
                     context_pct: None,
+                    model_name: None,
                     attention: None,
                     children: Vec::new(),
                     expanded: true,
@@ -144,6 +146,7 @@ impl AgentRegistry {
                     adapter: args.adapter,
                     cwd: args.cwd,
                     context_pct: None,
+                    model_name: None,
                     attention: None,
                     children: Vec::new(),
                     expanded: true,
@@ -233,6 +236,32 @@ impl AgentRegistry {
         adapter: Option<String>,
         pushed_at: std::time::SystemTime,
     ) -> Result<(), RegistryError> {
+        self.set_status_update_with_model(
+            id,
+            status,
+            message,
+            context_pct,
+            clear_context,
+            None,
+            attention_update,
+            adapter,
+            pushed_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_status_update_with_model(
+        &self,
+        id: &AgentId,
+        status: AgentStatus,
+        message: Option<String>,
+        context_pct: Option<u8>,
+        clear_context: bool,
+        model_name: Option<String>,
+        attention_update: Option<AttentionUpdate>,
+        adapter: Option<String>,
+        pushed_at: std::time::SystemTime,
+    ) -> Result<(), RegistryError> {
         let applied = {
             let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
@@ -259,6 +288,9 @@ impl AgentRegistry {
                         } else if clear_context {
                             node.context_pct = None;
                         }
+                        if let Some(model_name) = model_name.filter(|name| !name.trim().is_empty()) {
+                            node.model_name = Some(model_name);
+                        }
                         match attention_update {
                             Some(AttentionUpdate::Set { attention }) => node.attention = Some(attention),
                             Some(AttentionUpdate::Clear { kind }) => {
@@ -279,13 +311,19 @@ impl AgentRegistry {
                         if let Some(adapter) = adapter {
                             node.adapter = adapter;
                         }
-                        Some((node.status.clone(), node.context_pct, node.attention.clone(), node.adapter.clone()))
+                        Some((
+                            node.status.clone(),
+                            node.context_pct,
+                            node.model_name.clone(),
+                            node.attention.clone(),
+                            node.adapter.clone(),
+                        ))
                     }
                 }
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
-        let Some((new_status, new_context_pct, new_attention, new_adapter)) = applied else {
+        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter)) = applied else {
             return Ok(());
         };
         // Broadcast the node's actual resulting status, not necessarily the
@@ -297,6 +335,7 @@ impl AgentRegistry {
             status: new_status,
             message,
             context_pct: new_context_pct,
+            model_name: new_model_name,
             attention: new_attention,
             adapter: new_adapter,
         });
@@ -466,6 +505,27 @@ mod tests {
         let result = reg.register(make_register_root("agent")).unwrap();
         reg.set_status(&result.id, AgentStatus::Running, None, Some(42), None, std::time::SystemTime::now()).unwrap();
         assert_eq!(reg.get(&result.id).unwrap().context_pct, Some(42));
+    }
+
+    #[test]
+    fn status_update_with_model_persists_across_lifecycle_only_pushes() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            Some("anthropic/claude-sonnet-5".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now())
+            .unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().model_name.as_deref(), Some("anthropic/claude-sonnet-5"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ The agents are already smart. Overseer does **not** reimplement what they do —
 
 The usual shape is **one workspace per repository**. `n` spawns a workspace: it asks for a repo path (default: cwd) and launches a bare shell there — no adapter is launched on your behalf. The row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks once you run one yourself (its own `idle` sticks until then). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
 
-The hierarchy is intentionally capped at **depth 3**: a workspace (depth 1) can spawn children (depth 2), and those children can spawn visible leaf agents (depth 3). Depth-3 agents cannot spawn. Every parent also has a configurable direct-child cap (`[defaults] max_children`, default 8), keeping the tree readable and preventing runaway PTY/token costs. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is just a bare shell with nothing running yet, same as a human just opening it. The adapter (claude, opencode, pi) is shown as a 1-letter glyph fused to each tree row's status badge (`C`/`O`/`P`, derived generically from the adapter name rather than a hardcoded match); a workspace always starts labeled `shell` until you run a real harness inside it yourself, and its glyph stays blank until then.
+The hierarchy is intentionally capped at **depth 3**: a workspace (depth 1) can spawn children (depth 2), and those children can spawn visible leaf agents (depth 3). Depth-3 agents cannot spawn. Every parent also has a configurable direct-child cap (`[defaults] max_children`, default 8), keeping the tree readable and preventing runaway PTY/token costs. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is just a bare shell with nothing running yet, same as a human just opening it. Each tree item uses two lines: badge/name/status on the first, then branch plus the verified model name (or full adapter name when no model is known) on a dim secondary line. A bare `shell` workspace contributes no harness metadata until a real harness reports in.
 
 ---
 
@@ -187,6 +187,8 @@ Two harnesses, two status-wiring mechanisms — each verified against the instal
 | `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
 | `Notification` (`permission_prompt`) | `blocked` + `attention=permission` | Live-probed on Claude Code 2.1.209. Approval reaches `PostToolUse`; denial reaches `Stop`; both clear permission attention. |
 
+Every Claude `--from-hook` push also reads the newest real assistant turn's `message.model` from `transcript_path`, when present, and preserves the last known value otherwise. Synthetic transcript messages are ignored.
+
 **opencode** — a plugin at `~/.config/opencode/plugin/overseer.js`, auto-loaded (opencode scans that directory itself, no `opencode.jsonc` entry needed). Role instructions (`overseer-root.md`/`overseer-child.md`) merge into `opencode.jsonc`'s `instructions` array unconditionally — each file's own "only applies when `$OVERSEER_ROLE=...`" opening line makes loading both, every session, harmless:
 
 | opencode event | Pushes | Why |
@@ -197,6 +199,7 @@ Two harnesses, two status-wiring mechanisms — each verified against the instal
 | `permission.asked` / `permission.v2.asked` (generic event bus) | `blocked` + `attention=permission` | Live-probed on OpenCode 1.17.20 for root and child sessions. The typed top-level `permission.ask` hook exists in the installed declarations but did not fire. Overseer never writes a permission decision. |
 | `permission.replied` / `permission.v2.replied` | `running`, clears permission attention | Both approval and denial resolve the attention condition. |
 | `session.error` with structured `APIError` | preserves active lifecycle + provider attention | HTTP 429 maps to `rate_limit`, 402 to `billing`, other structured API failures to `provider_error`; `Retry-After` is forwarded when supplied. Experimental until a real provider-limit response is live-probed. |
+| typed `chat.message` hook | `running` + model | Reports the hook's authoritative `providerID/modelID`; absent model data leaves the last known model untouched. |
 
 Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
 
@@ -246,11 +249,14 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 ```
 ┌───────────────────────────┬─────────────────────────────────────────┐
 │ WORKSPACES                │                                         │
-│ ◌  overseer           idle│   the selected agent's live grid,       │
-│   ├ ⠸O auth-module        │   painted directly into this same       │
-│   ├ !C tests   blocked 2m │   ratatui frame by ui/term_pane —       │
-│   └ ✓P docs               │   real color, real interaction          │
-│ !C refactor-api blocked 5m│   once focused (Ctrl-l)                 │
+│ ◌ overseer            idle│   the selected agent's live grid,       │
+│   main                    │   painted directly into this same       │
+│ ├ ⠸ auth-module          │   ratatui frame by ui/term_pane —       │
+│   ovsr/auth · claude…     │   real color, real interaction          │
+│ ├ ! tests      blocked 2m │   once focused (Ctrl-l)                 │
+│   ovsr/tests · opencode   │                                         │
+│ └ ✓ docs                 │                                         │
+│   ovsr/docs · claude      │                                         │
 ├───────────────────────────┤                                         │
 │ task:   auth-module       │                                         │
 │ repo:   overseer          │                                         │
@@ -263,11 +269,9 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
 
-Each tree row right-aligns status in dim gray (red/bold for `blocked`); the name truncates with `…` (`format_tree_row`/`truncate_with_ellipsis`). Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention. Context % is no longer surfaced in the UI (tree or Details) — see the note under "Status meanings" below.
+Each tree item has a uniform two-line height. The first line right-aligns status in dim gray (red/bold for `blocked`) and truncates the name with `…` (`format_tree_row`/`truncate_with_ellipsis`). The dim second line aligns under the name and shows the branch when non-empty, then the verified model identifier when known; otherwise it falls back to the full adapter name. A bare `shell` workspace contributes no harness text, and an item with neither branch nor harness/model still reserves a blank second line. The selected background and mouse hit target cover both lines. Status bar: "`N running`", or "`N running · M blocked`" once any agent needs attention. Context % is no longer surfaced in the UI (tree or Details) — see the note under "Status meanings" below.
 
 Status badges: `$` rate/quota/billing attention (highest precedence) · `!` permission/blocked · `●` running · `◌` idle · `✓` done · `✗` error · `…` spawning. A missing attention badge does not prove health when that adapter declares the capability unsupported.
-
-Immediately after the badge, with no gap between them, a dim 1-letter harness glyph (`harness_glyph`, `ui/mod.rs`) shows which adapter that row is running — `C`/`O`/`P` for claude/opencode/pi, derived generically from the adapter name's first letter (uppercased) rather than a hardcoded match, so a future fourth adapter needs no change here. A bare-shell workspace (no harness launched yet) renders a blank glyph instead of claiming one, and the slot fills in the instant a real harness's SessionStart-equivalent hook reports in. Styled in the same dim `theme.idle` color as the tree's other chrome (not a new `[theme]` field) so it doesn't compete with the status badge's own color, the row's one attention-grabbing signal.
 
 **Keybinding house style: nvim.** `j`/`k` within a list, `Ctrl-h`/`Ctrl-l` between panes. New bindings extend this vocabulary, never a parallel one or a prefix-key/chord model. Keys an agent's own TUI relies on (e.g. `Ctrl-j` = Claude Code's insert-newline) pass through to a focused pane untouched — `Ctrl-h` is the *only* key Overseer intercepts while focused (real Backspace still works: terminals send `DEL`, not `^H`).
 

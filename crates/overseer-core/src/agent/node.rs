@@ -24,6 +24,7 @@ pub struct AgentNode {
     pub adapter: String,
     pub cwd: PathBuf,
     pub context_pct: Option<u8>,
+    pub model_name: Option<String>,
     pub attention: Option<Attention>,
     pub children: Vec<AgentNode>,
     pub expanded: bool,

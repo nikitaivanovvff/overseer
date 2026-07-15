@@ -58,6 +58,10 @@ pub enum Request {
         /// existing value untouched — most status pushes don't carry one.
         #[serde(default)]
         context_pct: Option<u8>,
+        /// Authoritative model identifier reported by the harness. `None`
+        /// preserves the last known value.
+        #[serde(default)]
+        model_name: Option<String>,
         #[serde(default)]
         clear_context: bool,
         #[serde(default)]
@@ -203,6 +207,7 @@ pub enum AttachEvent {
         status: AgentStatus,
         message: Option<String>,
         context_pct: Option<u8>,
+        model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
     },
@@ -296,8 +301,8 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
         match event {
             RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
             RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, attention, adapter } => {
-                AttachEvent::StatusChanged { agent_id, status, message, context_pct, attention, adapter }
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter } => {
+                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter }
             }
             RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
@@ -316,6 +321,7 @@ pub struct AgentDto {
     pub branch: String,
     pub cwd: std::path::PathBuf,
     pub context_pct: Option<u8>,
+    pub model_name: Option<String>,
     pub attention: Option<Attention>,
     pub capabilities: Box<AdapterCapabilities>,
     /// How long `status` has held its current value, in whole seconds,
@@ -339,6 +345,7 @@ impl AgentDto {
             branch: node.branch.clone(),
             cwd: node.cwd.clone(),
             context_pct: node.context_pct,
+            model_name: node.model_name.clone(),
             attention: node.attention.clone(),
             capabilities: Box::new(crate::agent::adapters::capabilities_for(&node.adapter)),
             status_secs: node.status_since.elapsed().as_secs(),
@@ -428,6 +435,7 @@ mod tests {
             status: AgentStatus::Done,
             message: None,
             context_pct: Some(42),
+            model_name: Some("anthropic/claude-sonnet-5".to_string()),
             clear_context: false,
             attention: None,
             adapter: None,
@@ -436,7 +444,8 @@ mod tests {
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(
-            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), .. })
+            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), model_name: Some(model), .. }
+                if model == "anthropic/claude-sonnet-5")
         );
     }
 
