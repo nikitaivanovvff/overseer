@@ -380,11 +380,25 @@ fn tree_row(node: &FlatNode, selected: bool, dimmed: bool, tick: u64, theme: &Th
         width.saturating_sub(left_fixed),
     );
     let secondary = Line::from(vec![
-        Span::raw(" ".repeat(left_fixed)),
+        Span::styled(continuation_prefix(&node.prefix), Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
         Span::styled(metadata, Style::default().fg(term_pane::map_dto_color(theme.idle))),
     ]);
 
     vec![primary, secondary]
+}
+
+/// Pure. Converts a first-line tree connector into the continuation shown beneath
+/// it. Ancestor segments already encode their own continuation state, so only
+/// this node's final connector segment changes.
+fn continuation_prefix(prefix: &str) -> String {
+    if let Some(rest) = prefix.strip_suffix("├ ") {
+        format!("{rest}│ ")
+    } else if let Some(rest) = prefix.strip_suffix("└ ") {
+        format!("{rest}  ")
+    } else {
+        prefix.to_string()
+    }
 }
 
 /// Pure. Composes the secondary tree line from the branch and the best known
@@ -815,6 +829,29 @@ mod tests {
     }
 
     #[test]
+    fn continuation_prefix_preserves_ancestor_connectors() {
+        assert_eq!(continuation_prefix(""), "");
+        assert_eq!(continuation_prefix("├ "), "│ ");
+        assert_eq!(continuation_prefix("└ "), "  ");
+        assert_eq!(continuation_prefix("│ └ "), "│   ");
+    }
+
+    #[test]
+    fn tree_row_secondary_line_continues_to_the_next_sibling() {
+        let mut root = node("workspace", vec![]);
+        root.children.push(node("first-child", vec![]));
+        root.children.push(node("second-child", vec![]));
+        let mut tree = AgentTree::new();
+        tree.add_root(root);
+
+        let flat = tree.flatten();
+        assert_eq!(flat[1].prefix, "├ ");
+        let lines = tree_row(&flat[1], false, false, 0, &Theme::default(), 40);
+        let secondary: String = lines[1].spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(secondary.starts_with("│   "), "expected a continuing guide, got: {secondary}");
+    }
+
+    #[test]
     fn tree_row_shell_workspace_omits_harness_metadata() {
         let theme = Theme::default();
         let node = flat_node_with_adapter("overseer", AgentStatus::Idle, "shell", "");
@@ -828,8 +865,10 @@ mod tests {
         let theme = Theme::default();
         for width in 0..8 {
             for adapter in ["claude", "opencode", "pi", "shell", ""] {
-                let node = flat_node_with_adapter("some-task", AgentStatus::Blocked, adapter, "  └ ");
-                let _ = tree_row(&node, false, false, 0, &theme, width);
+                for prefix in ["", "├ ", "└ ", "│ └ "] {
+                    let node = flat_node_with_adapter("some-task", AgentStatus::Blocked, adapter, prefix);
+                    let _ = tree_row(&node, false, false, 0, &theme, width);
+                }
             }
         }
     }
