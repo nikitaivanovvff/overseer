@@ -41,7 +41,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
-| **Harness** | adapter, agent type | The AI CLI an agent runs (claude, opencode, pi) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
+| **Harness** | adapter, agent type | The AI CLI an agent runs (claude or opencode) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
 | **Jump in** | focus the pane | Moving keyboard focus into the agent pane (`Ctrl-l`/`Enter`/`o`/click); every key but `Ctrl-h` then forwards to the agent. | `tui::jump_in`, `Focus::Pane` |
 | **Daemon** | — | The background process owning the registry and every PTY; the TUI is a detachable client of it. | `crates/overseer-core/src/daemon.rs` |
 
@@ -172,10 +172,10 @@ Injected env vars per session (the *only* thing Overseer injects at launch):
 - `OVERSEER_TASK` — the child's assignment for CLI-spawned children; absent for a workspace or TUI-created child waiting for a manual first prompt.
 
 Role behavior lives in **user-level content installed by `overseer install`** (a skill, a plain instructions file — whatever the harness itself loads), matched to `$OVERSEER_ROLE`:
-- Workspaces: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]`. Cross-harness spawning is supported — a claude workspace may spawn an opencode or pi child and vice versa.
+- Workspaces: may spawn children via `overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode]`. Cross-harness spawning is supported — a claude workspace may spawn an opencode child and vice versa.
 - Child agents: depth-2 children may delegate real sub-tasks via `overseer spawn`; depth-3 leaves work inline. All children set up their own branch/worktree and report completion explicitly (`overseer status done`) — never inferred. Child skills prohibit invisible built-in subagents because delegation belongs in the observable tree, with only a short, single-shot read-only lookup carve-out.
 
-Three harnesses, three status-wiring mechanisms — each verified against the installed binary, not just its docs:
+Two harnesses, two status-wiring mechanisms — each verified against the installed binary, not just its docs:
 
 **Claude Code** — user-level `~/.claude/settings.json` hooks (shared across sessions, no-op outside Overseer, all passing `--from-hook`, which reads the Claude-specific hook-payload JSON from stdin):
 
@@ -197,17 +197,6 @@ Three harnesses, three status-wiring mechanisms — each verified against the in
 | `permission.asked` / `permission.v2.asked` (generic event bus) | `blocked` + `attention=permission` | Live-probed on OpenCode 1.17.20 for root and child sessions. The typed top-level `permission.ask` hook exists in the installed declarations but did not fire. Overseer never writes a permission decision. |
 | `permission.replied` / `permission.v2.replied` | `running`, clears permission attention | Both approval and denial resolve the attention condition. |
 | `session.error` with structured `APIError` | preserves active lifecycle + provider attention | HTTP 429 maps to `rate_limit`, 402 to `billing`, other structured API failures to `provider_error`; `Retry-After` is forwarded when supplied. Experimental until a real provider-limit response is live-probed. |
-
-**pi** — an extension loaded via `pi --extension <absolute-path>` at spawn time (bypasses pi's own package manager/`settings.json` entirely, so install/uninstall is just "write/delete one file"). Role instructions are selected **per role** at spawn time via `--append-system-prompt <path>`, so only the correct doc is ever loaded:
-
-| pi event | Pushes | Why |
-|------|--------|-----|
-| `session_start` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | Mirrors Claude's `SessionStart`: a workspace is waiting on the human to prompt it; a child's task is already its initial prompt, so it's working the instant it launches. |
-| `agent_start` | `running` | A turn begins. |
-| `agent_end` | `idle` + harness-computed context usage | `ctx.getContextUsage()` was live-probed on pi 0.80.2 and supplies both the active model window and percentage for machine-readable output. |
-| `session_shutdown` | *(nothing)* | The exit watcher owns `error`. |
-
-**pi never pushes `blocked`** — no permission-request event exists in its `ExtensionEvent` union (permission gates are opt-in extensions in pi, not part of the base install). Its typed `after_provider_response` event also did not fire in a live 0.80.2 request, so provider limits are explicitly unsupported rather than inferred.
 
 Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
 
@@ -372,10 +361,6 @@ extra_args = ["--dangerously-skip-permissions"]
 
 [adapters.opencode]
 command = "opencode"
-extra_args = []
-
-[adapters.pi]
-command = "pi"
 extra_args = []
 
 [notify]

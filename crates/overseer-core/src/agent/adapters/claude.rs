@@ -59,7 +59,7 @@ impl ClaudeAdapter {
         // The printed message carries the single most-violated rule inline,
         // per role, rather than just pointing at the skill file — this fires
         // exactly once, at the very start of the session, and unlike
-        // opencode/pi (whose instructions load into the system prompt on
+        // opencode (whose instructions load into the system prompt on
         // every turn) a Claude skill is only re-consulted if the agent
         // chooses to invoke it again, which a real user reported it failing
         // to do mid-conversation. Baking the rule into the transcript itself
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn root_skill_blesses_cross_harness_spawn() {
-        assert!(ROOT_SKILL_CONTENT.contains("--adapter claude|opencode|pi"));
+        assert!(ROOT_SKILL_CONTENT.contains("--adapter claude|opencode"));
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn settings_session_start_message_carries_the_hard_rule_inline_per_role() {
-        // Unlike opencode/pi, whose role instructions load into the system
+        // Unlike opencode, whose role instructions load into the system
         // prompt on every turn, a Claude skill is only re-consulted if the
         // agent re-invokes it -- a real user reported it failing to do so
         // mid-conversation. So the one-shot SessionStart message itself

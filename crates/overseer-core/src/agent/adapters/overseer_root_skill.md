@@ -15,7 +15,7 @@ if you already read it once at the start of this session.**
 
 **Do not use your own built-in subagent/Task/parallel-tool-use feature for
 this.** (Whatever your harness calls it — Claude's `Task`/`Agent` tool,
-opencode's/pi's own subagent tooling — the rule is the same.) A subagent
+opencode's own subagent tooling — the rule is the same.) A subagent
 launched that way is invisible to Overseer entirely — no tree row, no status
 tracking, no separate branch/worktree, nothing the user watching the TUI can
 see or check on. Delegating means running the real CLI command below, every
@@ -23,7 +23,7 @@ time, even though your own built-in tool might feel like the faster/simpler
 choice for a given request:
 
 ```
-overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]
+overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode]
 ```
 
 Worked example — delegating a bug fix to a claude child:
@@ -38,11 +38,8 @@ Report overseer status done when finished." \
 ```
 
 Children don't have to run your own harness — pick `--adapter` per task if
-`opencode`/`pi` are installed too (e.g. hand a task to whichever one is
-better suited, or just to spread load). A pi child never reports `blocked`
-(pi has no built-in permission-prompt concept) — if one looks stuck at
-`idle`, that's your cue to check in, not a sign it's waiting on a prompt
-you'd otherwise see.
+`opencode` is installed too (e.g. hand a task to whichever harness is better
+suited, or just to spread load).
 
 `--name` and `--task` serve two different audiences, so keep their lengths
 different too:

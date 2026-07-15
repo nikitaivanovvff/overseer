@@ -129,7 +129,7 @@ impl AgentAdapter for OpencodeAdapter {
     fn is_installed(&self) -> bool {
         // `spawn_command` doesn't reference this path directly (opencode
         // auto-discovers plugin/*.js on its own), so a missing file doesn't
-        // crash the launch the way pi's does -- but it does mean the session
+        // crash the launch -- but it does mean the session
         // never reports a single status, sitting at `spawning` forever,
         // which reads exactly as "did this even work?" too.
         self.user_config_dir().is_some_and(|dir| dir.join(PLUGIN_PATH).exists())
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn root_instructions_bless_cross_harness_spawn() {
-        assert!(ROOT_INSTRUCTIONS_CONTENT.contains("--adapter claude|opencode|pi"));
+        assert!(ROOT_INSTRUCTIONS_CONTENT.contains("--adapter claude|opencode"));
     }
 
     #[test]

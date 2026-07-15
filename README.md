@@ -46,11 +46,11 @@ A Cargo workspace of two crates: `overseer-core` (library — agent model, sessi
 
 ## Getting started
 
-Overseer currently supports three harnesses: **Claude Code**, **opencode**, and **pi**. Install support for whichever you use, once, at the user level:
+Overseer currently supports two harnesses: **Claude Code** and **opencode**. Install support for whichever you use, once, at the user level. If you installed pi support with an older Overseer release, run that release's `overseer uninstall pi` before upgrading to remove its user-level files.
 
 ```sh
 cargo build --release
-./target/release/overseer install claude   # or opencode / pi
+./target/release/overseer install claude   # or opencode
 ```
 
 Then run `overseer`. It spawns a background daemon on first launch, and `n` opens a workspace picker — pick a repo and it drops you into a bare shell there. Run your own agent inside it; Overseer picks up its status automatically via the hooks `install` just wired in.

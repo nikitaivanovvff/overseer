@@ -64,7 +64,7 @@ pub struct FlatNode {
     pub prefix: String,
     /// When `status` last actually changed — see `AgentNode::status_since`.
     pub status_since: std::time::Instant,
-    /// The harness this agent runs (claude, opencode, pi, or `shell` for a
+    /// The harness this agent runs (claude, opencode, or `shell` for a
     /// bare-shell root) — see `AgentNode::adapter`. Carried through so the
     /// render layer (e.g. the spawning-placeholder in `ui::term_pane`) can
     /// name it without a second lookup back into the tree.

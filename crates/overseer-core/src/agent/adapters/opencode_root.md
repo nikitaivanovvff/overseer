@@ -14,7 +14,7 @@ command below, every time, even though your own built-in tool might feel
 like the faster/simpler choice for a given request:
 
 ```
-overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode|pi]
+overseer spawn --name "<short-kebab-name>" --task "<full, self-contained task description>" [--adapter claude|opencode]
 ```
 
 Worked example — delegating a bug fix to a claude child:
@@ -31,8 +31,6 @@ Children don't have to run your own harness — pick per task if others are inst
 - `overseer agent <id>` — full detail on one agent.
 
 A child stuck `blocked` or idle for a while needs your attention. There is no automatic supervision loop — checking on children periodically is your job as the root.
-
-**Caveat:** pi has no built-in permission-prompt concept, so a pi-run agent (root or child) never reports `blocked` — only `spawning → running → idle`/`done`/`error`. If a pi child looks stuck at `idle`, that's the signal to check on it; it isn't waiting on a permission you'd otherwise see.
 
 ## Reviewing a child's work
 

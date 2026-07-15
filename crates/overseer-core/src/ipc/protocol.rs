@@ -67,7 +67,7 @@ pub enum Request {
         /// own SessionStart-equivalent install hook passes this, once, so a
         /// bare-shell root (`overseer start` never launches an adapter, so
         /// it's always registered as "shell") stops looking like "shell" the
-        /// moment the user actually runs claude/opencode/pi inside it.
+        /// moment the user actually runs claude/opencode inside it.
         #[serde(default)]
         adapter: Option<String>,
         /// Wall-clock time this push was captured at, client-side, as early

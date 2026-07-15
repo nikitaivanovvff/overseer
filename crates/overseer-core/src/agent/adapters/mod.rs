@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 pub mod claude;
 pub mod opencode;
-pub mod pi;
 
 /// Identity passed to an adapter at launch time.
 /// No filesystem/worktree paths — Overseer does not own a workspace.
@@ -154,11 +153,9 @@ pub trait AgentAdapter: Send + Sync {
     /// this is deliberately kept out of `install_files`'s otherwise-pure
     /// contract. Default `true`: most harnesses launch fine even without
     /// Overseer's install content, they just won't report status. Override
-    /// when a missing file makes the launch command *itself* fail outright
-    /// (verified live, HARNESSES.md: `pi --extension <missing path>` hard-
-    /// errors and exits before the process ever starts responding) — without
-    /// this check, a spawn against an uninstalled adapter registers a child
-    /// that immediately crashes, sitting at `spawning` until the exit
+    /// when a missing file makes the launch command *itself* fail outright.
+    /// Without this check, a spawn against an uninstalled adapter registers
+    /// a child that immediately crashes, sitting at `spawning` until the exit
     /// watcher's next sweep (up to 5s) catches it, which reads as "did this
     /// even work?" rather than a clear, immediate error.
     fn is_installed(&self) -> bool {
@@ -185,7 +182,6 @@ pub fn adapter_for(name: &str) -> Option<Box<dyn AgentAdapter>> {
     match name {
         "claude" => Some(Box::new(claude::ClaudeAdapter::new())),
         "opencode" => Some(Box::new(opencode::OpencodeAdapter::new())),
-        "pi" => Some(Box::new(pi::PiAdapter::new())),
         _ => None,
     }
 }
@@ -248,5 +244,10 @@ mod tests {
         let env = identity_env(&ctx.identity());
         assert_eq!(env.get("OVERSEER_AGENT_ID"), Some(&ctx.agent_id.0.to_string()));
         assert_eq!(env.get("OVERSEER_REPO").map(String::as_str), Some("myrepo"));
+    }
+
+    #[test]
+    fn pi_is_not_a_supported_adapter() {
+        assert!(adapter_for("pi").is_none());
     }
 }

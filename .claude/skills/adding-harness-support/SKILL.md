@@ -1,14 +1,14 @@
 ---
 name: adding-harness-support
-description: Recipe for adding a new AI coding harness adapter to Overseer (e.g. a third harness beyond claude/opencode/pi). Use when asked to integrate a new agent CLI/TUI as an Overseer adapter.
+description: Recipe for adding a new AI coding harness adapter to Overseer beyond claude/opencode. Use when asked to integrate a new agent CLI/TUI as an Overseer adapter.
 ---
 
 Overseer launches an agent harness in a PTY and needs it to report its own
 status back (`spawning → running/idle/blocked → done/error`) without polling.
 "Supporting a harness" means writing one `AgentAdapter` implementation plus
-its install-time content files. `src/agent/adapters/claude.rs`, `opencode.rs`,
-and `pi.rs` are the three reference implementations — read whichever is
-closest in shape to the new harness before writing anything.
+its install-time content files. `src/agent/adapters/claude.rs` and
+`opencode.rs` are the reference implementations — read whichever is closest
+in shape to the new harness before writing anything.
 
 ## The five deliverables
 
@@ -33,7 +33,7 @@ Every adapter must deliver all five, all already abstracted by the
    terminal you're reading this in.
 4. **Role instructions** (`install_files`, install-time) — root/child
    behavior docs the harness will actually load. Content: spawn/monitor/drop
-   for roots (bless cross-harness spawning: `--adapter claude|opencode|pi|...`
+   for roots (bless cross-harness spawning: `--adapter claude|opencode|...`
    — an agent doesn't have to run its own harness for its children), worktree
    isolation + explicit `overseer status done --message …` for children
    (**never** inferred from the harness going quiet or the session ending).
@@ -56,11 +56,9 @@ Status vocabulary every harness must map onto (semantics fixed in AGENTS.md
 | `done` | explicitly declared complete | the agent's own `overseer status done`, never inferred |
 | `error` | process exited unexpectedly | the exit watcher (session manager), never a hook push |
 
-**If the harness has no permission-prompt concept** (pi is the existing
-example — permission gates are themselves opt-in extensions there), do not
-fake `blocked` by guessing at some other event. Document the gap plainly in
-the harness's own root instructions doc instead (see `pi_root.md`'s caveat
-paragraph) so the root agent knows not to expect it.
+**If the harness has no permission-prompt concept**, do not fake `blocked` by
+guessing at some other event. Document the gap plainly in the harness's own
+root instructions doc so the root agent knows not to expect it.
 
 ## Files to touch
 
@@ -92,18 +90,17 @@ source of truth. Concretely, for a fresh harness integration:
 1. **Launch invocation**: confirm the exact flag/positional-arg form that
    takes an initial prompt *and stays in interactive TUI mode* — many
    harnesses have both an interactive default and a separate one-shot/print
-   mode (`opencode run` vs. the default `opencode` command; `pi --print`/`-p`
-   vs. a bare positional message). Picking the wrong one silently turns every
-   spawned agent into a fire-and-forget script instead of a steerable session.
+   mode (`opencode run` vs. the default `opencode` command). Picking the wrong
+   one silently turns every spawned agent into a fire-and-forget script instead
+   of a steerable session.
 2. **Plugin/extension loading**: write a minimal probe (log to a scratch
    file: "loaded", plus every event name as it fires) and confirm it actually
    loads, can read `process.env`, and can exec a subprocess — from the
    harness's own real config/extension directory or invocation flag, not a
    guess from documentation. If the harness supports loading a hook file by
-   direct path at invocation time (verified for pi's `--extension <path>`),
-   prefer that over registering into the harness's own settings file — it
-   keeps `overseer install`/`--uninstall` to "write/delete one file," no
-   settings-file mutation needed at all.
+   direct path at invocation time, prefer that over registering into the
+   harness's own settings file — it keeps `overseer install`/`--uninstall` to
+   "write/delete one file," no settings-file mutation needed at all.
 3. **Event names for the five moments**: session start, agent starts
    working, agent finishes responding, permission request (if any), session
    end. Get these from the harness's own installed type definitions/source if
@@ -143,7 +140,7 @@ source of truth. Concretely, for a fresh harness integration:
   being unset (a no-op), embeds the absolute Overseer binary path, maps every
   status-relevant event to the right push (and — importantly — a test
   asserting it does **not** fabricate an event/status the harness doesn't
-  actually support, e.g. `pi::tests::extension_never_pushes_blocked`).
+   actually support).
 - `spawn_command`: uses `ctx.command`/`extra_args` correctly; appends the
   task via whichever mechanism was verified in Task 2 above (positional arg
   vs. a named flag) when non-empty; appends nothing extra for an empty task

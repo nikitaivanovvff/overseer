@@ -27,8 +27,7 @@ src/
 │   │   ├── mod       AgentAdapter trait (capabilities, install_files, spawn_command, env_inject) +
 │   │   │             identity_env(); the *.md files are the installed skills/instructions
 │   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
-│   │   ├── opencode  opencode adapter (auto-loaded plugin.js + instructions array)
-│   │   └── pi        pi adapter (--extension at spawn + authoritative context, no blocked support)
+│   │   └── opencode  opencode adapter (auto-loaded plugin.js + instructions array)
 │   ├── spawn         Orchestrates session launch + env injection + register — the one shared
 │   │                 path under Start and Spawn (spawn_root_shell vs spawn_child_agent)
 │   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it

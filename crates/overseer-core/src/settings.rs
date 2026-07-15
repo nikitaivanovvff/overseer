@@ -46,8 +46,8 @@ fn invokes_overseer_status_subcommand(cmd: &str) -> bool {
 /// True if `entry` is an Overseer-authored hook entry: either tagged with
 /// `_overseer: true` (current convention), or — for installs that predate
 /// that tag — carrying a legacy command signature every generation of our
-/// hook text has contained. Only opencode/pi are exempt from the legacy
-/// check since they never emitted JSON hook entries like this.
+/// hook text has contained. OpenCode is exempt from the legacy
+/// check since it never emitted JSON hook entries like this.
 fn is_overseer_entry(entry: &Value) -> bool {
     if entry.get("_overseer").and_then(|v| v.as_bool()) == Some(true) {
         return true;
