@@ -37,7 +37,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 |------|-------------|------------|-------------|
 | **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
-| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, attention, and unsupported/experimental harness capabilities. | `ui::render_agent_detail` |
+| **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and attention. Harness capabilities (lifecycle/permissions/limits/context) are computed but not rendered here — see `AdapterCapabilities` below. | `ui::render_agent_detail` |
 | **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
@@ -149,7 +149,7 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`AdapterCapabilities` declares `lifecycle`, `permission_requests`, `provider_limits`, and `context_usage` as `CapabilitySupport::Supported`, `Unsupported { reason }`, or `Experimental { note }`. This is a pure contract for what this Overseer version's installed integration can observe, not a dynamic plugin-health check. Unsupported is an expected, machine-readable result, never an adapter error.
+`AdapterCapabilities` declares `lifecycle`, `permission_requests`, `provider_limits`, and `context_usage` as `CapabilitySupport::Supported`, `Unsupported { reason }`, or `Experimental { note }`. This is a pure contract for what this Overseer version's installed integration can observe, not a dynamic plugin-health check. Unsupported is an expected, machine-readable result, never an adapter error. It's an internal/CLI-facing model — `overseer list`/`agent` JSON surfaces it (see "Agent Awareness" below), but the TUI's Details pane does not render it (removed 2026-07-15, alongside `context_pct`, rather than showing a per-field matrix most rows would render as all-unsupported before a harness is detected).
 
 `InstalledFile` is a `(path, content, merge_strategy)` triple, one of three `MergeStrategy` variants:
 - `Overwrite` — Overseer owns the file outright (a skill, a plugin/extension script).
@@ -218,7 +218,7 @@ A `blocked` (or, if configured, `idle`) agent reaches you two ways beyond the tr
 
 Both are driven by one pure diff (`notify::status_transitions`) comparing each frame's tree against the last — identical for `--mock` and daemon-attached. Config in `[notify]` (see Config below). Out of scope: a supervision loop that auto-re-prompts an idle child — this surfaces, a human (or the workspace reading `overseer list`) decides.
 
-Normalized attention also renders independently of lifecycle: `$` for rate/quota/billing and `!` for permission, with `$` taking deterministic precedence over a simultaneously blocked lifecycle. Details show reason, bounded message, retry delay, age, and unsupported/experimental capabilities. The `?` popup explicitly warns that no badge may mean unsupported/unknown rather than healthy.
+Normalized attention also renders independently of lifecycle: `$` for rate/quota/billing and `!` for permission, with `$` taking deterministic precedence over a simultaneously blocked lifecycle. Details show reason, bounded message, retry delay, and age. The `?` popup explicitly warns that no badge may mean unsupported/unknown rather than healthy.
 
 ### Workspace
 

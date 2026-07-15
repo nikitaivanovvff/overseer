@@ -12,7 +12,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use std::collections::HashSet;
 
-use overseer_core::agent::adapters::{capabilities_for, CapabilitySupport};
 use overseer_core::agent::{AgentId, AgentNode, AgentRole, AgentStatus, AgentTree, Attention, AttentionKind, FlatNode};
 use crate::app::{InputState, PendingAction};
 use overseer_core::config::{Action, Keybindings, Theme};
@@ -122,16 +121,16 @@ pub fn render(
         ])
         .split(outer[0]);
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(17)])
-        .split(columns[0]);
-
     let flat = tree.flatten();
     // The detail pane / live grid always track the *real* cursor — a live
     // search filter only affects what the tree list shows, nothing moves
     // for real until Enter (PHASE5B.md).
     let selected = flat.get(tree.cursor).cloned();
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(detail_pane_height(&selected, theme))])
+        .split(columns[0]);
 
     // While `/` is open, render only rows that match the query (plus every
     // ancestor of a match, dimmed, for context) instead of the full tree.
@@ -475,88 +474,87 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
     }
 }
 
+/// Pure — the Details pane's content lines for a selected agent. Shared by
+/// `render_agent_detail` and `detail_pane_height` so the reserved layout
+/// space always matches exactly what gets drawn (never a stale guess that
+/// leaves dead space, never one that clips a line).
+fn detail_lines(node: &FlatNode, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            // A root's name is the repo it was spawned in, not a task
+            // description (Part A: roots are a bare shell, no task text) —
+            // a child's name is the task it was actually spawned with.
+            Span::styled(
+                if node.role == AgentRole::Root { "name:   " } else { "task:   " },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(node.name.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(node.status.label(), status_style(&node.status, theme)),
+        ]),
+        Line::from(vec![
+            Span::styled("since:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format_age(node.status_since.elapsed()), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("repo:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(node.repo.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if node.branch.is_empty() { "—".to_string() } else { node.branch.clone() },
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("id:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(node.id.short(), Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    if let Some(attention) = &node.attention {
+        let age = attention.observed_at.elapsed().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled("attention: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ({})", attention.kind.label(), format_age(age)),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if let Some(message) = &attention.message {
+            lines.push(Line::from(vec![
+                Span::styled("message: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate_with_ellipsis(message, 80)),
+            ]));
+        }
+        if let Some(retry_at) = attention.retry_at {
+            let retry = retry_at.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("retry:  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(if retry.is_zero() { "now".to_string() } else { format!("in {}", format_age(retry)) }),
+            ]));
+        }
+    }
+    lines
+}
+
+/// Pure — how tall the Details pane needs to be (content rows + 2 for the
+/// border) for the currently selected agent. Computed fresh each frame from
+/// `detail_lines`, not a hardcoded constant, so the pane shrinks/grows with
+/// what it's actually showing instead of reserving worst-case dead space.
+fn detail_pane_height(selected: &Option<FlatNode>, theme: &Theme) -> u16 {
+    let content_rows = match selected {
+        Some(node) => detail_lines(node, theme).len(),
+        None => 1,
+    };
+    content_rows as u16 + 2
+}
+
 fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode>, theme: &Theme) {
     let content = match selected {
-        Some(node) => {
-            let mut lines = vec![
-            Line::from(vec![
-                // A root's name is the repo it was spawned in, not a task
-                // description (Part A: roots are a bare shell, no task text) —
-                // a child's name is the task it was actually spawned with.
-                Span::styled(
-                    if node.role == AgentRole::Root { "name:   " } else { "task:   " },
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(node.name.clone()),
-            ]),
-            Line::from(vec![
-                Span::styled("status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.status.label(), status_style(&node.status, theme)),
-            ]),
-            Line::from(vec![
-                Span::styled("since:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format_age(node.status_since.elapsed()), Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("repo:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.repo.clone(), Style::default().fg(Color::Cyan)),
-            ]),
-            Line::from(vec![
-                Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    if node.branch.is_empty() { "—".to_string() } else { node.branch.clone() },
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("id:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(node.id.short(), Style::default().fg(Color::DarkGray)),
-            ]),
-            ];
-            if let Some(attention) = &node.attention {
-                let age = attention.observed_at.elapsed().unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled("attention: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{} ({})", attention.kind.label(), format_age(age)),
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                if let Some(message) = &attention.message {
-                    lines.push(Line::from(vec![
-                        Span::styled("message: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(truncate_with_ellipsis(message, 80)),
-                    ]));
-                }
-                if let Some(retry_at) = attention.retry_at {
-                    let retry = retry_at.duration_since(std::time::SystemTime::now()).unwrap_or_default();
-                    lines.push(Line::from(vec![
-                        Span::styled("retry:  ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(if retry.is_zero() { "now".to_string() } else { format!("in {}", format_age(retry)) }),
-                    ]));
-                }
-            }
-            let capabilities = capabilities_for(&node.adapter);
-            for (label, support) in [
-                ("lifecycle", capabilities.lifecycle),
-                ("permissions", capabilities.permission_requests),
-                ("limits", capabilities.provider_limits),
-                ("context", capabilities.context_usage),
-            ] {
-                match support {
-                    CapabilitySupport::Unsupported { reason } => lines.push(Line::from(vec![
-                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!("unsupported ({reason})")),
-                    ])),
-                    CapabilitySupport::Experimental { note } => lines.push(Line::from(vec![
-                        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!("experimental ({note})")),
-                    ])),
-                    CapabilitySupport::Supported => {}
-                }
-            }
-            lines
-        }
+        Some(node) => detail_lines(node, theme),
         None => vec![Line::from(Span::styled(
             "  no agent selected",
             Style::default().fg(Color::DarkGray),
@@ -1438,5 +1436,43 @@ mod tests {
             content.contains("branch: —"),
             "expected a dash placeholder for an empty branch, got: {content}"
         );
+    }
+
+    #[test]
+    fn detail_pane_height_tracks_content_not_a_worst_case_constant() {
+        let theme = Theme::default();
+        let base = FlatNode {
+            id: AgentId::new(),
+            name: "scratch".to_string(),
+            status: AgentStatus::Idle,
+            role: AgentRole::Root,
+            repo: "scratch".to_string(),
+            branch: "main".to_string(),
+            context_pct: None,
+            model_name: None,
+            attention: None,
+            has_children: false,
+            prefix: String::new(),
+            status_since: std::time::Instant::now(),
+            adapter: "claude".to_string(),
+        };
+
+        // 6 fixed fields (name/status/since/repo/branch/id) + 2 border rows,
+        // no attention block — this used to always reserve 17 rows
+        // regardless of content, leaving a large dead gap under a short row.
+        assert_eq!(detail_pane_height(&Some(base.clone()), &theme), 8);
+
+        // No agent selected: one placeholder line + border.
+        assert_eq!(detail_pane_height(&None, &theme), 3);
+
+        // A full attention block (kind + message + retry) adds exactly 3 rows.
+        let mut with_attention = base;
+        with_attention.attention = Some(Attention {
+            kind: AttentionKind::Permission,
+            message: Some("needs approval".to_string()),
+            retry_at: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(30)),
+            observed_at: std::time::SystemTime::now(),
+        });
+        assert_eq!(detail_pane_height(&Some(with_attention), &theme), 11);
     }
 }
