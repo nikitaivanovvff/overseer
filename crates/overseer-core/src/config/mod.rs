@@ -126,7 +126,6 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
         "opencode".to_string(),
         AdapterConfig { command: "opencode".to_string(), extra_args: vec![] },
     );
-    adapters.insert("pi".to_string(), AdapterConfig { command: "pi".to_string(), extra_args: vec![] });
     adapters
 }
 
@@ -195,6 +194,7 @@ mod tests {
         let claude = cfg.adapters.get("claude").expect("default config must have claude");
         assert_eq!(claude.command, "claude");
         assert!(claude.extra_args.is_empty());
+        assert!(!cfg.adapters.contains_key("pi"));
     }
 
     #[test]

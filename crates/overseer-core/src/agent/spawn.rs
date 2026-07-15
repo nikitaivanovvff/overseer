@@ -440,13 +440,13 @@ mod tests {
 
     #[test]
     fn adapter_not_installed_error_message_points_at_the_install_command() {
-        // Not run through the real adapter lookup (whether "pi"/"opencode"
+        // Not run through the real adapter lookup (whether "opencode"
         // report is_installed() == true/false depends on this machine's own
-        // ~/.pi, ~/.config/opencode state -- non-deterministic across
+        // ~/.config/opencode state -- non-deterministic across
         // environments). Just pins the error message shape a caller
         // (a root agent's own tool output) would actually see.
-        let err = SpawnError::AdapterNotInstalled("pi".to_string());
-        assert_eq!(err.to_string(), "'pi' adapter is not installed -- run `overseer install pi` first");
+        let err = SpawnError::AdapterNotInstalled("opencode".to_string());
+        assert_eq!(err.to_string(), "'opencode' adapter is not installed -- run `overseer install opencode` first");
     }
 
     #[test]

@@ -170,7 +170,7 @@ impl AgentRegistry {
     /// `adapter` lets a session self-identify its actual harness — a root's
     /// adapter is always registered as the honest-but-uninformative "shell"
     /// (`overseer start` never launches one), so this is the only way a
-    /// bare-shell root running (say) pi ever stops looking like "shell" in
+    /// bare-shell root running (say) opencode ever stops looking like "shell" in
     /// the registry. Each adapter's own SessionStart-equivalent install hook
     /// passes this once, alongside its very first status push; a spawned
     /// child re-asserting its already-correct adapter here is harmless
@@ -533,12 +533,12 @@ mod tests {
         let result = reg.register(make_register_root("agent")).unwrap();
         reg.set_status(&result.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
-        reg.set_status(&result.id, AgentStatus::Idle, None, Some(77), Some("pi".to_string()), std::time::SystemTime::now()).unwrap();
+        reg.set_status(&result.id, AgentStatus::Idle, None, Some(77), Some("opencode".to_string()), std::time::SystemTime::now()).unwrap();
 
         let node = reg.get(&result.id).unwrap();
         assert_eq!(node.status, AgentStatus::Done, "status stays Done");
         assert_eq!(node.context_pct, Some(77), "context_pct still applies even when the status push is suppressed");
-        assert_eq!(node.adapter, "pi", "adapter still applies even when the status push is suppressed");
+        assert_eq!(node.adapter, "opencode", "adapter still applies even when the status push is suppressed");
     }
 
     #[test]
@@ -863,7 +863,7 @@ mod tests {
         let earlier = t0 - std::time::Duration::from_millis(500);
 
         reg.set_status(&result.id, AgentStatus::Running, None, Some(50), None, t0).unwrap();
-        reg.set_status(&result.id, AgentStatus::Blocked, None, Some(90), Some("pi".to_string()), earlier).unwrap();
+        reg.set_status(&result.id, AgentStatus::Blocked, None, Some(90), Some("opencode".to_string()), earlier).unwrap();
 
         let node = reg.get(&result.id).unwrap();
         assert_eq!(node.status, AgentStatus::Running);

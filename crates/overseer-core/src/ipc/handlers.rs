@@ -116,7 +116,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             };
             // Default to the spawning agent's *own* adapter, not a fixed
             // global default (AGENTS.md: cross-harness spawning is opt-in
-            // via an explicit --adapter, not the fallback) -- a pi/opencode
+            // via an explicit --adapter, not the fallback) -- an opencode
             // root's own children should run the same harness unless told
             // otherwise. `ctx.config.defaults.adapter` only still matters for
             // a bare-shell root (`parent.adapter == "shell"`, nothing real to

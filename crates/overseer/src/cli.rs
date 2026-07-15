@@ -35,7 +35,7 @@ pub enum Command {
         #[arg(long)]
         from_hook: bool,
         /// Self-identifies the calling session's actual harness (e.g.
-        /// "claude"/"opencode"/"pi") — only each adapter's own install hook
+        /// "claude"/"opencode") — only each adapter's own install hook
         /// passes this, once, at session start. Lets a bare-shell workspace
         /// stop looking like "shell" the moment a real harness actually runs
         /// inside it, which is what an omitted `--adapter` on a later
@@ -107,7 +107,7 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Adapter to use. Defaults to the spawning agent's own adapter when
-        /// omitted (a pi workspace's children run pi too, unless told
+        /// omitted (an opencode workspace's children run opencode too, unless told
         /// otherwise) — never a fixed "claude" default, which would silently
         /// launch the wrong harness for a non-claude workspace.
         #[arg(long)]
