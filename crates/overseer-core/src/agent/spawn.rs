@@ -147,6 +147,37 @@ fn resolve_adapter<'a>(
     Ok((adapter, adapter_config))
 }
 
+/// The CLI flag each adapter's harness accepts to auto-approve permissions,
+/// for `[defaults] im_not_afraid_of_agents` (README.md "Danger Zone"). `None`
+/// for an adapter we don't have a live-verified flag for — never guess one.
+fn auto_approve_flag(adapter_name: &str) -> Option<&'static str> {
+    match adapter_name {
+        "claude" => Some("--dangerously-skip-permissions"),
+        "opencode" => Some("--auto"),
+        _ => None,
+    }
+}
+
+/// Appends `adapter_name`'s auto-approve flag to `extra_args` when
+/// `im_not_afraid_of_agents` is enabled, unless it's already present. Toggle
+/// off (the default) or an adapter with no known flag leaves `extra_args`
+/// untouched.
+fn apply_auto_approve_flag(
+    adapter_name: &str,
+    mut extra_args: Vec<String>,
+    im_not_afraid_of_agents: bool,
+) -> Vec<String> {
+    if !im_not_afraid_of_agents {
+        return extra_args;
+    }
+    if let Some(flag) = auto_approve_flag(adapter_name) {
+        if !extra_args.iter().any(|a| a == flag) {
+            extra_args.push(flag.to_string());
+        }
+    }
+    extra_args
+}
+
 /// Child path — adapter-driven, registers `Running` since it auto-launches
 /// immediately. `command`/`extra_args` come from the resolved config entry for
 /// `req.adapter_name`, not the adapter name itself — a user can point "claude" at
@@ -191,7 +222,11 @@ fn spawn_child_agent(
         cwd: req.cwd,
         repo: req.repo,
         command: adapter_config.command.clone(),
-        extra_args: adapter_config.extra_args.clone(),
+        extra_args: apply_auto_approve_flag(
+            &req.adapter_name,
+            adapter_config.extra_args.clone(),
+            config.defaults.im_not_afraid_of_agents,
+        ),
         task: req.task,
         depth,
     };
@@ -511,6 +546,81 @@ mod tests {
         )
         .unwrap();
         assert!(registry.get(&child.id).is_some());
+    }
+
+    #[test]
+    fn apply_auto_approve_flag_toggle_off_returns_extra_args_unchanged() {
+        let result = apply_auto_approve_flag("claude", vec!["--foo".to_string()], false);
+        assert_eq!(result, vec!["--foo".to_string()]);
+    }
+
+    #[test]
+    fn apply_auto_approve_flag_appends_claude_flag_when_enabled() {
+        let result = apply_auto_approve_flag("claude", vec![], true);
+        assert_eq!(result, vec!["--dangerously-skip-permissions".to_string()]);
+    }
+
+    #[test]
+    fn apply_auto_approve_flag_appends_opencode_flag_when_enabled() {
+        let result = apply_auto_approve_flag("opencode", vec![], true);
+        assert_eq!(result, vec!["--auto".to_string()]);
+    }
+
+    #[test]
+    fn apply_auto_approve_flag_does_not_duplicate_an_already_present_flag() {
+        let result = apply_auto_approve_flag(
+            "claude",
+            vec!["--dangerously-skip-permissions".to_string()],
+            true,
+        );
+        assert_eq!(result, vec!["--dangerously-skip-permissions".to_string()]);
+    }
+
+    #[test]
+    fn apply_auto_approve_flag_unknown_adapter_returns_extra_args_unchanged() {
+        let result = apply_auto_approve_flag("aider", vec!["--foo".to_string()], true);
+        assert_eq!(result, vec!["--foo".to_string()]);
+    }
+
+    #[test]
+    fn spawn_agent_child_extra_args_include_auto_approve_flag_when_toggle_is_on() {
+        let (registry, sessions) = make_registry_and_sessions();
+        let mut config = Config::default();
+        config.defaults.im_not_afraid_of_agents = true;
+
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Root, None),
+        )
+        .unwrap();
+
+        // Same limitation as spawn_agent_child_uses_configured_command_and_extra_args
+        // above: spawn_child_agent's launch goes through a dry-run SessionManager,
+        // so the built LaunchContext/Command isn't directly observable here. This
+        // proves the resolution path succeeds with the toggle on, then asserts the
+        // exact value apply_auto_approve_flag computes for this config -- the same
+        // call spawn_child_agent makes to build LaunchContext.extra_args at its one
+        // production call site.
+        let child = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            base_request(AgentRole::Child, Some(root.id)),
+        )
+        .unwrap();
+        assert!(registry.get(&child.id).is_some());
+
+        let adapter_config = config.adapters.get("claude").unwrap();
+        let resolved_extra_args = apply_auto_approve_flag(
+            "claude",
+            adapter_config.extra_args.clone(),
+            config.defaults.im_not_afraid_of_agents,
+        );
+        assert_eq!(resolved_extra_args, vec!["--dangerously-skip-permissions".to_string()]);
     }
 
     #[test]

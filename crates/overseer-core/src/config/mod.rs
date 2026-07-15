@@ -65,6 +65,12 @@ pub struct Defaults {
     pub adapter: String,
     #[serde(default = "default_max_children")]
     pub max_children: usize,
+    /// Opt-in blanket toggle: every spawned child runs with its harness's own
+    /// auto-approve-permissions flag appended (README.md "Danger Zone").
+    /// Default false — Overseer's no-bypass-by-default posture for children
+    /// is intentional and must stay the default.
+    #[serde(default)]
+    pub im_not_afraid_of_agents: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,7 +137,11 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
 
 impl Default for Defaults {
     fn default() -> Self {
-        Self { adapter: default_adapter_name(), max_children: default_max_children() }
+        Self {
+            adapter: default_adapter_name(),
+            max_children: default_max_children(),
+            im_not_afraid_of_agents: false,
+        }
     }
 }
 
@@ -255,6 +265,26 @@ mod tests {
         let claude = cfg.adapters.get("claude").unwrap();
         assert_eq!(claude.command, "/opt/claude-wrapper");
         assert_eq!(claude.extra_args, vec!["--foo".to_string()]);
+    }
+
+    // ── [defaults] im_not_afraid_of_agents ────────────────────────────────────
+
+    #[test]
+    fn im_not_afraid_of_agents_defaults_false() {
+        let cfg = Config::default();
+        assert!(!cfg.defaults.im_not_afraid_of_agents);
+    }
+
+    #[test]
+    fn im_not_afraid_of_agents_parses_true() {
+        let cfg: Config = toml::from_str("[defaults]\nim_not_afraid_of_agents = true\n").unwrap();
+        assert!(cfg.defaults.im_not_afraid_of_agents);
+    }
+
+    #[test]
+    fn im_not_afraid_of_agents_stays_false_when_omitted() {
+        let cfg: Config = toml::from_str("[defaults]\nadapter = \"claude\"\n").unwrap();
+        assert!(!cfg.defaults.im_not_afraid_of_agents);
     }
 
     // ── [notify] (ATTENTION.md) ───────────────────────────────────────────────

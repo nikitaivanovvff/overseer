@@ -358,6 +358,7 @@ flips it from Spawning to Running moments later.
 [defaults]
 adapter = "claude"
 max_children = 8
+im_not_afraid_of_agents = false   # opt-in: auto-approve permissions for every spawned child — see README.md's Danger Zone
 
 [adapters.claude]
 command = "claude"
