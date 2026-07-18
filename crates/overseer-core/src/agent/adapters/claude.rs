@@ -13,8 +13,8 @@ const SETTINGS_PATH: &str = "settings.json";
 /// at content that no longer matches the (now role-specific) hook behavior.
 const LEGACY_SKILL_DIR: &str = "skills/overseer";
 
-const ROOT_SKILL_CONTENT: &str = include_str!("overseer_root_skill.md");
-const CHILD_SKILL_CONTENT: &str = include_str!("overseer_child_skill.md");
+const ROOT_SKILL_CONTENT: &str = include_str!("claude/overseer_root_skill.md");
+const CHILD_SKILL_CONTENT: &str = include_str!("claude/overseer_child_skill.md");
 
 pub struct ClaudeAdapter {
     overseer_bin: PathBuf,

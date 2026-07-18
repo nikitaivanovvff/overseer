@@ -10,8 +10,8 @@ const CHILD_INSTRUCTIONS_PATH: &str = "overseer-child.md";
 const CONFIG_PATH: &str = "opencode.jsonc";
 const INSTRUCTIONS_KEY: &str = "instructions";
 
-const ROOT_INSTRUCTIONS_CONTENT: &str = include_str!("opencode_root.md");
-const CHILD_INSTRUCTIONS_CONTENT: &str = include_str!("opencode_child.md");
+const ROOT_INSTRUCTIONS_CONTENT: &str = include_str!("opencode/opencode_root.md");
+const CHILD_INSTRUCTIONS_CONTENT: &str = include_str!("opencode/opencode_child.md");
 
 pub struct OpencodeAdapter {
     overseer_bin: PathBuf,
