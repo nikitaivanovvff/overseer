@@ -57,13 +57,61 @@ Then run `overseer`. It spawns a background daemon on first launch, and `n` open
 
 No prebuilt binaries or Homebrew tap yet — cross-compiled release CI exists (`.github/workflows/release.yml`) but no version has been tagged. Building from source is the only path today.
 
+## Configuration
+
+Everything below is optional. Overseer runs on built-in defaults if `~/.config/overseer/config.toml` doesn't exist, and a missing or invalid *value* for one field just warns on stderr and keeps that field's own default rather than failing to start. `[defaults]`/`[adapters.*]` are read once by the daemon (or `--mock`) at startup; `[notify]`/`[keybindings]`/`[theme]` are read independently by the TUI process, since they're properties of *your* terminal, not the daemon's.
+
+```toml
+# ~/.config/overseer/config.toml
+
+[defaults]
+adapter = "claude"                # harness a new workspace assumes, and what a spawned child inherits when --adapter is omitted
+max_children = 8                  # cap on direct children per parent (workspace or child) -- keeps the tree readable and bounds PTY/token cost
+im_not_afraid_of_agents = false   # opt-in: auto-approve every spawned child's permission prompts -- see "Danger Zone" below. Off by default; leave it off unless you mean it.
+
+[adapters.claude]
+command = "claude"                # binary to launch -- point this at a wrapper or a non-$PATH build if you need to
+extra_args = []                   # flags appended before the task text, e.g. ["--dangerously-skip-permissions"] to bypass prompts for every claude child (see Danger Zone)
+
+[adapters.opencode]
+command = "opencode"
+extra_args = []                   # e.g. ["--auto"] to auto-approve anything opencode wouldn't otherwise explicitly deny
+
+[notify]
+bell = true      # terminal BEL (\a) on any agent's ->blocked transition -- on by default, harmless if your terminal doesn't ring it
+mode = "off"     # desktop notifications: "off" (default), "blocked" (fires on ->blocked), or "blocked+idle" (also fires on ->idle)
+
+[keybindings]      # tree-focus-only bindings; every entry below is optional and independently remappable
+spawn_root = "n"   # open the "new workspace" prompt
+spawn_child = "s"  # spawn a child under the selected agent
+search = "/"       # fuzzy-search the tree by name
+help = "?"         # open the live keybinding reference popup
+# every other tree-focus action (j/k nav, <space> fold, d/D drop, Q shutdown, ...)
+# is remappable the same way -- see AGENTS.md's keybinding table for the full list.
+# Ctrl-h (leave a focused pane) and the scrollback keys (Ctrl-u/d/y/e, G) are
+# fixed and deliberately not listed here -- remapping them could steal a key
+# an agent's own TUI needs.
+
+[theme]                 # status + chrome colors only -- named ratatui colors ("green") or hex ("#rrggbb")
+running = "green"
+blocked = "red"
+idle = "dark_gray"
+done = "blue"
+error = "red"
+spawning = "cyan"
+border_focused = "yellow"
+border = "dark_gray"
+```
+
+See `AGENTS.md`'s Config section for the full rules behind these (e.g. how `[adapters.*]` entries not in your file still keep their built-in defaults, and how key-binding collisions are resolved).
+
 ## Danger Zone
 
 By design, Overseer does not bypass permission prompts for spawned children. A child asks for permission exactly like a human running the same harness would — that's the default, and it stays the default.
 
-If you want a child to run unattended without those prompts, that's your call and your risk to take, and there are two ways to make it:
+If you want a child to run unattended without those prompts, that's your call and your risk to take, and there are two ways to make it, both shown in the config example above:
 
-- **Per adapter**, already documented in `AGENTS.md`'s Config section: set `[adapters.<name>] extra_args` in `~/.config/overseer/config.toml` to whatever flags your harness accepts, e.g. `extra_args = ["--dangerously-skip-permissions"]` for Claude Code.
+- **Per adapter**: set `[adapters.<name>] extra_args` to whatever flags your harness accepts, e.g. `extra_args = ["--dangerously-skip-permissions"]` for Claude Code.
 - **Blanket, for every configured adapter**: set `[defaults] im_not_afraid_of_agents = true`. Overseer appends the equivalent auto-approve flag to every adapter that has one (`--dangerously-skip-permissions` for Claude Code, `--auto` for opencode) without you having to hand-list it per adapter.
 
 Either way, the consequence is the same: an agent running this way can take any action its harness allows — edit files, run shell commands, whatever the tool permits — without asking, unattended. Both flags are labeled dangerous by their own tools: Claude Code's is literally named `--dangerously-skip-permissions`, and opencode's own docs describe `--auto` as auto-approving permissions that aren't explicitly denied "(dangerous!)". Turn this on only if you mean it.

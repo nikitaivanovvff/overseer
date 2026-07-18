@@ -126,7 +126,7 @@ Workspace-drop is `Request::TuiDrop`, distinct from `Request::Drop`, sent only b
 
 ### Security
 
-Every agent under one daemon fully trusts every other agent. `agent_id` is a plain, caller-supplied field on every IPC request — never checked against the identity of the connection sending it, because the protocol has no notion of connection identity (no `SO_PEERCRED` check, no per-agent auth handshake). Any agent holding `OVERSEER_SOCKET` can `Write` into any other agent's PTY (including the workspace's own shell — real cross-agent code execution, not a UI nuisance), forge any agent's `Status`, `Drop` any non-workspace agent, or `Shutdown` the whole daemon. `overseer prompt` is a documented, scriptable path to that same `Write` capability (attach + two writes under the hood) — not a new one; the underlying wire protocol already let any agent write into any other agent's PTY before this command existed. This is a deliberate, accepted trade-off, not an oversight (see `docs/specs/SECURITY-AUDIT.md` F4) — the isolation Overseer provides is organizational (a tree you can see and `drop`), not a sandbox between siblings. **Do not run mutually-distrusting agents under one daemon.**
+Every agent under one daemon fully trusts every other agent. `agent_id` is a plain, caller-supplied field on every IPC request — never checked against the identity of the connection sending it, because the protocol has no notion of connection identity (no `SO_PEERCRED` check, no per-agent auth handshake). Any agent holding `OVERSEER_SOCKET` can `Write` into any other agent's PTY (including the workspace's own shell — real cross-agent code execution, not a UI nuisance), forge any agent's `Status`, `Drop` any non-workspace agent, or `Shutdown` the whole daemon. `overseer prompt` is a documented, scriptable path to that same `Write` capability (attach + two writes under the hood) — not a new one; the underlying wire protocol already let any agent write into any other agent's PTY before this command existed. This is a deliberate, accepted trade-off, not an oversight — the isolation Overseer provides is organizational (a tree you can see and `drop`), not a sandbox between siblings. **Do not run mutually-distrusting agents under one daemon.**
 
 Cross-user isolation relies on the socket directory being owner-only (`0700`, validated rather than blindly chmod'd — a pre-existing dir at the predictable `/tmp/overseer-$UID` fallback path is checked for real-directory/ownership/mode before being trusted) and the socket node itself being `0600`.
 
@@ -362,7 +362,7 @@ im_not_afraid_of_agents = false   # opt-in: auto-approve permissions for every s
 
 [adapters.claude]
 command = "claude"
-extra_args = ["--dangerously-skip-permissions"]
+extra_args = []
 
 [adapters.opencode]
 command = "opencode"
@@ -390,7 +390,7 @@ border_focused = "yellow"
 border = "dark_gray"
 ```
 
-A child spawn resolves `command`/`extra_args` from `config.adapters[name]`, not the adapter name itself — lets flags like `--dangerously-skip-permissions` reach the process, and lets a user point "claude" at a custom binary. A name with no entry in `config.adapters` is the same `UnknownAdapter` error as one with no `AgentAdapter` impl (e.g. `aider`, a config-shape example only — see "Agent Adapter Trait").
+A child spawn resolves `command`/`extra_args` from `config.adapters[name]`, not the adapter name itself — lets a user opt a harness into a bypass flag like `--dangerously-skip-permissions` (see `im_not_afraid_of_agents` above and README's Danger Zone), and lets a user point "claude" at a custom binary. A name with no entry in `config.adapters` is the same `UnknownAdapter` error as one with no `AgentAdapter` impl (e.g. `aider`, a config-shape example only — see "Agent Adapter Trait").
 
 `[notify]`: every channel independently switchable off. `bell` defaults **on**; `mode` defaults **off** (the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`.
 
