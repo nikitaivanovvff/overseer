@@ -280,7 +280,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | Key (default) | Action |
 |-----|--------|
 | `j` / `k` | Navigate agent tree (tree focus only) |
-| Left-click the tree | Focus the tree, selecting the row clicked (if any) — works while a pane is focused too; clicks are Overseer UI actions and never forward to agents |
+| Left-click the tree | Select the clicked row and jump into its pane if the agent is alive; a dead agent falls back to tree focus. The click itself remains an Overseer UI action and is never forwarded to the agent |
 | Left-click the pane | Jump in, same as `Enter`/`o` (alive check + scroll reset included); a click on an *already-focused* pane is a no-op so it never resets a wheel-scrolled position |
 | `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |

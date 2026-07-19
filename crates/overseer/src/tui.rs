@@ -369,26 +369,40 @@ fn handle_tree_key(app: &mut App, key: KeyEvent, pane_height: u16, keybindings: 
     true
 }
 
-/// Left-click is click-to-focus, window-manager style: a click in the tree
-/// half focuses the tree (selecting the row it landed on, if any), a click on
-/// the pane jumps in — mirroring `Enter`/`o` via `jump_in`, so the alive
-/// check and scroll reset live in one place. Works from *either* focus state:
-/// intercepting a click while a pane is focused steals nothing from the
-/// agent's TUI because Overseer forwards wheel reports, not UI clicks. A click on an already-focused pane
-/// is a no-op rather than a re-`jump_in`, so it never resets a wheel-scrolled
-/// position back to the live bottom. Clicks while any modal is open (search
-/// input, spawn input, drop/shutdown confirm, help popup) stay no-ops,
-/// mirroring how keyboard tree nav is unreachable in those states.
+/// Left-click is click-to-focus, window-manager style: clicking a tree row
+/// selects it and jumps into its pane, while clicking the pane jumps into the
+/// already-selected agent. Both paths mirror `Enter`/`o` via `jump_in`, so the
+/// alive check and scroll reset live in one place. A tree click establishes
+/// `Focus::Tree` before that attempt, ensuring a dead target cannot inherit
+/// pane focus from another agent. Re-clicking an already-focused live row or
+/// pane is a no-op rather than a re-`jump_in`, so it never resets a
+/// wheel-scrolled position back to the live bottom. Clicks while any modal is
+/// open (search input, spawn input, drop/shutdown confirm, help popup) stay
+/// no-ops, mirroring how keyboard tree nav is unreachable in those states.
 fn handle_left_click(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
     if app.input.is_some() || app.confirm.is_some() || app.show_help {
         return;
     }
     let pos = Position::new(mouse.column, mouse.row);
     if layout.tree_rect.contains(pos) {
-        if let Some(id) = ui::hit_test_tree(layout.tree_rect, &layout.tree_rows, mouse.column, mouse.row) {
+        if let Some(id) =
+            ui::hit_test_tree(layout.tree_rect, &layout.tree_rows, mouse.column, mouse.row)
+        {
+            let already_focused = app.focus == Focus::Pane
+                && app
+                    .with_tree(|t| t.selected())
+                    .is_some_and(|selected| selected.id == id)
+                && app.is_alive(&id);
             app.with_tree_mut(|t| t.select_by_id(&id));
+            app.focus = Focus::Tree;
+            if already_focused {
+                app.focus = Focus::Pane;
+            } else {
+                jump_in(app);
+            }
+        } else {
+            app.focus = Focus::Tree;
         }
-        app.focus = Focus::Tree;
     } else if layout.pane_rect.contains(pos) && app.focus != Focus::Pane {
         jump_in(app);
     }
@@ -1373,14 +1387,18 @@ mod tests {
     }
 
     #[test]
-    fn left_click_on_a_tree_row_selects_it_without_jumping_in() {
+    fn left_click_on_a_tree_row_selects_it_and_jumps_in() {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
 
         // Second row ("id_b") sits at screen row 2.
         handle_left_click(&mut app, &layout, mouse_down(5, 2));
 
         assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), Some(id_b.clone()));
-        assert_eq!(app.focus, Focus::Tree, "a tree click focuses the tree, it doesn't jump in");
+        assert_eq!(
+            app.focus,
+            Focus::Pane,
+            "a tree-row click must jump into the selected live agent"
+        );
 
         ctx.sessions.kill(&id_a);
         ctx.sessions.kill(&id_b);
@@ -1439,13 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn tree_click_while_pane_is_focused_returns_focus_to_the_tree_and_selects() {
+    fn tree_click_while_pane_is_focused_selects_and_jumps_into_the_new_agent() {
         let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
         app.focus = Focus::Pane; // as if the user had already jumped in
 
-        // Click-to-focus works from a focused pane too: UI clicks never forward
-        // to the agent, so intercepting this
-        // steals nothing — unlike keys, which stay passthrough-only.
+        // UI clicks never forward to the old agent, so this can switch the
+        // interactive pane directly while keys remain passthrough-only.
         handle_left_click(&mut app, &layout, mouse_down(5, 2));
 
         assert_eq!(
@@ -1453,10 +1470,76 @@ mod tests {
             Some(id_b.clone()),
             "a tree click while jumped in must select the clicked row"
         );
-        assert_eq!(app.focus, Focus::Tree, "…and hand focus back to the tree");
+        assert_eq!(
+            app.focus,
+            Focus::Pane,
+            "and jump directly into the new live agent"
+        );
 
         ctx.sessions.kill(&id_a);
         ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn tree_click_on_a_dead_agent_while_another_pane_is_focused_falls_back_to_the_tree() {
+        let live_id = AgentId::new();
+        let dead_id = AgentId::new();
+        let sessions =
+            SessionManager::dry_run_with_live_sessions([live_id.clone()].into_iter().collect());
+        let (mut app, ctx) = app_with_sessions(sessions);
+        register_agent(&ctx, Some(live_id.clone()));
+        register_agent(&ctx, Some(dead_id.clone()));
+        app.with_tree_mut(|t| t.cursor = 0);
+        app.focus = Focus::Pane;
+        let layout = ui::RenderLayout {
+            pane_rect: Rect { x: 30, y: 0, width: 50, height: 10 },
+            tree_rect: Rect { x: 0, y: 0, width: 30, height: 10 },
+            tree_rows: vec![live_id.clone(), dead_id.clone()],
+        };
+
+        handle_left_click(&mut app, &layout, mouse_down(5, 2));
+
+        assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), Some(dead_id));
+        assert_eq!(
+            app.focus,
+            Focus::Tree,
+            "a dead target must not inherit pane focus"
+        );
+        assert!(
+            app.status_message.is_some(),
+            "the failed jump must explain that the agent is dead"
+        );
+
+        ctx.sessions.kill(&live_id);
+    }
+
+    #[test]
+    fn click_on_the_already_focused_tree_row_does_not_reset_scroll() {
+        let id = AgentId::new();
+        let (mut app, ctx) = app_with_real_session_scrolled_to(&id);
+        jump_in(&mut app);
+        assert_eq!(app.focus, Focus::Pane);
+
+        let pane_rect = Rect { x: 30, y: 0, width: 50, height: 10 };
+        let layout = ui::RenderLayout {
+            pane_rect,
+            tree_rect: Rect { x: 0, y: 0, width: 30, height: 10 },
+            tree_rows: vec![id.clone()],
+        };
+        wheel(&mut app, mouse(MouseEventKind::ScrollUp, 45, 5), pane_rect, Some(&id));
+        let scrolled = ctx.sessions.display_offset(&id);
+        assert!(scrolled > 0, "wheel must have scrolled into history first");
+
+        handle_left_click(&mut app, &layout, mouse_down(5, 1));
+
+        assert_eq!(app.focus, Focus::Pane);
+        assert_eq!(
+            ctx.sessions.display_offset(&id),
+            scrolled,
+            "click must not reset the scroll"
+        );
+
+        ctx.sessions.kill(&id);
     }
 
     /// The `app.focus != Focus::Pane` guard: re-clicking an already-focused
