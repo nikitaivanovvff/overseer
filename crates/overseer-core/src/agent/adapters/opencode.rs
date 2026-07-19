@@ -47,6 +47,13 @@ impl OpencodeAdapter {
     /// No `--from-hook`: that flag drives Claude-transcript-specific
     /// classification (`agent::hook`) that doesn't apply here — the plugin's
     /// events are already precise, so pushes go straight to `overseer status`.
+    ///
+    /// No explicit `--branch` either: `execFile` without an `options.cwd`
+    /// inherits `process.cwd()` from the opencode process itself, so the
+    /// `overseer` binary this spawns sees the same cwd opencode does —
+    /// `cli::detect_current_branch`'s `git rev-parse --abbrev-ref HEAD`
+    /// (run unconditionally, not gated on `--from-hook`) self-reports the
+    /// real branch for every push with zero JS-side git shelling needed.
     fn plugin_content(&self) -> String {
         let bin = serde_json::to_string(&self.overseer_bin.to_string_lossy().to_string())
             .unwrap_or_else(|_| "\"overseer\"".to_string());
@@ -317,6 +324,16 @@ mod tests {
         assert!(content.contains("input.model.providerID"));
         assert!(content.contains("input.model.modelID"));
         assert!(content.contains(r#""--model-name""#));
+    }
+
+    #[test]
+    fn plugin_never_passes_an_explicit_branch() {
+        // Every push relies on the shared `overseer` CLI's own cwd-based
+        // auto-detection (`cli::detect_current_branch`) instead — `execFile`
+        // with no `options.cwd` inherits opencode's own process cwd, so the
+        // plugin needs no JS-side git shelling.
+        let content = make_adapter().plugin_content();
+        assert!(!content.contains("--branch"));
     }
 
     #[test]

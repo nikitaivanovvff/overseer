@@ -436,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn settings_hook_commands_never_pass_an_explicit_branch() {
+        // `--from-hook` alone is enough: `cli::detect_current_branch` runs a
+        // `git rev-parse --abbrev-ref HEAD` in the hook subprocess's own
+        // cwd unconditionally (verified live to match Claude Code's own
+        // tracked session cwd), so no hook command needs its own git
+        // shelling or an explicit `--branch`.
+        let a = make_adapter();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification", "SessionStart"] {
+            let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(!cmd.contains("--branch"), "{event} hook must not pass --branch, got: {cmd}");
+        }
+    }
+
+    #[test]
     fn settings_entries_are_marked_overseer_managed() {
         let a = make_adapter();
         let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();

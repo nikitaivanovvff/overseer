@@ -201,6 +201,8 @@ Every Claude `--from-hook` push also reads the newest real assistant turn's `mes
 | `session.error` with structured `APIError` | preserves active lifecycle + provider attention | HTTP 429 maps to `rate_limit`, 402 to `billing`, other structured API failures to `provider_error`; `Retry-After` is forwarded when supplied. Experimental until a real provider-limit response is live-probed. |
 | typed `chat.message` hook | `running` + model | Reports the hook's authoritative `providerID/modelID`; absent model data leaves the last known model untouched. |
 
+**Branch is self-reported the same way for both harnesses, uniformly, not per-adapter.** Every `overseer status` push — hook-invoked or not — auto-detects the pushing process's own current git branch via `git rev-parse --abbrev-ref HEAD` run in its own cwd (`cli::detect_current_branch`, the agent-process-side mirror of the daemon's read-only `GitClient::current_branch`), unless the caller passes an explicit `--branch`. This lives once in the shared `overseer` CLI binary rather than per-adapter: Claude's hook subprocess and opencode's `execFile`'d plugin subprocess both inherit their harness's own tracked cwd (verified live for Claude — the hook JSON's `cwd` field and the hook subprocess's OS-level cwd are identical), so neither adapter needs its own git-shelling code. Detection failure (not a git repo, no commits yet, `git` missing) preserves the last known branch rather than blanking it out, same "preserve last known value" posture as `model_name` above. This is why a **child's** registered branch starts empty (`—` in the TUI, same convention as a non-git workspace) rather than a synthesized `overseer/<id>` placeholder — its real branch only appears once its own hook/plugin fires from inside the worktree it sets up (per the child skill's convention, `ovsr/<slug>`). A **workspace's** branch, read once from git at `overseer start` time, gets the same live top-up for free the moment a real harness starts reporting inside it.
+
 Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
 
 Attention is separate from lifecycle: `permission`, `rate_limit`, `quota_limit`, `billing`, or `provider_error`, with optional bounded message/retry time and an observed timestamp. `overseer list`/`agent` include both attention and the selected adapter's capability matrix. Claude and OpenCode context usage are unsupported because their lifecycle integrations do not expose an authoritative active window size; Claude's correct 1M-aware percentage exists only in the user's single-owner `statusLine` command, which Overseer does not replace. Context percentage is not rendered in the TUI.
@@ -335,7 +337,7 @@ IPC server (spawn_blocking):
                            adapter.env_inject(ctx))
       spawn_command: <command> <extra_args...> "write tests"   // task is the final positional arg
       env_inject:    ...identity vars..., OVERSEER_TASK="write tests"
-  → replies: {"agent_id": "..."}
+  → replies: {"agent_id": "...", "branch": ""}   // empty -- self-reported later, never synthesized
 
 TUI re-renders with the new child visible under the parent, labeled "write-tests"
 in the tree — short and recognizable even though the task text (the child's
@@ -343,7 +345,9 @@ actual initial prompt) can run to a full paragraph. It starts working
 immediately instead of sitting at a bare prompt. The child sets up its own
 branch/worktree on startup (`git worktree add ../<repo>-<slug> -b ovsr/<slug>`,
 per the overseer-child skill's worked example), and its own SessionStart hook
-flips it from Spawning to Running moments later.
+flips it from Spawning to Running moments later — the same push that, per
+"Agent Awareness" above, self-reports the real branch for the tree row to
+pick up in place of the initial empty placeholder.
 ```
 
 `overseer start` (launch a workspace) is a *different* path — always no task and no adapter: it registers `role=root`, `status=idle`, names the node after the repo, and launches a bare shell (`$SHELL`) instead of `adapter.spawn_command(ctx)`. Whatever you run inside that shell (e.g. `claude`) inherits the injected identity env vars from the PTY itself and reports its own status via the same push hooks — Overseer never detects or launches it. The cwd doesn't have to be a git repo — git failure just falls back to the directory's own basename as the name and an empty branch, rather than rejecting the workspace outright; only a nonexistent/non-directory cwd is rejected.
