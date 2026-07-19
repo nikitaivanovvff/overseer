@@ -120,7 +120,9 @@ mod tests {
         let root_id = start_root(&socket);
         let (child_id, child_branch) = spawn_child(&socket, &root_id, "auth-module");
 
-        assert!(child_branch.starts_with("overseer/"), "child branch should be overseer/<id>");
+        // Self-reported later by the child's own hook/plugin, never
+        // synthesized at registration (see `Request::Status.branch`).
+        assert_eq!(child_branch, "", "a freshly spawned child should start with an empty branch");
 
         let list_resp = send(&socket, Request::List);
         assert!(list_resp.ok);
@@ -170,6 +172,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set child status failed");
@@ -185,6 +188,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set root status failed");
@@ -229,6 +233,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
@@ -249,6 +254,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
@@ -303,7 +309,9 @@ mod tests {
         assert_eq!(dto.adapter, "claude");
         assert_eq!(dto.repo, "test-repo"); // inherited from the parent root (GitClient::dry_run)
         assert_eq!(dto.branch, child_branch);
-        assert!(dto.branch.starts_with("overseer/"));
+        // Self-reported later by the child's own hook/plugin, never
+        // synthesized at registration (see `Request::Status.branch`).
+        assert_eq!(dto.branch, "");
         assert_eq!(dto.status, AgentStatus::Spawning);
 
         let _ = std::fs::remove_file(&socket);
@@ -367,6 +375,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(!resp.ok);
@@ -500,6 +509,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         });
         match next_event(&mut reader) {
@@ -544,7 +554,8 @@ mod tests {
                 clear_context: false,
                 attention: None,
                 adapter: None,
-            pushed_at: std::time::SystemTime::now(),
+                branch: None,
+                pushed_at: std::time::SystemTime::now(),
             });
         }
 

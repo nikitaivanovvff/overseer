@@ -43,6 +43,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             model_name,
             attention,
             adapter,
+            branch,
             pushed_at,
         } => {
             let attention = attention.map(|update| match update {
@@ -59,6 +60,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 context_pct,
                 clear_context,
                 model_name,
+                branch,
                 attention,
                 adapter,
                 pushed_at,
@@ -313,6 +315,7 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, req);
@@ -333,12 +336,73 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: None,
             pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, status_req);
         assert!(resp.ok);
         assert!(resp.data.is_none());
         assert_eq!(ctx.registry.get(&agent_id).unwrap().context_pct, Some(17));
+    }
+
+    // ── branch self-report ────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_status_with_branch_updates_a_childs_empty_placeholder() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let child_id = registered_id(spawn_child(&ctx, root_id, "task"));
+        assert_eq!(ctx.registry.get(&child_id).unwrap().branch, "");
+
+        let resp = dispatch(&ctx, Request::Status {
+            agent_id: child_id.clone(),
+            status: AgentStatus::Running,
+            message: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            attention: None,
+            adapter: None,
+            branch: Some("ovsr/auth-module".to_string()),
+            pushed_at: std::time::SystemTime::now(),
+        });
+        assert!(resp.ok);
+        assert_eq!(ctx.registry.get(&child_id).unwrap().branch, "ovsr/auth-module");
+    }
+
+    #[test]
+    fn dispatch_status_without_branch_preserves_the_last_self_reported_value() {
+        let ctx = make_ctx();
+        let root_id = start_root(&ctx);
+        let child_id = registered_id(spawn_child(&ctx, root_id, "task"));
+
+        dispatch(&ctx, Request::Status {
+            agent_id: child_id.clone(),
+            status: AgentStatus::Running,
+            message: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            attention: None,
+            adapter: None,
+            branch: Some("ovsr/auth-module".to_string()),
+            pushed_at: std::time::SystemTime::now(),
+        });
+        // A later push with no branch (e.g. detection failed for that one
+        // hook fire) must not blank out the last known value.
+        dispatch(&ctx, Request::Status {
+            agent_id: child_id.clone(),
+            status: AgentStatus::Idle,
+            message: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            attention: None,
+            adapter: None,
+            branch: None,
+            pushed_at: std::time::SystemTime::now(),
+        });
+        assert_eq!(ctx.registry.get(&child_id).unwrap().branch, "ovsr/auth-module");
     }
 
     #[test]
@@ -511,8 +575,9 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
         });
         assert!(resp.ok, "Spawn failed: {:?}", resp.error);
-        assert!(matches!(resp.data, Some(OkBody::Registered { branch, .. })
-            if branch.starts_with("overseer/")));
+        // Self-reported later by the child's own hook/plugin, never
+        // synthesized at registration (see `Request::Status.branch`).
+        assert!(matches!(resp.data, Some(OkBody::Registered { branch, .. }) if branch.is_empty()));
 
         let list_resp = dispatch(&ctx, Request::List);
         let agents = match list_resp.data {

@@ -447,7 +447,9 @@ mod tests {
             base_request(AgentRole::Child, Some(root.id)),
         )
         .unwrap();
-        assert!(child.branch.starts_with("overseer/"));
+        // Self-reported later by the child's own hook/plugin, never
+        // synthesized at registration (see `Request::Status.branch`).
+        assert_eq!(child.branch, "");
         assert_eq!(registry.snapshot().len(), 2);
     }
 

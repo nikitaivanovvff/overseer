@@ -60,6 +60,15 @@ pub enum Command {
         /// Remove a stale context value when this harness cannot report one.
         #[arg(long)]
         clear_context: bool,
+        /// Explicit branch override. Rarely needed — every push already
+        /// auto-detects the current branch via `git rev-parse --abbrev-ref
+        /// HEAD` run in this process's own cwd (see `detect_current_branch`),
+        /// the same self-report mechanism both the Claude Code hook and the
+        /// opencode plugin funnel through since both ultimately just invoke
+        /// this CLI. This flag exists for parity with `--model-name` and any
+        /// future caller that already knows its branch more cheaply.
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// List all agents.
     List,
@@ -252,6 +261,17 @@ fn read_hook_payload() -> Option<agent::hook::HookPayload> {
     agent::hook::parse_hook_payload(&raw)
 }
 
+/// Self-reports the given cwd's current git branch by running `git rev-parse
+/// --abbrev-ref HEAD` there — the agent-process-side mirror of the daemon's
+/// read-only `GitClient::current_branch` (`git.rs`), reused directly rather
+/// than reimplemented. `None` on any failure (not a git repo, `git` missing,
+/// zero-commit unborn-branch repos, detached-HEAD edge cases) — a `Status`
+/// push must never fail just because branch detection didn't pan out; the
+/// node simply keeps whatever branch it already had.
+fn detect_current_branch(cwd: &std::path::Path) -> Option<String> {
+    overseer_core::git::GitClient::new().current_branch(cwd).ok()
+}
+
 /// Returns `Ok(None)` for the Status command when `$OVERSEER_AGENT_ID` is unset,
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 ///
@@ -272,6 +292,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
             context_pct,
             mut model_name,
             clear_context,
+            mut branch,
         } => {
             let agent_id_str = match std::env::var("OVERSEER_AGENT_ID") {
                 Ok(s) => s,
@@ -292,6 +313,17 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                         .and_then(|path| std::fs::read_to_string(path).ok())
                         .and_then(|raw| agent::hook::latest_model_from_transcript(&raw));
                 }
+            }
+            // Self-reported, not `--from-hook`-gated: every `overseer status`
+            // invocation is itself the agent process (or a hook/plugin
+            // subprocess spawned with the same cwd — verified live for
+            // Claude Code, whose hook JSON `cwd` field and the hook
+            // subprocess's own OS cwd are identical), so a plain
+            // `git rev-parse --abbrev-ref HEAD` here is exactly as
+            // authoritative for opencode (which never sets --from-hook) as
+            // for Claude. An explicit `--branch` always wins.
+            if branch.is_none() {
+                branch = std::env::current_dir().ok().and_then(|cwd| detect_current_branch(&cwd));
             }
             let attention = match (attention, clear_attention) {
                 (Some(_), Some(_)) => return Err(anyhow::anyhow!("--attention and --clear-attention are mutually exclusive")),
@@ -316,6 +348,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 model_name,
                 attention,
                 adapter,
+                branch,
                 pushed_at,
             }))
         }
@@ -372,9 +405,60 @@ mod tests {
             context_pct: None,
             model_name: None,
             clear_context: false,
+            branch: None,
         };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_none(), "Status without OVERSEER_AGENT_ID should be a silent no-op");
+    }
+
+    // ── branch self-report ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_request_status_explicit_branch_wins_over_auto_detection() {
+        let id = AgentId::new();
+        let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
+        let cmd = Command::Status {
+            status: StatusArg::Running,
+            message: None,
+            from_hook: false,
+            adapter: None,
+            attention: None,
+            clear_attention: None,
+            retry_after: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            branch: Some("ovsr/explicit".to_string()),
+        };
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
+        assert!(matches!(req, Request::Status { branch: Some(b), .. } if b == "ovsr/explicit"));
+    }
+
+    #[test]
+    fn detect_current_branch_reads_the_real_branch_of_a_git_repo() {
+        let dir = std::env::temp_dir().join(format!("overseer-test-branch-detect-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        };
+        run(&["init", "-q", "-b", "ovsr/probe-branch", "."]);
+        run(&["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+
+        let branch = detect_current_branch(&dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(branch.as_deref(), Some("ovsr/probe-branch"));
+    }
+
+    #[test]
+    fn detect_current_branch_non_git_dir_returns_none() {
+        let dir = std::env::temp_dir().join(format!("overseer-test-branch-detect-non-git-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let branch = detect_current_branch(&dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(branch.is_none(), "a non-git directory must not report a fake branch");
     }
 
     #[test]
@@ -392,6 +476,7 @@ mod tests {
             context_pct: None,
             model_name: None,
             clear_context: false,
+            branch: None,
         };
         let result = build_request(cmd, std::time::SystemTime::now()).unwrap();
         assert!(result.is_some());
@@ -414,6 +499,7 @@ mod tests {
             context_pct: None,
             model_name: None,
             clear_context: false,
+            branch: None,
         };
         let request = build_request(cmd, pushed_at).unwrap().unwrap();
         match request {

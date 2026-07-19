@@ -30,6 +30,9 @@ pub enum RegistryEvent {
         model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
+        /// The node's current (merged) branch — same "definitive value, not
+        /// a delta" posture as `adapter`.
+        branch: String,
         /// See `AgentNode::session_alive`. Carried on every `StatusChanged`
         /// broadcast (not just ones from `mark_session_exited`) so a client
         /// applying this event as the definitive value (`app::apply_event`)
@@ -65,7 +68,11 @@ pub struct RegisterArgs {
     pub adapter: String,
     pub repo: String,
     pub cwd: PathBuf,
-    /// Explicit branch override. Defaults to "main" for root, "overseer/<id>" for child.
+    /// Explicit branch override. Defaults to "main" for root; a child always
+    /// starts empty (`—` in the TUI) regardless of this field — its real
+    /// branch is self-reported by its own hook/plugin the moment it fires
+    /// from inside the worktree it sets up (see `Request::Status.branch`),
+    /// never guessed or synthesized here.
     pub branch: Option<String>,
     /// Status the node starts in. Explicit at every call site — e.g. a bare-shell
     /// root starts `Idle` (nothing running yet), an adapter-launched child starts
@@ -141,7 +148,13 @@ impl AgentRegistry {
                 let parent_id = args.parent_id.ok_or(RegistryError::MissingParent)?;
 
                 let id = args.id.unwrap_or_default();
-                let branch = format!("overseer/{}", id.short());
+                // Empty (`—` in the TUI), not a synthesized `overseer/<id>`
+                // placeholder — a child's real branch is self-reported by
+                // its own hook/plugin once it fires from inside the
+                // worktree the child sets up itself (`Request::Status.branch`),
+                // same "explicit empty, never faked" convention as a non-git
+                // root (see `ipc::handlers::Request::Start`).
+                let branch = args.branch.unwrap_or_default();
                 let node = AgentNode {
                     id: id.clone(),
                     name: args.name,
@@ -250,12 +263,18 @@ impl AgentRegistry {
             context_pct,
             clear_context,
             None,
+            None,
             attention_update,
             adapter,
             pushed_at,
         )
     }
 
+    /// `branch` follows the exact same "preserve last known value" posture as
+    /// `model_name`: `None` (or all-whitespace) leaves the node's existing
+    /// value untouched, a non-empty value replaces it. Self-reported by the
+    /// pushing agent's own hook/plugin (`Request::Status.branch`) — the
+    /// registry never guesses or synthesizes one.
     #[allow(clippy::too_many_arguments)]
     pub fn set_status_update_with_model(
         &self,
@@ -265,6 +284,7 @@ impl AgentRegistry {
         context_pct: Option<u8>,
         clear_context: bool,
         model_name: Option<String>,
+        branch: Option<String>,
         attention_update: Option<AttentionUpdate>,
         adapter: Option<String>,
         pushed_at: std::time::SystemTime,
@@ -298,6 +318,9 @@ impl AgentRegistry {
                         if let Some(model_name) = model_name.filter(|name| !name.trim().is_empty()) {
                             node.model_name = Some(model_name);
                         }
+                        if let Some(branch) = branch.filter(|b| !b.trim().is_empty()) {
+                            node.branch = branch;
+                        }
                         match attention_update {
                             Some(AttentionUpdate::Set { attention }) => node.attention = Some(attention),
                             Some(AttentionUpdate::Clear { kind }) => {
@@ -324,6 +347,7 @@ impl AgentRegistry {
                             node.model_name.clone(),
                             node.attention.clone(),
                             node.adapter.clone(),
+                            node.branch.clone(),
                             node.session_alive,
                         ))
                     }
@@ -331,7 +355,8 @@ impl AgentRegistry {
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
-        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter, session_alive)) = applied
+        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter, new_branch, session_alive)) =
+            applied
         else {
             return Ok(());
         };
@@ -347,6 +372,7 @@ impl AgentRegistry {
             model_name: new_model_name,
             attention: new_attention,
             adapter: new_adapter,
+            branch: new_branch,
             session_alive,
         });
         Ok(())
@@ -384,12 +410,13 @@ impl AgentRegistry {
                         node.model_name.clone(),
                         node.attention.clone(),
                         node.adapter.clone(),
+                        node.branch.clone(),
                     ))
                 }
                 _ => None,
             }
         };
-        let Some((status, context_pct, model_name, attention, adapter)) = applied else {
+        let Some((status, context_pct, model_name, attention, adapter, branch)) = applied else {
             return;
         };
         let _ = self.events.send(RegistryEvent::StatusChanged {
@@ -400,6 +427,7 @@ impl AgentRegistry {
             model_name,
             attention,
             adapter,
+            branch,
             session_alive: false,
         });
     }
@@ -514,7 +542,10 @@ mod tests {
     }
 
     #[test]
-    fn register_child_returns_id_and_overseer_branch() {
+    fn register_child_starts_with_an_empty_branch_not_a_synthesized_one() {
+        // A child's real branch is self-reported later, via a `Request::Status`
+        // push from its own hook/plugin once it sets up its worktree — the
+        // registry must never fake one up front.
         let reg = AgentRegistry::new();
         let root = reg.register(make_register_root("root")).unwrap();
         let child_result = reg
@@ -530,7 +561,7 @@ mod tests {
                 initial_status: AgentStatus::Running,
             })
             .unwrap();
-        assert!(child_result.branch.starts_with("overseer/"));
+        assert_eq!(child_result.branch, "", "a freshly registered child must get an explicit empty branch, not a faked one");
     }
 
     #[test]
@@ -582,12 +613,116 @@ mod tests {
             Some("anthropic/claude-sonnet-5".to_string()),
             None,
             None,
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
         reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now())
             .unwrap();
         assert_eq!(reg.get(&result.id).unwrap().model_name.as_deref(), Some("anthropic/claude-sonnet-5"));
+    }
+
+    // ── branch self-report (mirrors model_name above) ─────────────────────────
+
+    #[test]
+    fn set_status_update_with_model_updates_branch() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            Some("ovsr/auth-module".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().branch, "ovsr/auth-module");
+    }
+
+    #[test]
+    fn branch_persists_across_lifecycle_only_pushes() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            Some("ovsr/auth-module".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        // A later push that doesn't carry a branch (e.g. a plain PostToolUse
+        // hook that failed to detect one) must not erase the last known value.
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now())
+            .unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().branch, "ovsr/auth-module");
+    }
+
+    #[test]
+    fn blank_branch_push_is_ignored() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            Some("ovsr/auth-module".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            Some("   ".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(reg.get(&result.id).unwrap().branch, "ovsr/auth-module", "an all-whitespace branch must not overwrite a known one");
+    }
+
+    #[test]
+    fn status_changed_broadcast_carries_the_current_branch() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("agent")).unwrap();
+        let mut rx = reg.subscribe();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            Some("ovsr/auth-module".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            RegistryEvent::StatusChanged { branch, .. } => assert_eq!(branch, "ovsr/auth-module"),
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
     }
 
     #[test]

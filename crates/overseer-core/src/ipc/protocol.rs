@@ -74,6 +74,18 @@ pub enum Request {
         /// moment the user actually runs claude/opencode inside it.
         #[serde(default)]
         adapter: Option<String>,
+        /// The pushing session's actual current git branch, self-reported —
+        /// never guessed or synthesized by the daemon. `None` leaves the
+        /// node's existing value untouched. Every `overseer status` push
+        /// auto-detects this from the CLI process's own cwd (`git rev-parse
+        /// --abbrev-ref HEAD`, mirroring `GitClient::current_branch` but run
+        /// from the agent process's side) unless the caller passes an
+        /// explicit `--branch` override, so a child's tree row goes from a
+        /// synthetic `overseer/<id>` placeholder to its real branch the
+        /// moment its own worktree setup causes the next hook fire's cwd to
+        /// reflect it.
+        #[serde(default)]
+        branch: Option<String>,
         /// Wall-clock time this push was captured at, client-side, as early
         /// as possible in the `overseer status` process's life (see
         /// `main.rs`) — not daemon-arrival time. Every hook fire is its own
@@ -210,6 +222,10 @@ pub enum AttachEvent {
         model_name: Option<String>,
         attention: Option<Attention>,
         adapter: String,
+        /// The node's current (merged) branch, same "definitive value, not a
+        /// delta" posture as `adapter` — a push that didn't self-report one
+        /// still broadcasts whatever the node already had.
+        branch: String,
         /// See `AgentNode::session_alive` — the definitive value, applied
         /// directly by `app::apply_event` same as every other field here.
         session_alive: bool,
@@ -304,8 +320,8 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
         match event {
             RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
             RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, session_alive } => {
-                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, session_alive }
+            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, branch, session_alive } => {
+                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, branch, session_alive }
             }
             RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
@@ -445,13 +461,14 @@ mod tests {
             clear_context: false,
             attention: None,
             adapter: None,
+            branch: Some("ovsr/auth".to_string()),
             pushed_at: std::time::SystemTime::now(),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(
-            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), model_name: Some(model), .. }
-                if model == "anthropic/claude-sonnet-5")
+            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), model_name: Some(model), branch: Some(branch), .. }
+                if model == "anthropic/claude-sonnet-5" && branch == "ovsr/auth")
         );
     }
 
@@ -462,6 +479,15 @@ mod tests {
         let raw = format!(r#"{{"cmd":"status","agent_id":"{}","status":"idle","message":null}}"#, id.0);
         let req: Request = serde_json::from_str(&raw).unwrap();
         assert!(matches!(req, Request::Status { context_pct: None, .. }));
+    }
+
+    #[test]
+    fn request_status_branch_defaults_to_none_when_absent() {
+        // Older callers (or a hand-written request) may omit branch entirely.
+        let id = AgentId::new();
+        let raw = format!(r#"{{"cmd":"status","agent_id":"{}","status":"idle","message":null}}"#, id.0);
+        let req: Request = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(req, Request::Status { branch: None, .. }));
     }
 
     #[test]
