@@ -184,7 +184,7 @@ Two harnesses, two status-wiring mechanisms — each verified against the instal
 | `SessionStart` | `idle` for a workspace, `running` for a child (branches on `$OVERSEER_ROLE`) | A workspace is a bare shell the human ran `claude` inside themselves — freshly started, it's waiting on the human to type a prompt, so `running` here would be misleading before the first prompt is even submitted; `UserPromptSubmit` is what flips it. A child's task is delivered as its initial prompt, so it's already working the instant it launches (registered `Spawning` — see "Spawn Data Flow") — this is what flips it to `running`. Both branches self-identify the adapter and print a pointer at the role-specific skill. |
 | `UserPromptSubmit` | `running` | The point real work actually begins — covers both a session's first prompt and the user prompting again after the agent had gone `idle`. |
 | `PostToolUse` | `running` | Actively working. |
-| `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; the only paths there are an explicit `overseer status done` from the agent, or a clean PTY exit (see Cleanup below). |
+| `Stop` | `idle` | Finished responding — **not** done. No hook ever pushes `done`; agents report it explicitly with `overseer status done`, while a clean root PTY exit is inferred as `done` (see Cleanup below). |
 | `Notification` (`permission_prompt`) | `blocked` + `attention=permission` | Live-probed on Claude Code 2.1.209. Approval reaches `PostToolUse`; denial reaches `Stop`; both clear permission attention. |
 
 Every Claude `--from-hook` push also reads the newest real assistant turn's `message.model` from `transcript_path`, when present, and preserves the last known value otherwise. Synthetic transcript messages are ignored.
@@ -201,7 +201,7 @@ Every Claude `--from-hook` push also reads the newest real assistant turn's `mes
 | `session.error` with structured `APIError` | preserves active lifecycle + provider attention | HTTP 429 maps to `rate_limit`, 402 to `billing`, other structured API failures to `provider_error`; `Retry-After` is forwarded when supplied. Experimental until a real provider-limit response is live-probed. |
 | typed `chat.message` hook | `running` + model | Reports the hook's authoritative `providerID/modelID`; absent model data leaves the last known model untouched. |
 
-Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup).
+Status meanings: `spawning` (registered, launching) → `running` (working) → `idle` (finished responding) / `blocked` (needs you) → `done` or `error` (see Cleanup). A child whose PTY exits cleanly is auto-dropped rather than left in `done`.
 
 Attention is separate from lifecycle: `permission`, `rate_limit`, `quota_limit`, `billing`, or `provider_error`, with optional bounded message/retry time and an observed timestamp. `overseer list`/`agent` include both attention and the selected adapter's capability matrix. Claude and OpenCode context usage are unsupported because their lifecycle integrations do not expose an authoritative active window size; Claude's correct 1M-aware percentage exists only in the user's single-owner `statusLine` command, which Overseer does not replace. Context percentage is not rendered in the TUI.
 
@@ -236,7 +236,7 @@ Cargo locks the target dir per-invocation, so concurrent builds from sibling wor
 
 Dropping an agent kills its PTY and deregisters it — Overseer doesn't delete branches or worktrees (it didn't create them). Recursive drop is depth-first, children before parent. Workspaces can't be dropped via IPC, only the TUI (`Request::TuiDrop`).
 
-A PTY exiting on its own (not via `drop`) never removes the row: a background watcher maps the exit code onto `done` (clean exit, code 0) or `error` (non-zero/signal), and the agent stays visible for review before an explicit `drop`.
+When a child PTY exits cleanly (code 0), the background watcher recursively drops that child and its descendants instead of leaving a dead pane in the tree. A child that exits non-zero or by signal stays visible as `error` for inspection. Workspace PTYs are never auto-dropped: a clean root exit stays visible as `done`, and a failed root exit stays visible as `error`, until the user explicitly drops it.
 
 **Quitting the TUI is a detach, not a kill.** `q`/`Ctrl-C` closes the attach connection immediately, no confirm — the daemon and every agent it tracks are unaffected. A later `overseer` launch reattaches and recovers the full tree and each agent's terminal content.
 
