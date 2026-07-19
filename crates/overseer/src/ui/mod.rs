@@ -104,7 +104,7 @@ pub fn render(
 ) -> RenderLayout {
     let area = frame.area();
     let (running, blocked, total) = tree.agent_counts();
-    let status_line = build_status_line(running, blocked, total, prompt, theme);
+    let status_line = build_status_line(running, blocked, total, prompt, area.width, theme, keybindings);
     let status_text: String = status_line.spans.iter().map(|s| s.content.as_ref()).collect();
     let status_height = status_bar_height(&status_text, area.width);
 
@@ -589,7 +589,15 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, selected: &Option<FlatNode
 /// full, live keybinding reference (PHASE5B.md), so this hint line only
 /// needs to stay short and point there — `q quit` stays spelled out
 /// regardless, since "how do I leave" shouldn't require opening help first.
-fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Option<&str>, theme: &Theme) -> Line<'static> {
+fn build_status_line(
+    running: usize,
+    blocked: usize,
+    total: usize,
+    prompt: Option<&str>,
+    width: u16,
+    theme: &Theme,
+    keybindings: &Keybindings,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             " OVERSEER ",
@@ -604,27 +612,11 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
     if let Some(prompt) = prompt {
         spans.push(Span::styled(prompt.to_string(), Style::default().fg(Color::White)));
     } else {
-        // `d/D drop` earns its place back on-screen (not just in the `?`
+        // Drop controls earn their place back on-screen (not just in the `?`
         // popup) — a user reported having no visible way to clean up a
         // `done` agent after PHASE5B.md's hint-line shortening dropped it
         // silently. "How do I get rid of a finished agent" is common and
         // urgent enough to not gate behind "thought to press `?` first".
-        let hints: Vec<Span> = vec![
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl-l/↵", Style::default().fg(Color::Yellow)),
-            Span::styled(" jump in  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("n/s", Style::default().fg(Color::Yellow)),
-            Span::styled(" spawn  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d/D", Style::default().fg(Color::Yellow)),
-            Span::styled(" drop  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::styled(" search  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("?", Style::default().fg(Color::Yellow)),
-            Span::styled(" help", Style::default().fg(Color::DarkGray)),
-        ];
         let counts_text = if blocked > 0 {
             format!("{running}/{total} running · {blocked} blocked")
         } else {
@@ -637,7 +629,17 @@ fn build_status_line(running: usize, blocked: usize, total: usize, prompt: Optio
         };
         spans.push(Span::styled(counts_text, counts_style));
         spans.push(Span::raw("   "));
-        spans.extend(hints);
+        let used = spans.iter().map(|span| span.content.chars().count()).sum::<usize>();
+        for (index, hint) in fitting_footer_hints(keybindings, usize::from(width).saturating_sub(used))
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(hint.key, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(format!(" {}", hint.label), Style::default().fg(Color::DarkGray)));
+        }
     }
 
     Line::from(spans)
@@ -660,26 +662,101 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Option<Rect> {
     Some(Rect::new(x, y, w, h))
 }
 
-/// Pure. Every action's current binding, in `Action::ALL` order, plus the
-/// fixed non-configurable keys — what the `?` popup lists (PHASE5B.md Task
-/// 3). Built straight from the live `Keybindings` struct, never a hardcoded
-/// string list, so a remap (or a newly added `Action` some future change
-/// forgets to label) can't silently drift out of sync with what the popup
-/// actually shows.
-pub fn help_rows(kb: &Keybindings) -> Vec<(String, &'static str)> {
-    let mut rows: Vec<(String, &'static str)> =
-        Action::ALL.iter().map(|&action| (kb.get(action).to_string(), action.label())).collect();
-    rows.push(("enter/o".to_string(), "jump in (fixed alias)"));
-    rows.push(("ctrl-c".to_string(), "quit (fixed alias)"));
-    rows.push(("ctrl-h".to_string(), "leave pane (the only key a focused pane intercepts)"));
-    rows.push(("$/!".to_string(), "limit/permission attention; no badge may mean unsupported"));
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpRow {
+    pub section: &'static str,
+    pub key: String,
+    pub label: &'static str,
+}
+
+#[derive(Clone)]
+struct Hint {
+    key: String,
+    label: &'static str,
+}
+
+fn action_hint(kb: &Keybindings, action: Action, label: &'static str) -> Hint {
+    Hint { key: kb.get(action).to_string(), label }
+}
+
+/// Returns only whole key-label pairs that fit. Quit is always retained; both
+/// drop controls then receive priority because cleanup must remain visible.
+fn fitting_footer_hints(kb: &Keybindings, available: usize) -> Vec<Hint> {
+    let hints = [
+        Hint { key: format!("{}/{}", kb.get(Action::NavDown), kb.get(Action::NavUp)), label: "nav" },
+        Hint { key: format!("{}/↵", kb.get(Action::JumpIn)), label: "jump in" },
+        action_hint(kb, Action::SpawnRoot, "workspace"),
+        action_hint(kb, Action::SpawnChild, "child"),
+        action_hint(kb, Action::Drop, "drop"),
+        action_hint(kb, Action::DropRecursive, "drop+children"),
+        action_hint(kb, Action::Search, "search"),
+        action_hint(kb, Action::Quit, "quit"),
+        action_hint(kb, Action::Help, "help"),
+    ];
+    let mut selected = Vec::new();
+    let mut used = 0;
+    for index in [7, 4, 5, 2, 3, 8, 0, 1, 6] {
+        let hint = &hints[index];
+        let pair_width = hint.key.chars().count() + 1 + hint.label.chars().count();
+        let separator = if selected.is_empty() { 0 } else { 2 };
+        if index == 7 || used + separator + pair_width <= available {
+            used += separator + pair_width;
+            selected.push(index);
+        }
+    }
+    selected.sort_unstable();
+    selected.into_iter().map(|index| hints[index].clone()).collect()
+}
+
+/// Complete, context-grouped interaction reference. Configurable rows and the
+/// footer both resolve through `action_hint`, so remaps cannot make them drift.
+pub fn help_rows(kb: &Keybindings) -> Vec<HelpRow> {
+    let mut rows = Vec::new();
+    let mut push_action = |section, action| {
+        let hint = action_hint(kb, action, action.label());
+        rows.push(HelpRow { section, key: hint.key, label: hint.label });
+    };
+    for action in [Action::NavDown, Action::NavUp, Action::ToggleExpand] {
+        push_action("TREE NAVIGATION", action);
+    }
+    for action in [
+        Action::JumpIn,
+        Action::SpawnRoot,
+        Action::SpawnChild,
+        Action::Drop,
+        Action::DropRecursive,
+        Action::Quit,
+        Action::Shutdown,
+        Action::Search,
+        Action::Help,
+    ] {
+        push_action("TREE ACTIONS", action);
+    }
+    rows.extend([
+        HelpRow { section: "TREE ACTIONS", key: "ctrl-c".into(), label: "quit (fixed alias)" },
+        HelpRow { section: "PANE FOCUS", key: "enter/o".into(), label: "jump in (fixed aliases)" },
+        HelpRow { section: "PANE FOCUS", key: "ctrl-h".into(), label: "leave pane (only intercepted pane key)" },
+        HelpRow { section: "SCROLLBACK (TREE FOCUS)", key: "ctrl-u/ctrl-d".into(), label: "half-page up/down" },
+        HelpRow { section: "SCROLLBACK (TREE FOCUS)", key: "ctrl-y/ctrl-e".into(), label: "one line up/down" },
+        HelpRow { section: "SCROLLBACK (TREE FOCUS)", key: "↑/↓".into(), label: "one wheel notch up/down" },
+        HelpRow { section: "SCROLLBACK (TREE FOCUS)", key: "G".into(), label: "return to live bottom" },
+        HelpRow { section: "MODALS", key: "enter".into(), label: "submit / confirm" },
+        HelpRow { section: "MODALS", key: "esc".into(), label: "cancel" },
+        HelpRow { section: "MODALS", key: "any key".into(), label: "close help" },
+        HelpRow { section: "MOUSE", key: "tree click".into(), label: "select agent" },
+        HelpRow { section: "MOUSE", key: "pane click".into(), label: "jump in" },
+        HelpRow { section: "MOUSE", key: "wheel (tree)".into(), label: "scroll pane preview" },
+        HelpRow { section: "MOUSE", key: "wheel (pane)".into(), label: "forward to agent, or scroll preview" },
+        HelpRow { section: "BADGES", key: "$/!".into(), label: "limit/permission attention; no badge may mean unsupported" },
+    ]);
     rows
 }
 
 fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
     let rows = help_rows(keybindings);
-    let height = rows.len() as u16 + 2;
-    let Some(popup) = centered_rect(area, 58, height) else { return };
+    let section_count = rows.iter().map(|row| row.section).collect::<HashSet<_>>().len();
+    let height = (rows.len() + section_count) as u16 + 2;
+    let Some(popup) = centered_rect(area, 72, height) else { return };
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -690,15 +767,21 @@ fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, label)| {
-            Line::from(vec![
-                Span::styled(format!("{key:>10}  "), Style::default().fg(Color::Yellow)),
-                Span::styled(*label, Style::default().fg(Color::White)),
-            ])
-        })
-        .collect();
+    let mut lines = Vec::with_capacity(rows.len() + section_count);
+    let mut section = None;
+    for row in rows {
+        if section != Some(row.section) {
+            section = Some(row.section);
+            lines.push(Line::from(Span::styled(
+                row.section,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>17}  ", row.key), Style::default().fg(Color::Yellow)),
+            Span::styled(row.label, Style::default().fg(Color::White)),
+        ]));
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1116,7 +1199,9 @@ mod tests {
 
     #[test]
     fn build_status_line_with_prompt_uses_prompt_text_not_hints() {
-        let line = build_status_line(1, 0, 2, Some("drop 'agent'? (y/n)"), &Theme::default());
+        let line = build_status_line(
+            1, 0, 2, Some("drop 'agent'? (y/n)"), 160, &Theme::default(), &Keybindings::default(),
+        );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("drop 'agent'? (y/n)"));
         assert!(!text.contains("jump in"));
@@ -1124,7 +1209,7 @@ mod tests {
 
     #[test]
     fn build_status_line_without_prompt_shows_hints_and_counts() {
-        let line = build_status_line(1, 0, 2, None, &Theme::default());
+        let line = build_status_line(1, 0, 2, None, 160, &Theme::default(), &Keybindings::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/2 running"));
         assert!(text.contains("jump in"));
@@ -1135,14 +1220,44 @@ mod tests {
         // Regression: PHASE5B.md's hint-line shortening dropped "d/D drop"
         // entirely, relying on the `?` popup alone — a real user reported
         // having no visible way to clean up a `done` agent as a result.
-        let line = build_status_line(1, 0, 2, None, &Theme::default());
+        let line = build_status_line(1, 0, 2, None, 160, &Theme::default(), &Keybindings::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("drop"), "drop hint must stay visible on screen: {text}");
+        assert!(text.contains("d drop"), "drop hint must stay visible on screen: {text}");
+        assert!(text.contains("D drop+children"), "recursive drop hint must stay visible: {text}");
+    }
+
+    #[test]
+    fn build_status_line_distinguishes_workspace_child_and_recursive_actions() {
+        let line = build_status_line(1, 0, 2, None, 160, &Theme::default(), &Keybindings::default());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        for hint in ["n workspace", "s child", "d drop", "D drop+children"] {
+            assert!(text.contains(hint), "missing distinct footer hint {hint:?}: {text}");
+        }
+        assert!(!text.contains("n/s spawn"));
+        assert!(!text.contains("d/D drop"));
+    }
+
+    #[test]
+    fn build_status_line_reflects_live_keybinding_remaps() {
+        let kb = Keybindings {
+            spawn_root: overseer_core::config::KeyBinding::Char('w'),
+            spawn_child: overseer_core::config::KeyBinding::Char('c'),
+            drop: overseer_core::config::KeyBinding::Char('x'),
+            drop_recursive: overseer_core::config::KeyBinding::Char('X'),
+            help: overseer_core::config::KeyBinding::Char('h'),
+            ..Keybindings::default()
+        };
+        let line = build_status_line(1, 0, 2, None, 160, &Theme::default(), &kb);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        for hint in ["w workspace", "c child", "x drop", "X drop+children", "h help"] {
+            assert!(text.contains(hint), "footer ignored remapped hint {hint:?}: {text}");
+        }
+        assert!(!text.contains("n workspace"));
     }
 
     #[test]
     fn build_status_line_with_blocked_shows_blocked_count() {
-        let line = build_status_line(1, 2, 4, None, &Theme::default());
+        let line = build_status_line(1, 2, 4, None, 160, &Theme::default(), &Keybindings::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("1/4 running"));
         assert!(text.contains("2 blocked"));
@@ -1150,7 +1265,7 @@ mod tests {
 
     #[test]
     fn build_status_line_without_blocked_omits_blocked_text() {
-        let line = build_status_line(1, 0, 2, None, &Theme::default());
+        let line = build_status_line(1, 0, 2, None, 160, &Theme::default(), &Keybindings::default());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("blocked"));
     }
@@ -1376,7 +1491,8 @@ mod tests {
         let kb = Keybindings::default();
         let rows = help_rows(&kb);
         for action in Action::ALL {
-            let count = rows.iter().filter(|(_, label)| *label == action.label()).count();
+            let key = kb.get(action).to_string();
+            let count = rows.iter().filter(|row| row.key == key && row.label == action.label()).count();
             assert_eq!(count, 1, "{:?} should appear exactly once, appeared {count} times", action.label());
         }
     }
@@ -1385,17 +1501,28 @@ mod tests {
     fn help_rows_includes_the_fixed_non_configurable_keys() {
         let kb = Keybindings::default();
         let rows = help_rows(&kb);
-        assert!(rows.iter().any(|(key, _)| key == "enter/o"));
-        assert!(rows.iter().any(|(key, _)| key == "ctrl-c"));
-        assert!(rows.iter().any(|(key, _)| key == "ctrl-h"));
+        assert!(rows.iter().any(|row| row.key == "enter/o"));
+        assert!(rows.iter().any(|row| row.key == "ctrl-c"));
+        assert!(rows.iter().any(|row| row.key == "ctrl-h"));
+    }
+
+    #[test]
+    fn help_rows_includes_scrollback_and_mouse_sections() {
+        let rows = help_rows(&Keybindings::default());
+        for key in ["ctrl-u/ctrl-d", "ctrl-y/ctrl-e", "↑/↓", "G"] {
+            assert!(rows.iter().any(|row| row.section == "SCROLLBACK (TREE FOCUS)" && row.key == key));
+        }
+        for key in ["tree click", "pane click", "wheel (tree)", "wheel (pane)"] {
+            assert!(rows.iter().any(|row| row.section == "MOUSE" && row.key == key));
+        }
     }
 
     #[test]
     fn help_rows_reflects_a_remap() {
         let kb = Keybindings { spawn_root: overseer_core::config::KeyBinding::Char('a'), ..Keybindings::default() };
         let rows = help_rows(&kb);
-        let spawn_root_row = rows.iter().find(|(_, label)| *label == Action::SpawnRoot.label()).unwrap();
-        assert_eq!(spawn_root_row.0, "a");
+        let spawn_root_row = rows.iter().find(|row| row.label == Action::SpawnRoot.label()).unwrap();
+        assert_eq!(spawn_root_row.key, "a");
     }
 
     // ── render-path perf (SCALE.md Task 1) ───────────────────────────────────
