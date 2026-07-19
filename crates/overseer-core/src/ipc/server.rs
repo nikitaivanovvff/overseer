@@ -9,7 +9,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-use crate::agent::{AgentRegistry, AgentStatus};
+use crate::agent::{drop::drop_agent, AgentRegistry, AgentRole, AgentStatus};
 use crate::ipc::{
     handlers::{dispatch, AppCtx},
     protocol::{AttachEvent, Request, Response, MAX_WRITE_DATA_BYTES},
@@ -590,10 +590,10 @@ async fn handle_attach(
 /// periodically applies that to the registry. Runs only when
 /// `ctx.watch_sessions` is true.
 ///
-/// Never removes anything — an exited agent's row stays visible (as `done` or
-/// `error`) so the user can review it before an explicit `drop`. That also
-/// sidesteps any orphaning concern for an exited parent with live children:
-/// nothing is deleted, so nothing can be silently taken out from under them.
+/// A child that exits cleanly is recursively dropped: its dead pane has
+/// nothing left to review, and recursively dropping prevents live descendants
+/// from being orphaned. Root exits and child failures stay visible as `done`
+/// or `error` for review before an explicit `drop`.
 async fn session_watcher(ctx: Arc<AppCtx>) {
     // Was 5s — a real user reported a pane looking "frozen" after typing
     // `exit`: the underlying PTY had already died (`SessionManager` knows
@@ -614,8 +614,8 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
     }
 }
 
-/// One watcher tick: map each exited PTY's exit status onto `done` (clean exit,
-/// code 0 — including a root shell where the user typed `exit`) or `error`
+/// One watcher tick: recursively drop children whose PTYs exit cleanly; map
+/// every other exited PTY onto `done` (clean root exit) or `error`
 /// (non-zero/signal). Synchronous and side-effect-only against
 /// `registry`/`sessions`, so it's directly unit-testable without a tokio runtime.
 ///
@@ -645,7 +645,24 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     for (id, success) in sessions.drain_exits() {
         registry.mark_session_exited(&id);
-        if registry.get(&id).is_some_and(|a| a.status == AgentStatus::Done) {
+
+        let agent = registry.get(&id);
+        if success && agent.as_ref().is_some_and(|agent| agent.role == AgentRole::Child) {
+            if let Some(agent) = &agent {
+                eprintln!(
+                    "overseer: agent {} '{}' ({:?}) auto-dropped after clean exit",
+                    id.short(),
+                    agent.name,
+                    agent.role,
+                );
+            }
+            if let Err(error) = drop_agent(registry, sessions, &id, true, false) {
+                eprintln!("overseer: failed to auto-drop agent {} after clean exit: {error}", id.short());
+            }
+            continue;
+        }
+
+        if agent.is_some_and(|agent| agent.status == AgentStatus::Done) {
             continue;
         }
         let (status, message) = if success {
@@ -830,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_marks_clean_exit_done() {
+    fn sweep_keeps_root_and_marks_clean_exit_done() {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
@@ -843,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_marks_nonzero_exit_error() {
+    fn sweep_keeps_root_and_marks_nonzero_exit_error() {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
@@ -853,6 +870,36 @@ mod tests {
 
         let root = registry.get(&root_id).unwrap();
         assert_eq!(root.status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn sweep_recursively_drops_child_after_clean_exit() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+        let grandchild_id = spawn(&registry, &sessions, AgentRole::Child, Some(child_id.clone()));
+
+        sessions.simulate_exit(child_id.clone(), true);
+        sweep_exited_sessions(&registry, &sessions);
+
+        assert!(registry.get(&child_id).is_none(), "cleanly exited child must be removed");
+        assert!(registry.get(&grandchild_id).is_none(), "the child's descendants must be removed");
+        assert!(registry.get(&root_id).is_some(), "the workspace must remain registered");
+    }
+
+    #[test]
+    fn sweep_keeps_child_and_marks_nonzero_exit_error() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id));
+
+        sessions.simulate_exit(child_id.clone(), false);
+        sweep_exited_sessions(&registry, &sessions);
+
+        let child = registry.get(&child_id).expect("failed child must stay visible for review");
+        assert_eq!(child.status, AgentStatus::Error);
     }
 
     #[test]
