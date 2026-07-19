@@ -205,7 +205,7 @@ Status meanings: `spawning` (registered, launching) → `running` (working) → 
 
 Attention is separate from lifecycle: `permission`, `rate_limit`, `quota_limit`, `billing`, or `provider_error`, with optional bounded message/retry time and an observed timestamp. `overseer list`/`agent` include both attention and the selected adapter's capability matrix. Claude and OpenCode context usage are unsupported because their lifecycle integrations do not expose an authoritative active window size; Claude's correct 1M-aware percentage exists only in the user's single-owner `statusLine` command, which Overseer does not replace. Context percentage is not rendered in the TUI.
 
-Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the detail pane always shows it under `status:`.
+Every agent also carries `status_secs`: seconds held in its *current* status, reset only on an actual status change. Visible via `overseer list`/`overseer agent`. In the TUI, tree rows show it for `blocked`/`idle` only (`blocked 2m`); the Details pane always shows it on its own `since:` line.
 
 Claude Code sessions also carry `context_pct` (`--from-hook` reads it off the transcript, see the `overseer status` row above) — kept in the wire protocol and `overseer list`/`overseer agent` JSON for scripting, but **no longer rendered in the TUI** (removed from both the tree row and the Details pane, 2026-07-15). The removed display computed a % of a hardcoded 200,000-token window, which is wrong for any account on a larger context variant (e.g. Claude's 1M-token Sonnet) — rather than keep showing a number that can silently be wrong depending on account config, it was pulled from the view entirely. Re-adding it to the UI needs an honestly-sourced per-adapter signal (see `HARNESS-CAPABILITIES.md`'s `context_usage` capability), not a bigger hardcoded guess.
 
@@ -264,7 +264,7 @@ A PTY exiting on its own (not via `drop`) never removes the row: a background wa
 │ status: running           │                                         │
 │ since:  4m                │                                         │
 └───────────────────────────┴─────────────────────────────────────────┘
- OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n/s spawn  d/D drop  / search  q quit  ? help
+ OVERSEER   1/6 running · 2 blocked   j/k nav  Ctrl-l/↵ jump in  n workspace  s child  d drop  D drop+children  / search  q quit  ? help
 ```
 
 Both columns are ratatui-rendered in one process, one window — `ui::render` does its own ~25/75 horizontal split every frame; no second pane, no multiplexer. `ui::term_pane` paints the selected agent's terminal cell-by-cell into that half from a `GridSnapshot` — the only render currency, in both `--mock` and daemon-attached modes (`App::pane_grid` asks `SessionManager::grid_snapshot` directly in `--mock`, or returns the last streamed snapshot otherwise). `ui/` never touches `alacritty_terminal`.
@@ -305,7 +305,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 
 ### Help
 
-`?` opens a centered popup listing every binding — generated from the live `Keybindings` struct (`ui::help_rows`), never a hardcoded string. Includes the fixed keys too (`Enter`/`o`, `Ctrl-C`, `Ctrl-h`), labeled as fixed. Any key closes it.
+`?` opens a centered, context-grouped interaction reference. Configurable rows are generated from the live `Keybindings` struct (`ui::help_rows`), never from default-key strings; the popup also lists fixed pane aliases, scrollback keys, modal controls, and mouse routing. Any key closes it.
 
 ### Scrollback
 
