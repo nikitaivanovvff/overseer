@@ -4,7 +4,7 @@
 
 The agents are already smart. Overseer does **not** reimplement what they do — it does not manage git worktrees, branches, or merges; agents handle their own isolation. Overseer is the observability, routing, and approval surface on top: see every agent's state at a glance, jump into any one to approve or intervene, or leave the parent to supervise its own children.
 
-The usual shape is **one workspace per repository**. `n` spawns a workspace: it asks for a repo path (default: cwd) and launches a bare shell there — no adapter is launched on your behalf. The row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks once you run one yourself (its own `idle` sticks until then). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
+The usual shape is **one workspace per repository**. `n` spawns a workspace immediately, no prompt: a bare shell in wherever Overseer itself is currently running (this process's own cwd) — no adapter is launched on your behalf. (To open a workspace for a *different* repo, use `overseer start --cwd <path>` from a terminal instead; the TUI itself only ever spawns at cwd.) The row appears immediately, named after the repo, and its status flips `idle` → `running` the moment your agent starts reporting via its hooks once you run one yourself (its own `idle` sticks until then). From there you talk to it in natural language and it fans work out into child agents, each in its own PTY (auto-launched via the configured adapter), surfacing as its own row. Drop into any child for approval or a nudge, or let the parent check on them periodically.
 
 The hierarchy is intentionally capped at **depth 3**: a workspace (depth 1) can spawn children (depth 2), and those children can spawn visible leaf agents (depth 3). Depth-3 agents cannot spawn. Every parent also has a configurable direct-child cap (`[defaults] max_children`, default 8), keeping the tree readable and preventing runaway PTY/token costs. A **child's** node name is the short label it was given at spawn (`--name`) — falling back to its task text verbatim if none was given, since the task can be a whole paragraph and a name shouldn't have to be. A **workspace's** node name is the **repo name** — there's no task description, since a workspace is just a bare shell with nothing running yet, same as a human just opening it. Each tree item uses two lines: badge/name/status on the first, then branch plus the verified model name (or full adapter name when no model is known) on a dim secondary line. A bare `shell` workspace contributes no harness metadata until a real harness reports in.
 
@@ -38,7 +38,7 @@ Canonical names for the things this doc (and conversation about Overseer) refers
 | **Agent structure** pane | tree, agent tree, sidebar, workspaces pane | The left-column list of workspaces with their agents nested under them, titled `WORKSPACES`. Selection/navigation (`j`/`k`), folds, and search all act here. | `ui::render_agent_tree`, `RenderLayout::tree_rect`/`tree_rows` |
 | **Agent pane** | pane, terminal pane, live pane | The right column: the selected agent's live terminal, painted cell-by-cell from a `GridSnapshot`. Read-only preview while tree-focused; interactive once jumped in. | `ui::term_pane::render_term_pane`, `RenderLayout::pane_rect` |
 | **Details** pane | detail panel | The block under the agent structure showing the selected agent's `task`/`name`, `repo`, `branch`, `status`, `since`, and attention. Harness capabilities (lifecycle/permissions/limits/context) are computed but not rendered here — see `AdapterCapabilities` below. | `ui::render_agent_detail` |
-| **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient confirm/error messages. | `ui::render_status_bar` |
+| **Footer** | status bar | The bottom line: `OVERSEER` brand, fleet summary (`N running · M blocked`), hotkey hints, and transient error messages. `d`/`D`/`Q` confirmation is a centered modal, not footer text — see `ui::render_confirm_modal`. | `ui::render_status_bar` |
 | **Workspace** | root — the wire/env value | A top-level agent, one per repo: the shell/harness you talk to directly. Spawned with `n`/`overseer start`. | `AgentRole::Root` |
 | **Child** | — | A depth-2 or depth-3 agent spawned for one task; depth-2 children may spawn visible depth-3 leaves. | `AgentRole::Child` |
 | **Harness** | adapter, agent type | The AI CLI an agent runs (claude or opencode) and the `AgentAdapter` that knows how to install/launch it. | `agent::adapters` |
@@ -287,7 +287,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 | `<space>` | Fold/unfold the selected agent's children |
 | `Ctrl-l` / `Enter` / `o` | Jump in — moves keyboard focus into the selected agent's pane, if it's alive |
 | `Ctrl-h` | From inside a focused pane, jump back out to the tree — the only key a pane intercepts; everything else, Ctrl-c included, forwards to the agent |
-| `n` | Spawn a workspace: prompts for a repo path (default cwd), then launches a bare shell there |
+| `n` | Spawn a workspace immediately, no prompt: a bare shell in this process's own cwd |
 | `s` | Ask for a child name, then create an idle child with the parent's configured harness for manual prompting |
 | `d` | Drop selected agent (confirm prompt) |
 | `D` | Recursive drop — agent + all children (confirm prompt) |
@@ -303,7 +303,7 @@ Every tree-focus action below is remappable via `[keybindings]`. Fixed regardles
 
 ### Search
 
-`/` opens a centered input; as you type, the tree shows only agents whose name fuzzy-matches (`fuzzy_match(query, name) -> Option<u32>`: case-insensitive, in-order subsequence, contiguous runs score higher), plus every ancestor of a match (dimmed, for context). `Enter` moves the *real* cursor to the current selection (or the first match) and closes the prompt; `Esc` closes it without moving anything.
+`/` turns the agent structure pane's own title into a live query box (`" / <query>█ "`, yellow border) instead of opening a separate popup — no floating box ever sits on top of the tree it's filtering. As you type, the tree shows only agents whose name fuzzy-matches (`fuzzy_match(query, name) -> Option<u32>`: case-insensitive, in-order subsequence, contiguous runs score higher), plus every ancestor of a match (dimmed, for context), visible the instant each keystroke lands. `Enter` moves the *real* cursor to the current selection (or the first match) and closes the prompt; `Esc` closes it without moving anything.
 
 ### Help
 

@@ -156,6 +156,7 @@ fn run_app<B: ratatui::backend::Backend>(
         last_statuses = overseer_core::notify::snapshot_statuses(&flat);
 
         let prompt = build_prompt(app);
+        let confirm_text = build_confirm_text(app);
         let input = app.input.as_ref();
         let pane_focused = app.focus == Focus::Pane;
         let pane_grid = selected_id.as_ref().and_then(|id| app.pane_grid(id));
@@ -168,6 +169,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     tick,
                     prompt.as_deref(),
                     input,
+                    confirm_text.as_deref(),
                     pane_grid.as_ref(),
                     pane_focused,
                     theme,
@@ -601,45 +603,59 @@ fn forward_paste(app: &mut App, text: &str) {
     app.write_input(&id, bytes);
 }
 
-/// Builds the status-bar override text for the active confirm prompt, or the
-/// last status message. `None` means the status bar should show its normal
-/// hints. Spawn input (`n`/`s`) no longer goes through here — it renders as
-/// its own modal (`ui::render_spawn_modal`), driven directly by `app.input`.
+/// Builds the status bar's last-message text. `None` means the status bar
+/// shows its normal hints. Neither spawn input (`n`/`s`) nor the `d`/`D`/`Q`
+/// confirm prompt goes through here — both render as their own centered
+/// modal (`ui::render_spawn_modal`/`ui::render_confirm_modal`) instead of
+/// status-bar text now, driven directly by `app.input`/`build_confirm_text`.
 fn build_prompt(app: &App) -> Option<String> {
-    if let Some(confirm) = &app.confirm {
-        return Some(match &confirm.action {
-            ConfirmAction::Drop { agent_id, recursive } => {
-                let name = app
-                    .with_tree(|t| t.find(agent_id).map(|n| n.name.clone()))
-                    .unwrap_or_else(|| "?".to_string());
-                let descendants = app
-                    .with_tree(|t| t.subtree_ids_postorder(agent_id))
-                    .map(|ids| ids.len().saturating_sub(1))
-                    .unwrap_or(0);
-                let suffix = if *recursive && descendants > 0 {
-                    format!(" + {descendants} children")
-                } else {
-                    String::new()
-                };
-                format!("drop '{name}'{suffix}? (y/n)")
-            }
-            ConfirmAction::Shutdown { agent_count } => {
-                let plural = if *agent_count == 1 { "" } else { "s" };
-                format!("kill {agent_count} agent{plural} and the daemon? (y/n)")
-            }
-        });
-    }
-
     app.status_message.clone()
 }
 
-/// `n`: opens the repo-path prompt for a new workspace — always a bare shell
-/// in the chosen repo, asking for nothing but the directory. Run your own
-/// agent inside it whenever you're ready.
+/// Composes the message body for the active `d`/`D`/`Q` confirm modal, or
+/// `None` when no confirm is pending. Pure text composition, kept in the
+/// controller (not `ui/`) same as `build_prompt` — `ui::render_confirm_modal`
+/// only lays the result out.
+fn build_confirm_text(app: &App) -> Option<String> {
+    let confirm = app.confirm.as_ref()?;
+    Some(match &confirm.action {
+        ConfirmAction::Drop { agent_id, recursive } => {
+            let name = app
+                .with_tree(|t| t.find(agent_id).map(|n| n.name.clone()))
+                .unwrap_or_else(|| "?".to_string());
+            let descendants = app
+                .with_tree(|t| t.subtree_ids_postorder(agent_id))
+                .map(|ids| ids.len().saturating_sub(1))
+                .unwrap_or(0);
+            let suffix = if *recursive && descendants > 0 {
+                format!(" + {descendants} children")
+            } else {
+                String::new()
+            };
+            format!("drop '{name}'{suffix}?")
+        }
+        ConfirmAction::Shutdown { agent_count } => {
+            let plural = if *agent_count == 1 { "" } else { "s" };
+            format!("kill {agent_count} agent{plural} and the daemon?")
+        }
+    })
+}
+
+/// `n`: spawns a workspace immediately, no prompt — a bare shell in this
+/// process's own cwd, the same way opening a plain shell there would behave.
+/// Typing an arbitrary repo path is no longer a TUI capability (2026-07-19,
+/// user direction: the old modal was friction for the common case, and
+/// `n` already defaulted to cwd on a bare Enter); `overseer start --cwd
+/// <path>` from a terminal still covers spawning a workspace elsewhere.
+/// Resolves and sends *this* process's cwd explicitly rather than leaving
+/// `Request::Start { cwd: None }` for the daemon to default from its own —
+/// the daemon is a long-lived singleton per socket that may have first been
+/// launched from a different directory than whichever terminal this
+/// particular TUI attach is running in right now.
 fn start_spawn_root(app: &mut App) {
     app.status_message = None;
-    let default_cwd = std::env::current_dir().map(|p| display_path_from_home(&p)).unwrap_or_default();
-    app.input = Some(InputState { action: PendingAction::SpawnRoot, buffer: default_cwd });
+    let cwd = std::env::current_dir().ok();
+    dispatch_and_report(app, Request::Start { cwd });
 }
 
 /// `s`: opens a name prompt for a taskless child under the selected node. Whether
@@ -698,24 +714,13 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Dispatches the composed `Start`/`Spawn` request — mock mode in-process,
-/// real mode over a one-shot connection to the daemon (`App::dispatch`) —
-/// so the grandchild check applies uniformly either way.
-///
-/// `SpawnRoot`'s empty-buffer semantics differ from `SpawnChild`'s: an empty repo
-/// path means "use cwd" (not "cancel") — the buffer is prefilled with cwd on `n`
-/// already, so an empty buffer only happens if the user deliberately cleared it.
+/// Dispatches the composed `Spawn` request (child) or moves the search cursor
+/// — mock mode in-process, real mode over a one-shot connection to the
+/// daemon (`App::dispatch`) — so the grandchild check applies uniformly
+/// either way. `SpawnRoot` never reaches here: `n` dispatches directly from
+/// `start_spawn_root`, no prompt to submit.
 fn submit_input(app: &mut App, input: InputState) {
     match input.action {
-        PendingAction::SpawnRoot => {
-            let path_text = input.buffer.trim();
-            let cwd = if path_text.is_empty() {
-                std::env::current_dir().ok()
-            } else {
-                Some(expand_repo_path(path_text))
-            };
-            dispatch_and_report(app, Request::Start { cwd });
-        }
         PendingAction::SpawnChild { parent_id } => {
             let name = input.buffer.trim().to_string();
             if name.is_empty() {
@@ -752,33 +757,6 @@ fn dispatch_and_report(app: &mut App, req: Request) {
     } else {
         Some(format!("spawn failed: {}", resp.error.unwrap_or_else(|| "unknown error".to_string())))
     };
-}
-
-/// Renders `path` relative to `$HOME` (e.g. `~/projects/overseer`) for display in
-/// the spawn-root modal — the inverse of `expand_repo_path`. Falls back to the
-/// absolute path unchanged when `path` isn't under home (or home can't be resolved).
-fn display_path_from_home(path: &std::path::Path) -> String {
-    let Some(home) = dirs::home_dir() else {
-        return path.display().to_string();
-    };
-    if path == home {
-        return "~".to_string();
-    }
-    match path.strip_prefix(&home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-/// Expands a leading `~/` using `$HOME`, since `PathBuf` does no shell expansion
-/// on its own and the repo-path prompt is otherwise typed like a shell argument.
-fn expand_repo_path(text: &str) -> PathBuf {
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(text)
 }
 
 /// Returns `false` to request the run loop break. Currently only reached via
@@ -835,27 +813,6 @@ mod tests {
         let ctx = mock_ctx(socket.clone());
         assert!(ctx.sessions.is_dry_run(), "--mock must never spawn a real PTY");
         let _ = std::fs::remove_file(&socket);
-    }
-
-    // ── display_path_from_home ───────────────────────────────────────────────
-
-    #[test]
-    fn display_path_from_home_under_home_uses_tilde() {
-        let home = dirs::home_dir().expect("test requires resolvable $HOME");
-        let path = home.join("projects/overseer");
-        assert_eq!(display_path_from_home(&path), "~/projects/overseer");
-    }
-
-    #[test]
-    fn display_path_from_home_outside_home_is_unchanged() {
-        let path = PathBuf::from("/opt/other/repo");
-        assert_eq!(display_path_from_home(&path), "/opt/other/repo");
-    }
-
-    #[test]
-    fn display_path_from_home_home_itself_is_tilde() {
-        let home = dirs::home_dir().expect("test requires resolvable $HOME");
-        assert_eq!(display_path_from_home(&home), "~");
     }
 
     // ── quit guard ────────────────────────────────────────────────────────────
@@ -1268,23 +1225,38 @@ mod tests {
         let (mut app, ctx) = app_with_sessions(SessionManager::dry_run());
         register_agent(&ctx, None);
         let kb = Keybindings { spawn_root: KeyBinding::Char('a'), ..Keybindings::default() };
+        let before = app.with_tree(|t| t.agent_counts().2);
 
         // 'n' (the default) must no longer trigger spawn-root once remapped away.
         handle_tree_key(&mut app, key(KeyCode::Char('n'), KeyModifiers::NONE), 24, &kb);
-        assert!(app.input.is_none(), "'n' must be inert once spawn_root is remapped to 'a'");
+        assert_eq!(
+            app.with_tree(|t| t.agent_counts().2),
+            before,
+            "'n' must be inert once spawn_root is remapped to 'a'"
+        );
 
         // 'a' (the remap) must trigger it instead.
         handle_tree_key(&mut app, key(KeyCode::Char('a'), KeyModifiers::NONE), 24, &kb);
-        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::SpawnRoot)));
+        assert_eq!(
+            app.with_tree(|t| t.agent_counts().2),
+            before + 1,
+            "remapped spawn_root must register a new root"
+        );
     }
 
-    // ── root-spawn prompt (`n`) ───────────────────────────────────────────────
+    // ── root-spawn (`n`) ──────────────────────────────────────────────────────
 
     #[test]
-    fn start_spawn_root_opens_the_repo_path_prompt_directly() {
+    fn start_spawn_root_registers_a_workspace_immediately_with_no_prompt() {
         let (mut app, _ctx) = app_with_sessions(SessionManager::dry_run());
+        let before = app.with_tree(|t| t.agent_counts().2);
         start_spawn_root(&mut app);
-        assert!(matches!(app.input.as_ref().map(|i| &i.action), Some(PendingAction::SpawnRoot)));
+        assert!(app.input.is_none(), "'n' must never open a prompt");
+        assert_eq!(
+            app.with_tree(|t| t.agent_counts().2),
+            before + 1,
+            "'n' must register a new root immediately, in this process's own cwd"
+        );
     }
 
     // ── fuzzy search (PHASE5B.md Task 1) ─────────────────────────────────────

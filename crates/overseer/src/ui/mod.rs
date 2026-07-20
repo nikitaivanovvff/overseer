@@ -96,6 +96,7 @@ pub fn render(
     tick: u64,
     prompt: Option<&str>,
     input: Option<&InputState>,
+    confirm_text: Option<&str>,
     pane_grid: Option<&GridSnapshot>,
     pane_focused: bool,
     theme: &Theme,
@@ -158,17 +159,24 @@ pub fn render(
         .iter()
         .flat_map(|node| [node.id.clone(), node.id.clone()])
         .collect();
-    render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme);
+    render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme, search_query);
     render_agent_detail(frame, left[1], &selected, theme);
     let pane_rect = render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused);
     render_status_bar(frame, status_line, outer[1]);
 
-    // Drawn last, on top of everything — a bordered, centered modal instead of
-    // the old cramped status-bar text, since that was genuinely easy to miss
-    // (no visual weight beyond wrapped plain text at the very bottom of an
-    // already-narrow pane).
+    // Drawn last, on top of everything. Search has no modal of its own — its
+    // query lives in the tree pane's own title (see `render_agent_tree`) so
+    // the live-filtered rows underneath it are never obscured by a floating
+    // box; only the two prompts that need real typing room (spawn root/child)
+    // still get a centered modal.
     if let Some(input) = input {
-        render_input_modal(frame, area, input);
+        if !matches!(input.action, PendingAction::Search) {
+            render_spawn_modal(frame, area, input);
+        }
+    }
+
+    if let Some(confirm_text) = confirm_text {
+        render_confirm_modal(frame, area, confirm_text);
     }
 
     if show_help {
@@ -283,6 +291,7 @@ pub fn hit_test_tree(tree_rect: Rect, tree_rows: &[AgentId], column: u16, row: u
     tree_rows.get(row_index).cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_agent_tree(
     frame: &mut Frame,
     cursor: usize,
@@ -291,6 +300,7 @@ fn render_agent_tree(
     flat: &[FlatNode],
     matched: Option<&HashSet<AgentId>>,
     theme: &Theme,
+    search_query: Option<&str>,
 ) {
     // `List`'s border consumes 2 columns; the row text itself gets the rest.
     let inner_width = area.width.saturating_sub(2) as usize;
@@ -312,10 +322,22 @@ fn render_agent_tree(
         })
         .collect();
 
-    let block = Block::default()
-        .title(" WORKSPACES ")
-        .borders(Borders::ALL)
-        .border_style(focused_border(true, theme));
+    // The query lives directly in the pane's own title bar instead of a
+    // floating popup: the already-filtered rows below stay fully visible
+    // while typing, and the border turns yellow as the same "you're in a
+    // prompt" cue the spawn modal's border otherwise carries alone.
+    let (title, border_style) = match search_query {
+        Some(query) => (
+            Line::from(vec![
+                Span::styled(" / ", Style::default().fg(Color::Yellow)),
+                Span::styled(query.to_string(), Style::default().fg(Color::White)),
+                Span::styled("█ ", Style::default().fg(Color::Yellow)),
+            ]),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => (Line::from(" WORKSPACES "), focused_border(true, theme)),
+    };
+    let block = Block::default().title(title).borders(Borders::ALL).border_style(border_style);
 
     frame.render_widget(List::new(items).block(block), area);
 }
@@ -786,18 +808,18 @@ fn render_help_popup(frame: &mut Frame, area: Rect, keybindings: &Keybindings) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
-    let (title, label, submit_hint) = match &input.action {
-        PendingAction::SpawnRoot => (" new workspace ".to_string(), "repo path:", "spawn"),
-        PendingAction::SpawnChild { .. } => (" spawn child ".to_string(), "name:", "spawn"),
-        PendingAction::Search => (" search ".to_string(), "agent name:", "jump"),
-    };
+/// Renders the centered text-input modal for the spawn-child prompt (`s`) —
+/// the only prompt left that needs real typing room. `n` (spawn workspace)
+/// dispatches immediately with no prompt at all, and `Search` renders inline
+/// in the tree pane's own title instead (`render_agent_tree`).
+fn render_spawn_modal(frame: &mut Frame, area: Rect, input: &InputState) {
+    debug_assert!(matches!(input.action, PendingAction::SpawnChild { .. }));
 
     let Some(popup) = centered_rect(area, 56, 6) else { return };
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(title)
+        .title(" spawn child ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(Color::Black));
@@ -810,7 +832,7 @@ fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)))),
+        Paragraph::new(Line::from(Span::styled("name:", Style::default().fg(Color::DarkGray)))),
         rows[0],
     );
     frame.render_widget(
@@ -823,8 +845,48 @@ fn render_input_modal(frame: &mut Frame, area: Rect, input: &InputState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("↵ ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{submit_hint}   "), Style::default().fg(Color::DarkGray)),
+            Span::styled("spawn   ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Yellow)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ])),
+        rows[2],
+    );
+}
+
+/// Renders the centered confirmation modal for `d`/`D`/`Q` — previously a
+/// plain status-bar line, which was genuinely easy to miss (no visual weight
+/// beyond wrapped text at the bottom of an already-narrow pane); now the same
+/// bordered-popup treatment the spawn prompts get, red instead of yellow
+/// since every action behind this modal is destructive. `message` is fully
+/// composed by the caller (`tui::build_confirm_text`) — this function only
+/// lays it out.
+fn render_confirm_modal(frame: &mut Frame, area: Rect, message: &str) {
+    let Some(popup) = centered_rect(area, 56, 7) else { return };
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" confirm ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(message, Style::default().fg(Color::White))))
+            .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("y ", Style::default().fg(Color::Yellow)),
+            Span::styled("confirm   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("n/Esc ", Style::default().fg(Color::Yellow)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ])),
         rows[2],

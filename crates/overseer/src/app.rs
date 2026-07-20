@@ -11,18 +11,18 @@ use overseer_core::agent::{AgentId, AgentNode, AgentTree};
 use overseer_core::ipc::protocol::{AgentDto, AttachEvent, GridSnapshot, Request, Response};
 use overseer_core::ipc::AppCtx;
 
-/// What a text-input prompt (`n` / `s` / `/`) is being collected for.
+/// What a text-input prompt (`s` / `/`) is being collected for. `n` (spawn
+/// workspace) isn't here — it dispatches immediately from cwd, no prompt.
 #[derive(Debug, Clone)]
 pub enum PendingAction {
-    SpawnRoot,
     SpawnChild { parent_id: AgentId },
-    /// Fuzzy agent search (PHASE5B.md) — unlike the spawn prompts, this one
-    /// re-filters the tree live as `buffer` changes rather than waiting for
-    /// a submit; `ui::render` reads it directly off `App`'s `input` field.
+    /// Fuzzy agent search (PHASE5B.md) — unlike the spawn-child prompt, this
+    /// one re-filters the tree live as `buffer` changes rather than waiting
+    /// for a submit; `ui::render` reads it directly off `App`'s `input` field.
     Search,
 }
 
-/// Active while the user is typing a repo path, child name, or search query.
+/// Active while the user is typing a child name or search query.
 pub struct InputState {
     pub action: PendingAction,
     pub buffer: String,
