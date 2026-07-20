@@ -614,8 +614,16 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
     }
 }
 
-/// One watcher tick: recursively drop children whose PTYs exit cleanly; map
-/// every other exited PTY onto `done` (clean root exit) or `error`
+/// One watcher tick: recursively drop children whose PTYs exit cleanly;
+/// also drop a Root (workspace) whose PTY exits cleanly, but only when it
+/// currently has no children — a childless workspace's dead pane can never
+/// be re-entered (see `AgentNode::session_alive`/`tui::jump_in`), so there's
+/// nothing left to review, exactly like a leaf child. A Root that still has
+/// children is never auto-dropped this way: recursively dropping it would
+/// kill live descendants with zero confirmation, which would violate the
+/// app-wide rule that destructive actions always confirm (`d`/`D`/`Q`) — it
+/// keeps falling through to the `done` status-update path below, unchanged.
+/// Every other exited PTY maps onto `done` (clean exit) or `error`
 /// (non-zero/signal). Synchronous and side-effect-only against
 /// `registry`/`sessions`, so it's directly unit-testable without a tokio runtime.
 ///
@@ -647,7 +655,21 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
         registry.mark_session_exited(&id);
 
         let agent = registry.get(&id);
-        if success && agent.as_ref().is_some_and(|agent| agent.role == AgentRole::Child) {
+        // A childless agent (child, or a Root with no live descendants) is
+        // auto-dropped on clean exit unconditionally of any prior status —
+        // mirroring the existing Child branch, which already ignores a prior
+        // `done` the same way. That means a childless Root that had already
+        // self-reported `done` while its PTY was still alive now also gets
+        // swept away here rather than lingering as an inert `Done` row: once
+        // the PTY is confirmed dead and there's nothing left under it, there's
+        // no more value in keeping the row than there was when it was a live
+        // child. `allow_root: true` is safe here — this sweep is the daemon's
+        // own trusted internal loop, the same trust level that already lets
+        // it auto-drop children; it's not a script/CLI caller, which is what
+        // `RootRequiresTui` exists to stop.
+        let childless = registry.with_tree(|tree| tree.find(&id).is_some_and(|node| node.children.is_empty()));
+        let auto_droppable = agent.as_ref().is_some_and(|agent| agent.role == AgentRole::Child) || childless;
+        if success && auto_droppable {
             if let Some(agent) = &agent {
                 eprintln!(
                     "overseer: agent {} '{}' ({:?}) auto-dropped after clean exit",
@@ -656,7 +678,7 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
                     agent.role,
                 );
             }
-            if let Err(error) = drop_agent(registry, sessions, &id, true, false) {
+            if let Err(error) = drop_agent(registry, sessions, &id, true, true) {
                 eprintln!("overseer: failed to auto-drop agent {} after clean exit: {error}", id.short());
             }
             continue;
@@ -847,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_keeps_root_and_marks_clean_exit_done() {
+    fn sweep_drops_childless_root_after_clean_exit() {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
@@ -855,8 +877,27 @@ mod tests {
         sessions.simulate_exit(root_id.clone(), true);
         sweep_exited_sessions(&registry, &sessions);
 
-        let root = registry.get(&root_id).expect("exited agent must stay visible, not be removed");
+        assert!(registry.get(&root_id).is_none(), "childless workspace's clean exit must be auto-dropped");
+    }
+
+    #[test]
+    fn sweep_keeps_root_with_live_child_and_marks_clean_exit_done() {
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let child_id = spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
+
+        // Only the root's PTY exited cleanly — it still has a live child, so
+        // dropping it would kill that child with zero confirmation. It must
+        // stay visible as `Done` instead, exactly like today's unchanged
+        // behavior for a root with children.
+        sessions.simulate_exit(root_id.clone(), true);
+        sweep_exited_sessions(&registry, &sessions);
+
+        let root = registry.get(&root_id).expect("a root with a live child must never be auto-dropped");
         assert_eq!(root.status, AgentStatus::Done);
+        let child = registry.get(&child_id).expect("the live child must be untouched");
+        assert_eq!(child.status, AgentStatus::Spawning);
     }
 
     #[test]
@@ -929,6 +970,12 @@ mod tests {
         let registry = AgentRegistry::new();
         let sessions = SessionManager::dry_run();
         let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        // Give this root a live child so it's exempt from the new
+        // childless-root auto-drop-on-clean-exit path below — this test is
+        // specifically about the done-skip/session_alive interaction, and a
+        // childless root would get removed by the final clean exit instead
+        // of exercising that path.
+        spawn(&registry, &sessions, AgentRole::Child, Some(root_id.clone()));
         registry.set_status(&root_id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
 
         // The session never exited (no `simulate_exit`) -- a sweep tick must
