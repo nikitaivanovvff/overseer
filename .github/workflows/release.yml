@@ -1,8 +1,11 @@
 name: Release
 
+# Manual-trigger only for now: distribution is `cargo install --git` while
+# the Homebrew tap / prebuilt-binary story settles. Kept intact (not
+# deleted) so it's a one-line revert (`on: release: types: [published]`)
+# once that's ready.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write

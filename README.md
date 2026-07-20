@@ -46,11 +46,18 @@ A Cargo workspace of two crates: `overseer-core` (library — agent model, sessi
 
 ## Getting started
 
+No prebuilt binaries or Homebrew tap yet — build from source. Requires the Rust toolchain.
+
+```sh
+cargo install --git https://github.com/nikitaivanovvff/overseer overseer
+```
+
+This clones, builds `--release`, and installs the `overseer` binary to `~/.cargo/bin` (already on `PATH` if you have Rust set up). To hack on it locally instead, clone and `cargo build --release` — the binary lands at `target/release/overseer`.
+
 Overseer currently supports two harnesses: **Claude Code** and **opencode**. Install support for whichever you use, once, at the user level. If you installed pi support with an older Overseer release, run that release's `overseer uninstall pi` before upgrading to remove its user-level files.
 
 ```sh
-cargo build --release
-./target/release/overseer install claude   # or opencode
+overseer install claude   # or opencode
 ```
 
 `install` only ever writes at the **user level** — never into the project repo you happen to run it from, so it never shows up in `git status` for any codebase you use Overseer on:
@@ -62,7 +69,7 @@ Either way, `overseer install <agent> --uninstall` (or the equivalent `overseer 
 
 Then run `overseer`. It spawns a background daemon on first launch, and `n` opens a workspace picker — pick a repo and it drops you into a bare shell there. Run your own agent inside it; Overseer picks up its status automatically via the hooks `install` just wired in.
 
-No prebuilt binaries or Homebrew tap yet — cross-compiled release CI exists (`.github/workflows/release.yml`) but no version has been tagged. Building from source is the only path today.
+Cross-compiled release CI exists (`.github/workflows/release.yml`) but is currently manual-trigger only while `cargo install --git` is the primary distribution path — no version has been tagged yet.
 
 ## Configuration
 
