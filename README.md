@@ -73,7 +73,7 @@ Cross-compiled release CI exists (`.github/workflows/release.yml`) but is curren
 
 ## Configuration
 
-Everything below is optional. Overseer runs on built-in defaults if `~/.config/overseer/config.toml` doesn't exist, and a missing or invalid *value* for one field just warns on stderr and keeps that field's own default rather than failing to start. `[defaults]`/`[adapters.*]` are read once by the daemon (or `--mock`) at startup; `[notify]`/`[keybindings]`/`[theme]` are read independently by the TUI process, since they're properties of *your* terminal, not the daemon's.
+Everything below is optional. Overseer runs on built-in defaults if `~/.config/overseer/config.toml` doesn't exist, and a missing or invalid *value* for one field just warns on stderr and keeps that field's own default rather than failing to start. `[defaults]`/`[adapters.*]`/`[danger_zone]` are read once by the daemon (or `--mock`) at startup; `[notify]`/`[keybindings]`/`[theme]` are read independently by the TUI process, since they're properties of *your* terminal, not the daemon's.
 
 ```toml
 # ~/.config/overseer/config.toml
@@ -81,7 +81,9 @@ Everything below is optional. Overseer runs on built-in defaults if `~/.config/o
 [defaults]
 adapter = "claude"                # harness a new workspace assumes, and what a spawned child inherits when --adapter is omitted
 max_children = 8                  # cap on direct children per parent (workspace or child) -- keeps the tree readable and bounds PTY/token cost
-im_not_afraid_of_agents = false   # opt-in: auto-approve every spawned child's permission prompts -- see "Danger Zone" below. Off by default; leave it off unless you mean it.
+
+[danger_zone]
+full_auto_mode = false   # opt-in: auto-approve every spawned child's permission prompts -- see "Danger Zone" below. Off by default; leave it off unless you mean it.
 
 [adapters.claude]
 command = "claude"                # binary to launch -- point this at a wrapper or a non-$PATH build if you need to
@@ -126,7 +128,7 @@ By design, Overseer does not bypass permission prompts for spawned children. A c
 If you want a child to run unattended without those prompts, that's your call and your risk to take, and there are two ways to make it, both shown in the config example above:
 
 - **Per adapter**: set `[adapters.<name>] extra_args` to whatever flags your harness accepts, e.g. `extra_args = ["--dangerously-skip-permissions"]` for Claude Code.
-- **Blanket, for every configured adapter**: set `[defaults] im_not_afraid_of_agents = true`. Overseer appends the equivalent auto-approve flag to every adapter that has one (`--dangerously-skip-permissions` for Claude Code, `--auto` for opencode) without you having to hand-list it per adapter.
+- **Blanket, for every configured adapter**: set `[danger_zone] full_auto_mode = true`. Overseer appends the equivalent auto-approve flag to every adapter that has one (`--dangerously-skip-permissions` for Claude Code, `--auto` for opencode) without you having to hand-list it per adapter.
 
 Either way, the consequence is the same: an agent running this way can take any action its harness allows — edit files, run shell commands, whatever the tool permits — without asking, unattended. Both flags are labeled dangerous by their own tools: Claude Code's is literally named `--dangerously-skip-permissions`, and opencode's own docs describe `--auto` as auto-approving permissions that aren't explicitly denied "(dangerous!)". Turn this on only if you mean it.
 

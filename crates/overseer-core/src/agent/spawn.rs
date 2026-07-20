@@ -148,7 +148,7 @@ fn resolve_adapter<'a>(
 }
 
 /// The CLI flag each adapter's harness accepts to auto-approve permissions,
-/// for `[defaults] im_not_afraid_of_agents` (README.md "Danger Zone"). `None`
+/// for `[danger_zone] full_auto_mode` (README.md "Danger Zone"). `None`
 /// for an adapter we don't have a live-verified flag for — never guess one.
 fn auto_approve_flag(adapter_name: &str) -> Option<&'static str> {
     match adapter_name {
@@ -159,15 +159,14 @@ fn auto_approve_flag(adapter_name: &str) -> Option<&'static str> {
 }
 
 /// Appends `adapter_name`'s auto-approve flag to `extra_args` when
-/// `im_not_afraid_of_agents` is enabled, unless it's already present. Toggle
-/// off (the default) or an adapter with no known flag leaves `extra_args`
-/// untouched.
+/// `full_auto_mode` is enabled, unless it's already present. Toggle off (the
+/// default) or an adapter with no known flag leaves `extra_args` untouched.
 fn apply_auto_approve_flag(
     adapter_name: &str,
     mut extra_args: Vec<String>,
-    im_not_afraid_of_agents: bool,
+    full_auto_mode: bool,
 ) -> Vec<String> {
-    if !im_not_afraid_of_agents {
+    if !full_auto_mode {
         return extra_args;
     }
     if let Some(flag) = auto_approve_flag(adapter_name) {
@@ -225,7 +224,7 @@ fn spawn_child_agent(
         extra_args: apply_auto_approve_flag(
             &req.adapter_name,
             adapter_config.extra_args.clone(),
-            config.defaults.im_not_afraid_of_agents,
+            config.danger_zone.full_auto_mode,
         ),
         task: req.task,
         depth,
@@ -496,6 +495,7 @@ mod tests {
             Config {
                 defaults: Default::default(),
                 adapters: Default::default(),
+                danger_zone: Default::default(),
                 notify: Default::default(),
                 keybindings: Default::default(),
                 theme: Default::default(),
@@ -588,7 +588,7 @@ mod tests {
     fn spawn_agent_child_extra_args_include_auto_approve_flag_when_toggle_is_on() {
         let (registry, sessions) = make_registry_and_sessions();
         let mut config = Config::default();
-        config.defaults.im_not_afraid_of_agents = true;
+        config.danger_zone.full_auto_mode = true;
 
         let root = spawn_agent(
             &registry,
@@ -620,7 +620,7 @@ mod tests {
         let resolved_extra_args = apply_auto_approve_flag(
             "claude",
             adapter_config.extra_args.clone(),
-            config.defaults.im_not_afraid_of_agents,
+            config.danger_zone.full_auto_mode,
         );
         assert_eq!(resolved_extra_args, vec!["--dangerously-skip-permissions".to_string()]);
     }
