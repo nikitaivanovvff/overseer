@@ -380,13 +380,15 @@ pick up in place of the initial empty placeholder.
 
 ## Config
 
-`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, `[notify]`, `[keybindings]`, `[theme]` — all below. `[defaults]`/`[adapters.*]` load once at daemon/mock startup; `[notify]`/`[keybindings]`/`[theme]` load independently in the TUI process, since they're properties of *your* terminal, not the daemon's. Missing/invalid file falls back to the built-in default; a bad *value* for one field warns on stderr and keeps that field's own default — never a hard error.
+`~/.config/overseer/config.toml`. **Implemented:** `[defaults]`, `[adapters.*]`, `[danger_zone]`, `[notify]`, `[keybindings]`, `[theme]` — all below. `[defaults]`/`[adapters.*]`/`[danger_zone]` load once at daemon/mock startup; `[notify]`/`[keybindings]`/`[theme]` load independently in the TUI process, since they're properties of *your* terminal, not the daemon's. Missing/invalid file falls back to the built-in default; a bad *value* for one field warns on stderr and keeps that field's own default — never a hard error.
 
 ```toml
 [defaults]
 adapter = "claude"
 max_children = 8
-im_not_afraid_of_agents = false   # opt-in: auto-approve permissions for every spawned child — see README.md's Danger Zone
+
+[danger_zone]
+full_auto_mode = false   # opt-in: auto-approve permissions for every spawned child — see README.md's Danger Zone
 
 [adapters.claude]
 command = "claude"
@@ -418,7 +420,7 @@ border_focused = "yellow"
 border = "dark_gray"
 ```
 
-A child spawn resolves `command`/`extra_args` from `config.adapters[name]`, not the adapter name itself — lets a user opt a harness into a bypass flag like `--dangerously-skip-permissions` (see `im_not_afraid_of_agents` above and README's Danger Zone), and lets a user point "claude" at a custom binary. A name with no entry in `config.adapters` is the same `UnknownAdapter` error as one with no `AgentAdapter` impl (e.g. `aider`, a config-shape example only — see "Agent Adapter Trait").
+A child spawn resolves `command`/`extra_args` from `config.adapters[name]`, not the adapter name itself — lets a user opt a harness into a bypass flag like `--dangerously-skip-permissions` (see `full_auto_mode` above and README's Danger Zone), and lets a user point "claude" at a custom binary. A name with no entry in `config.adapters` is the same `UnknownAdapter` error as one with no `AgentAdapter` impl (e.g. `aider`, a config-shape example only — see "Agent Adapter Trait").
 
 `[notify]`: every channel independently switchable off. `bell` defaults **on**; `mode` defaults **off** (the louder, opt-in channel). `"blocked+idle"` also notifies on `→idle`.
 

@@ -1,5 +1,5 @@
-//! `[defaults]`/`[adapters.*]`/`[notify]`/`[keybindings]`/`[theme]` config
-//! loader (AGENTS.md "Config").
+//! `[defaults]`/`[adapters.*]`/`[danger_zone]`/`[notify]`/`[keybindings]`/`[theme]`
+//! config loader (AGENTS.md "Config").
 
 mod keybindings;
 mod theme;
@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer};
 pub struct Config {
     pub defaults: Defaults,
     pub adapters: HashMap<String, AdapterConfig>,
+    pub danger_zone: DangerZone,
     pub notify: NotifyConfig,
     pub keybindings: Keybindings,
     pub theme: Theme,
@@ -39,6 +40,8 @@ impl<'de> Deserialize<'de> for Config {
             #[serde(default)]
             adapters: HashMap<String, AdapterConfig>,
             #[serde(default)]
+            danger_zone: DangerZone,
+            #[serde(default)]
             notify: NotifyConfig,
             #[serde(default)]
             keybindings: Keybindings,
@@ -52,6 +55,7 @@ impl<'de> Deserialize<'de> for Config {
         Ok(Config {
             defaults: raw.defaults,
             adapters,
+            danger_zone: raw.danger_zone,
             notify: raw.notify,
             keybindings: raw.keybindings,
             theme: raw.theme,
@@ -65,12 +69,19 @@ pub struct Defaults {
     pub adapter: String,
     #[serde(default = "default_max_children")]
     pub max_children: usize,
+}
+
+/// `[danger_zone]` — settings that weaken Overseer's default safety posture.
+/// Kept in its own section, separate from `[defaults]`, so it reads as a
+/// deliberate opt-in rather than an ordinary default.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DangerZone {
     /// Opt-in blanket toggle: every spawned child runs with its harness's own
     /// auto-approve-permissions flag appended (README.md "Danger Zone").
     /// Default false — Overseer's no-bypass-by-default posture for children
     /// is intentional and must stay the default.
     #[serde(default)]
-    pub im_not_afraid_of_agents: bool,
+    pub full_auto_mode: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,11 +148,7 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
 
 impl Default for Defaults {
     fn default() -> Self {
-        Self {
-            adapter: default_adapter_name(),
-            max_children: default_max_children(),
-            im_not_afraid_of_agents: false,
-        }
+        Self { adapter: default_adapter_name(), max_children: default_max_children() }
     }
 }
 
@@ -150,6 +157,7 @@ impl Default for Config {
         Self {
             defaults: Defaults::default(),
             adapters: default_adapters(),
+            danger_zone: DangerZone::default(),
             notify: NotifyConfig::default(),
             keybindings: Keybindings::default(),
             theme: Theme::default(),
@@ -267,24 +275,24 @@ mod tests {
         assert_eq!(claude.extra_args, vec!["--foo".to_string()]);
     }
 
-    // ── [defaults] im_not_afraid_of_agents ────────────────────────────────────
+    // ── [danger_zone] full_auto_mode ──────────────────────────────────────────
 
     #[test]
-    fn im_not_afraid_of_agents_defaults_false() {
+    fn full_auto_mode_defaults_false() {
         let cfg = Config::default();
-        assert!(!cfg.defaults.im_not_afraid_of_agents);
+        assert!(!cfg.danger_zone.full_auto_mode);
     }
 
     #[test]
-    fn im_not_afraid_of_agents_parses_true() {
-        let cfg: Config = toml::from_str("[defaults]\nim_not_afraid_of_agents = true\n").unwrap();
-        assert!(cfg.defaults.im_not_afraid_of_agents);
+    fn full_auto_mode_parses_true() {
+        let cfg: Config = toml::from_str("[danger_zone]\nfull_auto_mode = true\n").unwrap();
+        assert!(cfg.danger_zone.full_auto_mode);
     }
 
     #[test]
-    fn im_not_afraid_of_agents_stays_false_when_omitted() {
+    fn full_auto_mode_stays_false_when_omitted() {
         let cfg: Config = toml::from_str("[defaults]\nadapter = \"claude\"\n").unwrap();
-        assert!(!cfg.defaults.im_not_afraid_of_agents);
+        assert!(!cfg.danger_zone.full_auto_mode);
     }
 
     // ── [notify] (ATTENTION.md) ───────────────────────────────────────────────
