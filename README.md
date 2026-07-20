@@ -53,6 +53,13 @@ cargo build --release
 ./target/release/overseer install claude   # or opencode
 ```
 
+`install` only ever writes at the **user level** — never into the project repo you happen to run it from, so it never shows up in `git status` for any codebase you use Overseer on:
+
+- **claude**: two skill files at `~/.claude/skills/overseer-root/SKILL.md` and `~/.claude/skills/overseer-child/SKILL.md` (role-specific instructions Claude Code itself loads — how to delegate via `overseer spawn`, how to set up a worktree/branch and report `overseer status done`), plus a merge into `~/.claude/settings.json`'s `hooks` — `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `Notification` — each just shelling out to `overseer status ... --from-hook`. Overseer's own hook entries are tagged `_overseer: true`, so uninstall removes exactly those and leaves any hooks you've configured yourself untouched.
+- **opencode**: an auto-loaded plugin at `~/.config/opencode/plugin/overseer.js` (opencode picks up anything under `plugin/` on its own, no config entry needed) that listens for opencode's own lifecycle events and pushes the same kind of status/attention updates as Claude's hooks, plus two instruction files (`overseer-root.md`/`overseer-child.md`) merged into `opencode.jsonc`'s `instructions` array. Both instruction files are always installed together — each one's own opening line ("only applies when `$OVERSEER_ROLE=...`") is what makes loading both, every session, harmless. Respects `$XDG_CONFIG_HOME` if set, otherwise defaults to `~/.config/opencode`.
+
+Either way, `overseer install <agent> --uninstall` (or the equivalent `overseer uninstall <agent>`) removes exactly what was installed — nothing else in your settings/config is touched.
+
 Then run `overseer`. It spawns a background daemon on first launch, and `n` opens a workspace picker — pick a repo and it drops you into a bare shell there. Run your own agent inside it; Overseer picks up its status automatically via the hooks `install` just wired in.
 
 No prebuilt binaries or Homebrew tap yet — cross-compiled release CI exists (`.github/workflows/release.yml`) but no version has been tagged. Building from source is the only path today.
