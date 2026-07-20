@@ -14,14 +14,19 @@ use overseer_core::ipc::protocol::{ColorDto, GridSnapshot};
 /// rendered content, `None` if it has none yet (or isn't running); `--mock`
 /// and daemon-attached modes both feed this from `App::pane_grid` — `ui/`
 /// never sees anything backend-specific. `focused` draws the cursor and a
-/// distinct border; read-only preview otherwise. Returns the inner
-/// (border-excluded) rect actually painted, so callers can size the PTY to it.
+/// distinct border; read-only preview otherwise. `selection`, when present,
+/// is a mouse-native text selection's `(anchor, cursor)` in pane-local
+/// `(col, row)` — see `overseer_core::selection` for why this stands in for
+/// terminal-native drag-select (mouse capture is permanently armed, so the
+/// host terminal never gets the drag). Returns the inner (border-excluded)
+/// rect actually painted, so callers can size the PTY to it.
 pub fn render_term_pane(
     frame: &mut Frame,
     area: Rect,
     grid: Option<&GridSnapshot>,
     selected: Option<&FlatNode>,
     focused: bool,
+    selection: Option<((u16, u16), (u16, u16))>,
 ) -> Rect {
     let offset = grid.map(|g| g.display_offset).unwrap_or(0);
     // A session that exits naturally (not via `d`/`D`) keeps its last
@@ -44,7 +49,7 @@ pub fn render_term_pane(
     }
 
     match grid {
-        Some(grid) => paint_grid_snapshot(grid, inner, frame.buffer_mut(), focused),
+        Some(grid) => paint_grid_snapshot(grid, inner, frame.buffer_mut(), focused, selection),
         None => frame.render_widget(placeholder("agent not running"), inner),
     }
     inner
@@ -118,8 +123,17 @@ pub(crate) fn map_dto_color(color: ColorDto) -> Color {
 /// Paints a `GridSnapshot` into `buf`, cell by cell — the only painter in
 /// `ui/`, for both `--mock` and daemon-attached modes (`GridSnapshot` is the
 /// only render currency; see `session::pty::grid_snapshot_from_term` for how
-/// it's built).
-pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, show_cursor: bool) {
+/// it's built). `selection`, when present, reverse-highlights every cell
+/// `overseer_core::selection::contains` reports as within its span — the
+/// same visual treatment the cursor gets below, so a selected range reads
+/// the same way a real terminal's own inverse-video selection does.
+pub fn paint_grid_snapshot(
+    grid: &GridSnapshot,
+    area: Rect,
+    buf: &mut Buffer,
+    show_cursor: bool,
+    selection: Option<((u16, u16), (u16, u16))>,
+) {
     let cols = area.width as usize;
     let lines = area.height as usize;
 
@@ -140,6 +154,11 @@ pub fn paint_grid_snapshot(grid: &GridSnapshot, area: Rect, buf: &mut Buffer, sh
             }
             if cell.inverse {
                 style = style.add_modifier(Modifier::REVERSED);
+            }
+            if let Some((anchor, cursor)) = selection {
+                if overseer_core::selection::contains(anchor, cursor, (col as u16, row as u16)) {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
             }
             let target = &mut buf[(x, y)];
             target.set_char(cell.ch);
@@ -170,7 +189,7 @@ mod tests {
         let grid = snapshot_from_bytes(10, 3, b"hi");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false, None);
         assert_eq!(buf[(0, 0)].symbol(), "h");
         assert_eq!(buf[(1, 0)].symbol(), "i");
         assert_eq!(buf[(2, 0)].symbol(), " ");
@@ -182,7 +201,7 @@ mod tests {
         let grid = snapshot_from_bytes(10, 3, b"\x1b[1;31mX");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false, None);
         let cell = &buf[(0, 0)];
         assert_eq!(cell.symbol(), "X");
         assert_eq!(cell.fg, Color::Red);
@@ -195,7 +214,7 @@ mod tests {
         let grid = snapshot_from_bytes(10, 3, "你".as_bytes());
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false, None);
         assert_eq!(buf[(0, 0)].symbol(), "你");
         // The spacer cell must stay untouched (default blank), not a stray
         // second glyph — this is the classic wide-char column-shear bug.
@@ -208,11 +227,11 @@ mod tests {
         let area = Rect::new(0, 0, 10, 3);
 
         let mut buf_no_cursor = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf_no_cursor, false);
+        paint_grid_snapshot(&grid, area, &mut buf_no_cursor, false, None);
         assert!(!buf_no_cursor[(1, 0)].modifier.contains(Modifier::REVERSED));
 
         let mut buf_cursor = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf_cursor, true);
+        paint_grid_snapshot(&grid, area, &mut buf_cursor, true, None);
         assert!(buf_cursor[(1, 0)].modifier.contains(Modifier::REVERSED));
     }
 
@@ -221,7 +240,7 @@ mod tests {
         let grid = snapshot_from_bytes(10, 3, b"a\r\nb");
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false, None);
         assert_eq!(buf[(0, 0)].symbol(), "a");
         assert_eq!(buf[(0, 1)].symbol(), "b");
     }
@@ -233,7 +252,7 @@ mod tests {
         let grid = snapshot_from_bytes(30, 3, b"hello world this overflows");
         let area = Rect::new(0, 0, 5, 1);
         let mut buf = Buffer::empty(area);
-        paint_grid_snapshot(&grid, area, &mut buf, false);
+        paint_grid_snapshot(&grid, area, &mut buf, false, None);
         assert_eq!(buf[(0, 0)].symbol(), "h");
         assert_eq!(buf[(4, 0)].symbol(), "o");
     }
@@ -254,18 +273,18 @@ mod tests {
         let area = Rect::new(0, 0, 10, 5);
         let live = snapshot_from_bytes(10, 5, &bytes);
         let mut live_buf = Buffer::empty(area);
-        paint_grid_snapshot(&live, area, &mut live_buf, false);
+        paint_grid_snapshot(&live, area, &mut live_buf, false, None);
         let live_top: String = (0..5).map(|c| live_buf[(c, 0)].symbol()).collect();
 
         let scrolled = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, false);
         let mut scrolled_buf = Buffer::empty(area);
-        paint_grid_snapshot(&scrolled, area, &mut scrolled_buf, false);
+        paint_grid_snapshot(&scrolled, area, &mut scrolled_buf, false, None);
         let scrolled_top: String = (0..5).map(|c| scrolled_buf[(c, 0)].symbol()).collect();
         assert_ne!(scrolled_top, live_top, "scrolling up must show older content");
 
         let restored = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, true);
         let mut restored_buf = Buffer::empty(area);
-        paint_grid_snapshot(&restored, area, &mut restored_buf, false);
+        paint_grid_snapshot(&restored, area, &mut restored_buf, false, None);
         let restored_top: String = (0..5).map(|c| restored_buf[(c, 0)].symbol()).collect();
         assert_eq!(restored_top, live_top, "scrolling back to bottom must restore the live view");
     }
@@ -335,7 +354,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
         terminal
             .draw(|frame| {
-                render_term_pane(frame, frame.area(), None, Some(node), false);
+                render_term_pane(frame, frame.area(), None, Some(node), false, None);
             })
             .unwrap();
         terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect()

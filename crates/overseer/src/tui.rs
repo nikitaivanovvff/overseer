@@ -16,7 +16,7 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use overseer_core::agent::{AgentId, AgentTree};
 use crate::app::{
-    App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PendingAction,
+    App, Backend, ConfirmAction, ConfirmState, DaemonState, Focus, InputState, PaneSelection, PendingAction,
 };
 use overseer_core::config::{Action, Config, KeyBinding, Keybindings};
 use overseer_core::daemon;
@@ -142,6 +142,9 @@ fn run_app<B: ratatui::backend::Backend>(
             if let Some(id) = &selected_id {
                 app.scroll_to_bottom(id);
             }
+            // A selection is pane-content-relative — it means nothing once
+            // the pane is showing a different agent's grid.
+            app.selection = None;
             last_selected = selected_id.clone();
         }
 
@@ -160,6 +163,15 @@ fn run_app<B: ratatui::backend::Backend>(
         let input = app.input.as_ref();
         let pane_focused = app.focus == Focus::Pane;
         let pane_grid = selected_id.as_ref().and_then(|id| app.pane_grid(id));
+        // Only render a highlight that actually belongs to the pane currently
+        // on screen — `app.selection` outlives an agent switch for one frame
+        // (cleared just above on `selected_id != last_selected`), so this
+        // guard is what stops a stale range flashing over the wrong grid.
+        let pane_selection = app
+            .selection
+            .as_ref()
+            .filter(|s| Some(&s.agent_id) == selected_id.as_ref())
+            .map(|s| (s.anchor, s.cursor));
         let mut layout = ui::RenderLayout { pane_rect: Rect::default(), tree_rect: Rect::default(), tree_rows: Vec::new() };
         app.with_tree(|tree| {
             terminal.draw(|f| {
@@ -172,6 +184,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     confirm_text.as_deref(),
                     pane_grid.as_ref(),
                     pane_focused,
+                    pane_selection,
                     theme,
                     keybindings,
                     app.show_help,
@@ -256,6 +269,13 @@ fn run_app<B: ratatui::backend::Backend>(
                     Event::Paste(text) if app.focus == Focus::Pane => forward_paste(app, &text),
                     Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                         handle_left_click(app, &layout, mouse);
+                        start_pane_selection(app, &layout, mouse);
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                        update_pane_selection(app, &layout, mouse);
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Up(MouseButton::Left) => {
+                        finish_pane_selection(app);
                     }
                     Event::Mouse(mouse) => {
                         pending_scroll += handle_mouse_wheel(app, &mouse, pane_rect);
@@ -408,6 +428,84 @@ fn handle_left_click(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent
     } else if layout.pane_rect.contains(pos) && app.focus != Focus::Pane {
         jump_in(app);
     }
+}
+
+/// Begins tracking a mouse-native text selection (`overseer_core::selection`)
+/// on a left-button-down over the pane — independent of, and in addition to,
+/// `handle_left_click`'s focus/jump-in handling above: a click that turns
+/// into a drag both focuses the pane *and* starts selecting from the same
+/// gesture, same as clicking into a GUI text field can immediately begin a
+/// drag-select within it. Deliberately does not forward `Down`/`Drag`/`Up`
+/// into the focused inner PTY the way wheel events are — those three kinds
+/// were unclaimed before this (silently dropped), so claiming them for
+/// Overseer's own selection is not a behavior change to anything that
+/// previously worked. No-ops under any modal, mirroring `handle_left_click`.
+fn start_pane_selection(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
+    if app.input.is_some() || app.confirm.is_some() || app.show_help {
+        return;
+    }
+    let pos = Position::new(mouse.column, mouse.row);
+    if !layout.pane_rect.contains(pos) {
+        return;
+    }
+    let Some(id) = app.with_tree(|t| t.selected()).map(|n| n.id) else { return };
+    let point = (mouse.column - layout.pane_rect.x, mouse.row - layout.pane_rect.y);
+    app.selection = Some(PaneSelection { agent_id: id, anchor: point, cursor: point, dragging: true });
+}
+
+/// Extends the in-progress selection's cursor end on each `Drag` report.
+/// Clamped to the pane rect rather than dropped once the drag leaves it, so
+/// dragging past an edge still extends the selection to that edge — the
+/// same "clamp, don't lose the gesture" choice made elsewhere for a scroll
+/// held past its bound.
+fn update_pane_selection(app: &mut App, layout: &ui::RenderLayout, mouse: MouseEvent) {
+    let Some(selection) = app.selection.as_mut() else { return };
+    if !selection.dragging {
+        return;
+    }
+    // `width`/`height` saturating_sub(1) keeps max >= pane_rect.x/.y even for
+    // a degenerate zero-size pane, so `clamp` here can never see min > max.
+    let max_col = layout.pane_rect.x + layout.pane_rect.width.saturating_sub(1);
+    let max_row = layout.pane_rect.y + layout.pane_rect.height.saturating_sub(1);
+    let col = mouse.column.clamp(layout.pane_rect.x, max_col);
+    let row = mouse.row.clamp(layout.pane_rect.y, max_row);
+    selection.cursor = (col - layout.pane_rect.x, row - layout.pane_rect.y);
+}
+
+/// Finalizes the selection on button-up: a real drag (cursor moved from
+/// anchor) extracts the spanned text from the agent's *current* grid and
+/// copies it out via OSC 52, then leaves the range in place so the highlight
+/// stays visible — real terminals keep a finished selection highlighted
+/// until the next click, which `start_pane_selection` provides by
+/// overwriting `app.selection` on the next `Down`. A plain click (no
+/// movement) clears any prior selection instead of copying a single cell,
+/// since a bare click is the existing "just focus/jump-in" gesture, not an
+/// attempt to select one character.
+fn finish_pane_selection(app: &mut App) {
+    let Some(selection) = app.selection.as_mut() else { return };
+    if !selection.dragging {
+        return;
+    }
+    selection.dragging = false;
+    if selection.anchor == selection.cursor {
+        app.selection = None;
+        return;
+    }
+    let (agent_id, anchor, cursor) = (selection.agent_id.clone(), selection.anchor, selection.cursor);
+    let Some(grid) = app.pane_grid(&agent_id) else { return };
+    let text = overseer_core::selection::extract_text(&grid, anchor, cursor);
+    if !text.is_empty() {
+        write_clipboard(&text);
+    }
+}
+
+/// Writes an OSC 52 clipboard-set sequence straight to this process's own
+/// stdout, bypassing ratatui's buffered draw — the same pattern
+/// `overseer_core::notify::ring_bell` already uses for BEL.
+fn write_clipboard(text: &str) {
+    use std::io::Write;
+    let _ = io::stdout().write_all(overseer_core::selection::osc52_copy(text).as_bytes());
+    let _ = io::stdout().flush();
 }
 
 /// Converts a live key event into the config-file vocabulary `Keybindings`
@@ -1551,6 +1649,162 @@ mod tests {
 
         assert_eq!(app.with_tree(|t| t.selected()).map(|n| n.id), Some(id_a.clone()));
         assert_eq!(app.focus, Focus::Tree);
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    // ── mouse-native pane selection (overseer_core::selection) ──────────────
+    //
+    // The actual OSC 52 write is a thin, unexercised-by-design I/O shell —
+    // same house style as `notify::ring_bell` — so these test the state
+    // machine (`app.selection`'s anchor/cursor/dragging), not stdout.
+
+    fn mouse_drag(column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn down_inside_the_pane_starts_a_selection_at_pane_local_coordinates() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+
+        let selection = app.selection.as_ref().expect("a click inside the pane must start a selection");
+        assert_eq!(selection.agent_id, id_a, "selection belongs to the currently selected agent");
+        assert_eq!(selection.anchor, (15, 5), "column/row translated relative to pane_rect's origin (30, 0)");
+        assert_eq!(selection.cursor, selection.anchor);
+        assert!(selection.dragging);
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn down_outside_the_pane_does_not_start_a_selection() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+
+        start_pane_selection(&mut app, &layout, mouse_down(5, 2)); // lands in the tree, not the pane
+
+        assert!(app.selection.is_none());
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn down_while_a_modal_is_open_does_not_start_a_selection() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        app.input = Some(InputState { action: PendingAction::Search, buffer: String::new() });
+
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+
+        assert!(app.selection.is_none());
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn drag_extends_the_cursor_of_an_in_progress_selection() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+
+        update_pane_selection(&mut app, &layout, mouse_drag(50, 6));
+
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(selection.anchor, (15, 5));
+        assert_eq!(selection.cursor, (20, 6));
+        assert!(selection.dragging);
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn drag_past_the_pane_edge_clamps_to_the_edge_instead_of_losing_the_gesture() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+
+        // pane_rect is columns [30, 80), rows [0, 10) — well past both edges.
+        update_pane_selection(&mut app, &layout, mouse_drag(200, 200));
+
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(selection.cursor, (49, 9), "clamped to the pane's last column/row");
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn drag_with_no_selection_in_progress_is_a_noop() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+
+        update_pane_selection(&mut app, &layout, mouse_drag(50, 6));
+
+        assert!(app.selection.is_none());
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn releasing_after_a_real_drag_keeps_the_range_but_stops_dragging() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+        update_pane_selection(&mut app, &layout, mouse_drag(50, 6));
+
+        finish_pane_selection(&mut app);
+
+        let selection = app.selection.as_ref().expect("the finished range stays visible as a highlight");
+        assert_eq!(selection.anchor, (15, 5));
+        assert_eq!(selection.cursor, (20, 6));
+        assert!(!selection.dragging, "no longer in progress once released");
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn releasing_a_plain_click_with_no_movement_clears_the_selection() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+        // No Drag event arrives in between — a plain click, not a select.
+
+        finish_pane_selection(&mut app);
+
+        assert!(app.selection.is_none(), "a bare click must not leave a one-cell highlight behind");
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn a_second_click_starts_a_fresh_selection_over_the_previous_ones_highlight() {
+        let (mut app, ctx, id_a, id_b, layout) = app_with_two_live_agents_and_layout();
+        start_pane_selection(&mut app, &layout, mouse_down(45, 5));
+        update_pane_selection(&mut app, &layout, mouse_drag(50, 6));
+        finish_pane_selection(&mut app);
+        assert!(app.selection.is_some());
+
+        start_pane_selection(&mut app, &layout, mouse_down(60, 7));
+
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(selection.anchor, (30, 7), "the stale highlight is replaced, not merged with");
+        assert_eq!(selection.cursor, selection.anchor);
+        assert!(selection.dragging);
+
+        ctx.sessions.kill(&id_a);
+        ctx.sessions.kill(&id_b);
+    }
+
+    #[test]
+    fn finish_with_no_selection_at_all_is_a_noop() {
+        let (mut app, ctx, id_a, id_b, _layout) = app_with_two_live_agents_and_layout();
+
+        finish_pane_selection(&mut app); // must not panic
+
+        assert!(app.selection.is_none());
 
         ctx.sessions.kill(&id_a);
         ctx.sessions.kill(&id_b);

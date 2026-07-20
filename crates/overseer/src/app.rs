@@ -78,6 +78,22 @@ pub enum Backend {
     Daemon(DaemonState),
 }
 
+/// A mouse-driven pane text selection, in progress or just finished
+/// (mouse-native copy — see `overseer_core::selection`). `agent_id` pins it
+/// to the pane it was dragged against, so a stale selection from a
+/// since-deselected agent is dropped instead of misapplied — `tui::run_app`
+/// clears it whenever the selected agent changes, the same trigger that
+/// already resets scroll-to-bottom. Points are pane-local `(col, row)`.
+/// `dragging` is `true` from the initiating click until the matching
+/// button-up; once `false`, the range stays around only so the highlight
+/// remains visible (real-terminal behavior) until the next click clears it.
+pub struct PaneSelection {
+    pub agent_id: AgentId,
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
+    pub dragging: bool,
+}
+
 pub struct App {
     pub backend: Backend,
     pub tick: u64,
@@ -88,6 +104,7 @@ pub struct App {
     /// `?` popup (PHASE5B.md) — any key closes it; doesn't interact with
     /// `input`/`confirm` at all, so it can overlay either.
     pub show_help: bool,
+    pub selection: Option<PaneSelection>,
 }
 
 impl App {
@@ -108,6 +125,7 @@ impl App {
             status_message: None,
             focus: Focus::Tree,
             show_help: false,
+            selection: None,
         }
     }
 

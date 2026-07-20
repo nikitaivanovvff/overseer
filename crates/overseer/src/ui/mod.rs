@@ -99,6 +99,7 @@ pub fn render(
     confirm_text: Option<&str>,
     pane_grid: Option<&GridSnapshot>,
     pane_focused: bool,
+    pane_selection: Option<((u16, u16), (u16, u16))>,
     theme: &Theme,
     keybindings: &Keybindings,
     show_help: bool,
@@ -161,7 +162,8 @@ pub fn render(
         .collect();
     render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme, search_query);
     render_agent_detail(frame, left[1], &selected, theme);
-    let pane_rect = render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused);
+    let pane_rect =
+        render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused, pane_selection);
     render_status_bar(frame, status_line, outer[1]);
 
     // Drawn last, on top of everything. Search has no modal of its own — its
@@ -769,6 +771,7 @@ pub fn help_rows(kb: &Keybindings) -> Vec<HelpRow> {
         HelpRow { section: "MOUSE", key: "pane click".into(), label: "jump in" },
         HelpRow { section: "MOUSE", key: "wheel (tree)".into(), label: "scroll pane preview" },
         HelpRow { section: "MOUSE", key: "wheel (pane)".into(), label: "forward to agent, or scroll preview" },
+        HelpRow { section: "MOUSE", key: "drag (pane)".into(), label: "select text, copies to clipboard (OSC 52)" },
         HelpRow { section: "BADGES", key: "$/!".into(), label: "limit/permission attention; no badge may mean unsupported" },
     ]);
     rows
@@ -1574,7 +1577,7 @@ mod tests {
         for key in ["ctrl-u/ctrl-d", "ctrl-y/ctrl-e", "↑/↓", "G"] {
             assert!(rows.iter().any(|row| row.section == "SCROLLBACK (TREE FOCUS)" && row.key == key));
         }
-        for key in ["tree click", "pane click", "wheel (tree)", "wheel (pane)"] {
+        for key in ["tree click", "pane click", "wheel (tree)", "wheel (pane)", "drag (pane)"] {
             assert!(rows.iter().any(|row| row.section == "MOUSE" && row.key == key));
         }
     }
