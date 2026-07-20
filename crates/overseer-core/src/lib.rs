@@ -12,6 +12,7 @@ pub mod install;
 pub mod ipc;
 pub mod kill;
 pub mod notify;
+pub mod selection;
 pub mod session;
 pub mod settings;
 
