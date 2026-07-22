@@ -173,6 +173,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set child status failed");
@@ -189,6 +190,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok, "set root status failed");
@@ -234,6 +236,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
@@ -255,6 +258,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
@@ -376,6 +380,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(!resp.ok);
@@ -510,6 +515,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         match next_event(&mut reader) {
@@ -555,6 +561,7 @@ mod tests {
                 attention: None,
                 adapter: None,
                 branch: None,
+                repo: None,
                 pushed_at: std::time::SystemTime::now(),
             });
         }

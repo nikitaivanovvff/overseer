@@ -86,6 +86,19 @@ pub enum Request {
         /// reflect it.
         #[serde(default)]
         branch: Option<String>,
+        /// The pushing session's actual current repo, self-reported the same
+        /// way as `branch` — the git repo root's basename when the process's
+        /// cwd is inside one (stable across `cd`s within that repo, since it
+        /// comes from `git rev-parse --show-toplevel`), else the bare
+        /// directory's own basename. `None` leaves the node's existing value
+        /// untouched. Only ever sent by the pushing CLI when `$OVERSEER_ROLE
+        /// == "root"`, and only ever applied by the registry to a root node
+        /// — a workspace's tree label, static since `overseer start`, snaps
+        /// to the real repo the moment the first status push (e.g. a
+        /// harness's SessionStart-equivalent hook) fires from inside
+        /// whatever directory the bare shell was `cd`'d into.
+        #[serde(default)]
+        repo: Option<String>,
         /// Wall-clock time this push was captured at, client-side, as early
         /// as possible in the `overseer status` process's life (see
         /// `main.rs`) — not daemon-arrival time. Every hook fire is its own
@@ -226,6 +239,14 @@ pub enum AttachEvent {
         /// delta" posture as `adapter` — a push that didn't self-report one
         /// still broadcasts whatever the node already had.
         branch: String,
+        /// The node's current (merged) repo, same "definitive value, not a
+        /// delta" posture as `branch` — only ever actually changes for a
+        /// root/workspace node (see `AgentRegistry::set_status_update_with_model`).
+        repo: String,
+        /// The node's current (merged) display name — kept equal to `repo`
+        /// for a root node, otherwise the child's own given/task-derived
+        /// label, unaffected by this push.
+        name: String,
         /// See `AgentNode::session_alive` — the definitive value, applied
         /// directly by `app::apply_event` same as every other field here.
         session_alive: bool,
@@ -320,9 +341,31 @@ impl From<crate::agent::RegistryEvent> for AttachEvent {
         match event {
             RegistryEvent::Registered { agent } => AttachEvent::AgentRegistered { agent },
             RegistryEvent::Removed { agent_id } => AttachEvent::AgentRemoved { agent_id },
-            RegistryEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, branch, session_alive } => {
-                AttachEvent::StatusChanged { agent_id, status, message, context_pct, model_name, attention, adapter, branch, session_alive }
-            }
+            RegistryEvent::StatusChanged {
+                agent_id,
+                status,
+                message,
+                context_pct,
+                model_name,
+                attention,
+                adapter,
+                branch,
+                repo,
+                name,
+                session_alive,
+            } => AttachEvent::StatusChanged {
+                agent_id,
+                status,
+                message,
+                context_pct,
+                model_name,
+                attention,
+                adapter,
+                branch,
+                repo,
+                name,
+                session_alive,
+            },
             RegistryEvent::Shutdown => AttachEvent::Shutdown,
         }
     }
@@ -462,13 +505,14 @@ mod tests {
             attention: None,
             adapter: None,
             branch: Some("ovsr/auth".to_string()),
+            repo: Some("overseer".to_string()),
             pushed_at: std::time::SystemTime::now(),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(
-            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), model_name: Some(model), branch: Some(branch), .. }
-                if model == "anthropic/claude-sonnet-5" && branch == "ovsr/auth")
+            matches!(back, Request::Status { status: AgentStatus::Done, context_pct: Some(42), model_name: Some(model), branch: Some(branch), repo: Some(repo), .. }
+                if model == "anthropic/claude-sonnet-5" && branch == "ovsr/auth" && repo == "overseer")
         );
     }
 
@@ -488,6 +532,15 @@ mod tests {
         let raw = format!(r#"{{"cmd":"status","agent_id":"{}","status":"idle","message":null}}"#, id.0);
         let req: Request = serde_json::from_str(&raw).unwrap();
         assert!(matches!(req, Request::Status { branch: None, .. }));
+    }
+
+    #[test]
+    fn request_status_repo_defaults_to_none_when_absent() {
+        // Older callers (or a hand-written request) may omit repo entirely.
+        let id = AgentId::new();
+        let raw = format!(r#"{{"cmd":"status","agent_id":"{}","status":"idle","message":null}}"#, id.0);
+        let req: Request = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(req, Request::Status { repo: None, .. }));
     }
 
     #[test]

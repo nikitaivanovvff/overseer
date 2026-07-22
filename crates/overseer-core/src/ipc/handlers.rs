@@ -44,6 +44,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             attention,
             adapter,
             branch,
+            repo,
             pushed_at,
         } => {
             let attention = attention.map(|update| match update {
@@ -61,6 +62,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 clear_context,
                 model_name,
                 branch,
+                repo,
                 attention,
                 adapter,
                 pushed_at,
@@ -316,6 +318,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, req);
@@ -337,6 +340,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         };
         let resp = dispatch(&ctx, status_req);
@@ -364,6 +368,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: Some("ovsr/auth-module".to_string()),
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert!(resp.ok);
@@ -386,6 +391,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: Some("ovsr/auth-module".to_string()),
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         // A later push with no branch (e.g. detection failed for that one
@@ -400,6 +406,7 @@ mod tests {
             attention: None,
             adapter: None,
             branch: None,
+            repo: None,
             pushed_at: std::time::SystemTime::now(),
         });
         assert_eq!(ctx.registry.get(&child_id).unwrap().branch, "ovsr/auth-module");

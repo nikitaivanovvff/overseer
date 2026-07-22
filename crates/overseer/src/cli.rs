@@ -272,6 +272,19 @@ fn detect_current_branch(cwd: &std::path::Path) -> Option<String> {
     overseer_core::git::GitClient::new().current_branch(cwd).ok()
 }
 
+/// Self-reports the given cwd's repo: the git repo root's basename
+/// (`git rev-parse --show-toplevel`, mirroring `GitClient::repo_name`) when
+/// inside one — stable across `cd`s within that repo, since it's the root,
+/// not the cwd itself — else the bare directory's own basename via
+/// `dir_basename`, same "honest name over a faked one" fallback `Request::Start`
+/// already uses. Unlike `detect_current_branch`, this never returns `None`:
+/// there's always *some* honest directory name to report, even outside git.
+fn detect_current_repo(cwd: &std::path::Path) -> String {
+    overseer_core::git::GitClient::new()
+        .repo_name(cwd)
+        .unwrap_or_else(|_| overseer_core::git::dir_basename(cwd))
+}
+
 /// Returns `Ok(None)` for the Status command when `$OVERSEER_AGENT_ID` is unset,
 /// indicating a non-Overseer session where the hook should be a silent no-op.
 ///
@@ -325,6 +338,18 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
             if branch.is_none() {
                 branch = std::env::current_dir().ok().and_then(|cwd| detect_current_branch(&cwd));
             }
+            // Only a root/workspace ever self-reports a repo/name top-up — a
+            // child's `repo` is fixed at spawn time and its `name` is a
+            // given/task-derived label, neither of which should drift just
+            // because a status push happened to fire from some other
+            // directory (e.g. a worktree the child set up for itself). Gated
+            // here, not in the registry alone, so a child's own hook fires
+            // don't even pay for the extra `git` subprocess call.
+            let repo = if std::env::var("OVERSEER_ROLE").ok().as_deref() == Some("root") {
+                std::env::current_dir().ok().map(|cwd| detect_current_repo(&cwd))
+            } else {
+                None
+            };
             let attention = match (attention, clear_attention) {
                 (Some(_), Some(_)) => return Err(anyhow::anyhow!("--attention and --clear-attention are mutually exclusive")),
                 (Some(kind), None) => Some(AttentionUpdate::Set {
@@ -349,6 +374,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 attention,
                 adapter,
                 branch,
+                repo,
                 pushed_at,
             }))
         }
@@ -459,6 +485,79 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         assert!(branch.is_none(), "a non-git directory must not report a fake branch");
+    }
+
+    // ── repo self-report ─────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_current_repo_reads_the_repo_roots_basename_even_from_a_subdirectory() {
+        let dir = std::env::temp_dir().join(format!("overseer-test-repo-detect-{}", AgentId::new()));
+        let subdir = dir.join("src").join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q", "."]).current_dir(&dir).status().unwrap().success());
+
+        // Detected from deep inside the repo, not its own root -- stays
+        // pinned to the repo's own directory name (`git rev-parse
+        // --show-toplevel`), never the subdirectory being cd'd into.
+        let repo = detect_current_repo(&subdir);
+
+        let expected = dir.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(repo, expected);
+    }
+
+    #[test]
+    fn detect_current_repo_non_git_dir_falls_back_to_the_bare_directory_name() {
+        let dir = std::env::temp_dir().join(format!("overseer-test-repo-detect-non-git-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let repo = detect_current_repo(&dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(repo, dir.file_name().unwrap().to_string_lossy(), "outside git, the bare directory name is always honest, never a fake");
+    }
+
+    #[test]
+    fn build_request_status_self_reports_repo_only_for_a_root() {
+        let id = AgentId::new();
+        let _env = EnvGuard::set_all(&[("OVERSEER_AGENT_ID", &id.0.to_string()), ("OVERSEER_ROLE", "root")]);
+        let cmd = Command::Status {
+            status: StatusArg::Running,
+            message: None,
+            from_hook: false,
+            adapter: None,
+            attention: None,
+            clear_attention: None,
+            retry_after: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            branch: None,
+        };
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
+        let expected = detect_current_repo(&std::env::current_dir().unwrap());
+        assert!(matches!(req, Request::Status { repo: Some(r), .. } if r == expected));
+    }
+
+    #[test]
+    fn build_request_status_never_self_reports_repo_for_a_child() {
+        let id = AgentId::new();
+        let _env = EnvGuard::set_all(&[("OVERSEER_AGENT_ID", &id.0.to_string()), ("OVERSEER_ROLE", "child")]);
+        let cmd = Command::Status {
+            status: StatusArg::Running,
+            message: None,
+            from_hook: false,
+            adapter: None,
+            attention: None,
+            clear_attention: None,
+            retry_after: None,
+            context_pct: None,
+            model_name: None,
+            clear_context: false,
+            branch: None,
+        };
+        let req = build_request(cmd, std::time::SystemTime::now()).unwrap().unwrap();
+        assert!(matches!(req, Request::Status { repo: None, .. }), "a child must never self-report a repo/name change");
     }
 
     #[test]

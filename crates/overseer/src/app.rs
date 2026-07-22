@@ -342,7 +342,7 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
         AttachEvent::AgentRemoved { agent_id } => {
             state.tree.remove(&agent_id);
         }
-        AttachEvent::StatusChanged { agent_id, status, context_pct, model_name, attention, adapter, branch, session_alive, message: _ } => {
+        AttachEvent::StatusChanged { agent_id, status, context_pct, model_name, attention, adapter, branch, repo, name, session_alive, message: _ } => {
             if let Some(node) = state.tree.find_mut(&agent_id) {
                 // Same "compare before overwrite" rule as the registry
                 // itself (ATTENTION.md) — a repeated same-status push must
@@ -362,6 +362,8 @@ fn apply_event(state: &mut DaemonState, event: AttachEvent) {
                 node.attention = attention;
                 node.adapter = adapter;
                 node.branch = branch;
+                node.repo = repo;
+                node.name = name;
                 node.session_alive = session_alive;
             }
         }
@@ -654,6 +656,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: true,
         });
         let node = state.tree.find(&root_id).unwrap();
@@ -677,6 +681,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: true,
         });
 
@@ -701,6 +707,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: true,
         });
 
@@ -740,6 +748,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: true,
         });
         apply_event(&mut state, AttachEvent::StatusChanged {
@@ -751,6 +761,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: true,
         });
         assert_eq!(state.tree.find(&root_id).unwrap().context_pct, None);
@@ -885,6 +897,8 @@ mod tests {
             attention: None,
             adapter: "claude".to_string(),
             branch: "main".to_string(),
+            repo: "overseer".to_string(),
+            name: "agent".to_string(),
             session_alive: false,
         });
         let app = App::new_daemon_state_for_test(state);

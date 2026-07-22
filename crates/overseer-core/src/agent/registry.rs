@@ -33,6 +33,16 @@ pub enum RegistryEvent {
         /// The node's current (merged) branch — same "definitive value, not
         /// a delta" posture as `adapter`.
         branch: String,
+        /// The node's current (merged) repo — same "definitive value, not a
+        /// delta" posture as `branch`. Only ever changes for a root/workspace
+        /// node (see `set_status_update_with_model`); a child's `repo` is
+        /// fixed at spawn time and simply echoed back unchanged.
+        repo: String,
+        /// The node's current (merged) display name — kept equal to `repo`
+        /// for a root node (a workspace is always named after its repo), and
+        /// otherwise just echoed back unchanged for a child, whose name is
+        /// its given/task-derived label and is never touched here.
+        name: String,
         /// See `AgentNode::session_alive`. Carried on every `StatusChanged`
         /// broadcast (not just ones from `mark_session_exited`) so a client
         /// applying this event as the definitive value (`app::apply_event`)
@@ -264,6 +274,7 @@ impl AgentRegistry {
             clear_context,
             None,
             None,
+            None,
             attention_update,
             adapter,
             pushed_at,
@@ -275,6 +286,22 @@ impl AgentRegistry {
     /// value untouched, a non-empty value replaces it. Self-reported by the
     /// pushing agent's own hook/plugin (`Request::Status.branch`) — the
     /// registry never guesses or synthesizes one.
+    ///
+    /// `repo` follows the same posture but is additionally gated on role:
+    /// it only ever updates a **root** node's `repo` (and, kept in lockstep,
+    /// `name` — a workspace is always named after its repo, same invariant
+    /// `spawn_root` establishes at registration). A child's `repo`/`name` are
+    /// never touched here even if a caller passes one — a child's worktree
+    /// commonly lives in a sibling directory with its own git root, so
+    /// self-reporting from cwd the way root does would rename it to its own
+    /// worktree instead of the workspace it belongs to, and its `name` is a
+    /// given/task-derived label that must never drift on its own. This is
+    /// the same "live top-up" mechanism as `branch`: a workspace's name,
+    /// static since `overseer start`, corrects itself the moment the first
+    /// real status push (e.g. a harness's SessionStart-equivalent hook)
+    /// fires from inside whatever directory the user `cd`'d the bare shell
+    /// into — not on every `cd` itself, since Overseer has no push signal
+    /// for a bare shell with nothing running inside it yet.
     #[allow(clippy::too_many_arguments)]
     pub fn set_status_update_with_model(
         &self,
@@ -285,6 +312,7 @@ impl AgentRegistry {
         clear_context: bool,
         model_name: Option<String>,
         branch: Option<String>,
+        repo: Option<String>,
         attention_update: Option<AttentionUpdate>,
         adapter: Option<String>,
         pushed_at: std::time::SystemTime,
@@ -321,6 +349,12 @@ impl AgentRegistry {
                         if let Some(branch) = branch.filter(|b| !b.trim().is_empty()) {
                             node.branch = branch;
                         }
+                        if let Some(repo) = repo.filter(|r| !r.trim().is_empty()) {
+                            if node.role == AgentRole::Root {
+                                node.repo = repo.clone();
+                                node.name = repo;
+                            }
+                        }
                         match attention_update {
                             Some(AttentionUpdate::Set { attention }) => node.attention = Some(attention),
                             Some(AttentionUpdate::Clear { kind }) => {
@@ -348,6 +382,8 @@ impl AgentRegistry {
                             node.attention.clone(),
                             node.adapter.clone(),
                             node.branch.clone(),
+                            node.repo.clone(),
+                            node.name.clone(),
                             node.session_alive,
                         ))
                     }
@@ -355,8 +391,17 @@ impl AgentRegistry {
                 None => return Err(RegistryError::UnknownAgent(id.clone())),
             }
         };
-        let Some((new_status, new_context_pct, new_model_name, new_attention, new_adapter, new_branch, session_alive)) =
-            applied
+        let Some((
+            new_status,
+            new_context_pct,
+            new_model_name,
+            new_attention,
+            new_adapter,
+            new_branch,
+            new_repo,
+            new_name,
+            session_alive,
+        )) = applied
         else {
             return Ok(());
         };
@@ -373,6 +418,8 @@ impl AgentRegistry {
             attention: new_attention,
             adapter: new_adapter,
             branch: new_branch,
+            repo: new_repo,
+            name: new_name,
             session_alive,
         });
         Ok(())
@@ -411,12 +458,14 @@ impl AgentRegistry {
                         node.attention.clone(),
                         node.adapter.clone(),
                         node.branch.clone(),
+                        node.repo.clone(),
+                        node.name.clone(),
                     ))
                 }
                 _ => None,
             }
         };
-        let Some((status, context_pct, model_name, attention, adapter, branch)) = applied else {
+        let Some((status, context_pct, model_name, attention, adapter, branch, repo, name)) = applied else {
             return;
         };
         let _ = self.events.send(RegistryEvent::StatusChanged {
@@ -428,6 +477,8 @@ impl AgentRegistry {
             attention,
             adapter,
             branch,
+            repo,
+            name,
             session_alive: false,
         });
     }
@@ -614,6 +665,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -638,6 +690,7 @@ mod tests {
             Some("ovsr/auth-module".to_string()),
             None,
             None,
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -656,6 +709,7 @@ mod tests {
             false,
             None,
             Some("ovsr/auth-module".to_string()),
+            None,
             None,
             None,
             std::time::SystemTime::now(),
@@ -682,6 +736,7 @@ mod tests {
             Some("ovsr/auth-module".to_string()),
             None,
             None,
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -693,6 +748,7 @@ mod tests {
             false,
             None,
             Some("   ".to_string()),
+            None,
             None,
             None,
             std::time::SystemTime::now(),
@@ -716,11 +772,158 @@ mod tests {
             Some("ovsr/auth-module".to_string()),
             None,
             None,
+            None,
             std::time::SystemTime::now(),
         )
         .unwrap();
         match rx.try_recv().unwrap() {
             RegistryEvent::StatusChanged { branch, .. } => assert_eq!(branch, "ovsr/auth-module"),
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    // ── repo/name self-report (mirrors branch above, root-only) ──────────────
+
+    #[test]
+    fn set_status_update_with_model_updates_repo_and_name_for_a_root() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("projects")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some("overseer".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.repo, "overseer");
+        assert_eq!(dto.name, "overseer", "a workspace's tree label follows its repo");
+    }
+
+    #[test]
+    fn repo_persists_across_lifecycle_only_pushes() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("projects")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some("overseer".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        // A later push that doesn't self-report a repo (e.g. a plain
+        // PostToolUse hook) must not revert the name back to the stale one.
+        reg.set_status(&result.id, AgentStatus::Idle, None, None, None, std::time::SystemTime::now())
+            .unwrap();
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.repo, "overseer");
+        assert_eq!(dto.name, "overseer");
+    }
+
+    #[test]
+    fn blank_repo_push_is_ignored() {
+        let reg = AgentRegistry::new();
+        // `make_register_root` hardcodes `repo: "overseer"` regardless of the
+        // name given, matching the real `spawn_root` invariant that a root's
+        // `name` and `repo` start equal.
+        let result = reg.register(make_register_root("overseer")).unwrap();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some("   ".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.repo, "overseer", "an all-whitespace repo must not overwrite the registered one");
+        assert_eq!(dto.name, "overseer");
+    }
+
+    #[test]
+    fn repo_push_never_touches_a_childs_repo_or_name() {
+        // A child's `repo` is fixed at spawn (inherited from its parent) and
+        // its `name` is a given/task-derived label — self-reporting a repo
+        // from a child's own cwd (commonly a sibling worktree with its own
+        // git root) must never rename it to that worktree.
+        let reg = AgentRegistry::new();
+        let root = reg.register(make_register_root("overseer")).unwrap();
+        let child = reg
+            .register(RegisterArgs {
+                id: None,
+                name: "auth-module".to_string(),
+                role: AgentRole::Child,
+                parent_id: Some(root.id.clone()),
+                adapter: "claude".to_string(),
+                repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
+                branch: None,
+                initial_status: AgentStatus::Running,
+            })
+            .unwrap();
+        reg.set_status_update_with_model(
+            &child.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some("overseer-auth-module".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let dto = reg.get(&child.id).unwrap();
+        assert_eq!(dto.repo, "overseer", "a child's repo must stay the workspace it belongs to");
+        assert_eq!(dto.name, "auth-module", "a child's name is its given label, never repo-derived");
+    }
+
+    #[test]
+    fn status_changed_broadcast_carries_the_current_repo_and_name() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("projects")).unwrap();
+        let mut rx = reg.subscribe();
+        reg.set_status_update_with_model(
+            &result.id,
+            AgentStatus::Running,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some("overseer".to_string()),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            RegistryEvent::StatusChanged { repo, name, .. } => {
+                assert_eq!(repo, "overseer");
+                assert_eq!(name, "overseer");
+            }
             other => panic!("expected StatusChanged, got {other:?}"),
         }
     }
