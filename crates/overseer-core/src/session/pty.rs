@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,6 +27,76 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// real pane rect (overwritten by the first `resize_all`).
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_LINES: usize = 24;
+
+/// Returns `pid`'s current working directory by reading it directly from the
+/// OS — no cooperation from the process itself required, so this works for a
+/// bare shell with nothing agent-side running in it at all. This is the
+/// mechanism behind `SessionManager::pty_cwd`: Overseer already owns this
+/// PTY's child process, so it can just ask the kernel where it is instead of
+/// waiting on any agent hook to self-report (AGENTS.md "Agent Awareness" —
+/// this is the OS-truth counterpart to that self-reported top-up, not a
+/// replacement for it: a child's worktree branch still has no OS-level
+/// equivalent to read, since "current directory" and "git branch" aren't the
+/// same fact).
+///
+/// `None` on any failure (process gone, permission denied, platform
+/// unsupported) — callers must treat this exactly like a git-detection
+/// failure elsewhere in this codebase: keep whatever value is already known
+/// rather than erroring.
+#[cfg(target_os = "linux")]
+fn os_process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// macOS has no procfs, so this goes through `proc_pidinfo(PROC_PIDVNODEPATHINFO)`
+/// instead — the same libproc call real Alacritty (the terminal emulator, not
+/// the `alacritty_terminal` library this module already depends on) uses for
+/// its own "open a new window in the same directory" feature. `libc` is
+/// already a workspace dependency (`libc::kill` elsewhere in this file), and
+/// it already vendors the exact struct layout Darwin's headers define, so
+/// this doesn't risk hand-rolled FFI struct drift.
+#[cfg(target_os = "macos")]
+fn os_process_cwd(pid: u32) -> Option<PathBuf> {
+    // SAFETY: `info` is a plain-old-data struct of fixed-width ints/arrays
+    // (no pointers, no invariants beyond "some bytes") — zero-initializing
+    // it is always valid, and `proc_pidinfo` is documented to either fill it
+    // completely or report failure via its return value, which is checked
+    // below before any field is read.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `written == size` above confirms the kernel filled the whole
+    // struct, `vip_path` included, so reinterpreting its nested char arrays
+    // as one flat byte run of the same total length reads only initialized
+    // memory.
+    let path_bytes = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr() as *const u8,
+            std::mem::size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let end = path_bytes.iter().position(|&b| b == 0)?;
+    if end == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf8_lossy(&path_bytes[..end]).into_owned()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
 
 /// Every agent PTY is sized to the single, shared live-pane rect — there are
 /// no per-agent sizes.
@@ -313,6 +383,17 @@ impl SessionManager {
                 .get(id)
                 .is_some_and(|s| s.alive.load(Ordering::Relaxed)),
         }
+    }
+
+    /// The OS-level current working directory of `id`'s PTY child process
+    /// itself — read straight from the kernel (`os_process_cwd`), not from
+    /// anything the process running inside it has reported. `None` for an
+    /// unknown/dry-run id or an unsupported platform. This is what lets a
+    /// workspace's location correct itself the instant a bare shell `cd`s
+    /// around, with no agent (and no hook) involved at all.
+    pub fn pty_cwd(&self, id: &AgentId) -> Option<PathBuf> {
+        let pid = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(id)?.pid;
+        os_process_cwd(pid)
     }
 
     /// Resizes every live session to `(cols, lines)` and remembers it as the
@@ -776,6 +857,60 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("kill() must not block forever on a child that ignores HUP/TERM");
         assert!(!s.is_alive(&id));
+    }
+
+    // ── pty_cwd (OS-level, agent-independent cwd tracking) ───────────────────
+
+    #[test]
+    fn pty_cwd_is_none_for_an_unknown_id() {
+        let s = SessionManager::dry_run();
+        assert!(s.pty_cwd(&AgentId::new()).is_none());
+    }
+
+    #[test]
+    fn pty_cwd_reports_the_launch_directory() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        let cmd = Command::new("/bin/sh");
+        // canonicalize: macOS's /tmp is itself a symlink (-> /private/tmp),
+        // and the OS reports the resolved path, not whatever alias we launched
+        // through.
+        let launch_dir = std::fs::canonicalize("/tmp").unwrap();
+        s.launch(id.clone(), &launch_dir, &cmd, &HashMap::new()).unwrap();
+
+        assert_eq!(s.pty_cwd(&id), Some(launch_dir));
+        s.kill(&id);
+    }
+
+    #[test]
+    fn pty_cwd_reflects_a_later_cd_with_no_agent_involved() {
+        let s = SessionManager::new();
+        let id = AgentId::new();
+        // Two distinct, freshly created directories -- not `/tmp` vs
+        // `std::env::temp_dir()`, which resolve to the *same* path on Linux
+        // (both just `/tmp`), which would make the `cd` below a no-op.
+        let base = std::env::temp_dir().join(format!("ovsr-pty-cwd-test-{}", id.short()));
+        let start_dir = base.join("start");
+        let target_dir = base.join("target");
+        std::fs::create_dir_all(&start_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let start_dir = std::fs::canonicalize(&start_dir).unwrap();
+        let target_dir = std::fs::canonicalize(&target_dir).unwrap();
+        let cmd = Command::new("/bin/sh");
+        s.launch(id.clone(), &start_dir, &cmd, &HashMap::new()).unwrap();
+        assert_eq!(s.pty_cwd(&id), Some(start_dir));
+
+        // Nothing but a plain shell `cd` -- no hook, no push, no agent.
+        s.write(&id, format!("cd {}\r", target_dir.display()).into_bytes());
+
+        let moved = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.pty_cwd(&id).as_deref() == Some(target_dir.as_path())
+        });
+        assert!(moved, "pty_cwd must observe a plain `cd` with nothing agent-side involved");
+
+        s.kill(&id);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── generation / grid_snapshot ────────────────────────────────────────────

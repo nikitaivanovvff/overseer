@@ -425,6 +425,92 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// OS-truth top-up for a root/workspace's `cwd`/`repo`/`name`/`branch` —
+    /// the counterpart to `set_status_update_with_model`'s self-reported
+    /// top-up above, but driven by the daemon directly reading the PTY
+    /// process's own current directory (`SessionManager::pty_cwd`,
+    /// `ipc::server::sync_workspace_locations`) instead of waiting on any
+    /// agent hook to fire. This is what lets a workspace's location correct
+    /// itself the instant a bare shell `cd`s around, before any agent even
+    /// runs inside it.
+    ///
+    /// Root-gated for the same reason `set_status_update_with_model`'s own
+    /// `repo`/`name` top-up is: a child's worktree commonly lives in a
+    /// sibling directory with its own git root, so tracking its PTY's cwd the
+    /// way a workspace's is tracked would misname it after that worktree.
+    /// No-op (and no broadcast) for an unknown id, a non-root node, or a call
+    /// where nothing actually changed — the caller (`sync_workspace_locations`)
+    /// runs on every live root every tick, so a silent no-op on the common
+    /// "nothing moved" case is what keeps this from spamming attach clients.
+    ///
+    /// `repo`/`branch` follow the same "preserve last known value" posture as
+    /// everywhere else in this file: `None` (git detection failed for the new
+    /// cwd — not a git repo, `git` missing) leaves the existing value alone;
+    /// only `cwd` itself is unconditional, since the OS is always right about
+    /// where the process actually is.
+    pub fn sync_workspace_location(
+        &self,
+        id: &AgentId,
+        cwd: PathBuf,
+        repo: Option<String>,
+        branch: Option<String>,
+    ) {
+        let applied = {
+            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.find_mut(id) {
+                Some(node) if node.role == AgentRole::Root => {
+                    let mut changed = node.cwd != cwd;
+                    node.cwd = cwd;
+                    if let Some(repo) = repo.filter(|r| !r.trim().is_empty()) {
+                        if node.repo != repo {
+                            node.repo = repo.clone();
+                            node.name = repo;
+                            changed = true;
+                        }
+                    }
+                    if let Some(branch) = branch.filter(|b| !b.trim().is_empty()) {
+                        if node.branch != branch {
+                            node.branch = branch;
+                            changed = true;
+                        }
+                    }
+                    changed.then(|| {
+                        (
+                            node.status.clone(),
+                            node.context_pct,
+                            node.model_name.clone(),
+                            node.attention.clone(),
+                            node.adapter.clone(),
+                            node.branch.clone(),
+                            node.repo.clone(),
+                            node.name.clone(),
+                            node.session_alive,
+                        )
+                    })
+                }
+                _ => None,
+            }
+        };
+        let Some((status, context_pct, model_name, attention, adapter, branch, repo, name, session_alive)) =
+            applied
+        else {
+            return;
+        };
+        let _ = self.events.send(RegistryEvent::StatusChanged {
+            agent_id: id.clone(),
+            status,
+            message: None,
+            context_pct,
+            model_name,
+            attention,
+            adapter,
+            branch,
+            repo,
+            name,
+            session_alive,
+        });
+    }
+
     /// Records that `id`'s PTY has actually exited — the *only* writer of
     /// `AgentNode::session_alive`, called unconditionally by the daemon's
     /// exit-code sweep (`ipc::server::sweep_exited_sessions`) for every id
@@ -926,6 +1012,123 @@ mod tests {
             }
             other => panic!("expected StatusChanged, got {other:?}"),
         }
+    }
+
+    // ── sync_workspace_location (OS-truth cwd/repo/branch top-up) ────────────
+
+    #[test]
+    fn sync_workspace_location_updates_cwd_repo_name_and_branch_for_a_root() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("overseer")).unwrap();
+        reg.sync_workspace_location(
+            &result.id,
+            PathBuf::from("/Users/nikita/projects/gh-view"),
+            Some("gh-view".to_string()),
+            Some("main".to_string()),
+        );
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.repo, "gh-view");
+        assert_eq!(dto.name, "gh-view");
+        assert_eq!(dto.branch, "main");
+        assert_eq!(dto.cwd, PathBuf::from("/Users/nikita/projects/gh-view"));
+    }
+
+    #[test]
+    fn sync_workspace_location_is_a_noop_for_a_child() {
+        let reg = AgentRegistry::new();
+        let root = reg.register(make_register_root("overseer")).unwrap();
+        let child = reg
+            .register(RegisterArgs {
+                id: None,
+                name: "auth-module".to_string(),
+                role: AgentRole::Child,
+                parent_id: Some(root.id.clone()),
+                adapter: "claude".to_string(),
+                repo: "overseer".to_string(),
+                cwd: PathBuf::from("."),
+                branch: None,
+                initial_status: AgentStatus::Running,
+            })
+            .unwrap();
+        reg.sync_workspace_location(
+            &child.id,
+            PathBuf::from("/some/sibling-worktree"),
+            Some("sibling-worktree".to_string()),
+            Some("ovsr/auth-module".to_string()),
+        );
+        let dto = reg.get(&child.id).unwrap();
+        assert_eq!(dto.repo, "overseer", "a child's repo must never be touched by cwd tracking");
+        assert_eq!(dto.name, "auth-module");
+        assert_eq!(dto.branch, "", "a child's branch stays self-reported, not OS-tracked");
+    }
+
+    #[test]
+    fn sync_workspace_location_none_repo_or_branch_preserves_existing_values() {
+        // Mirrors the self-report "preserve last known value" convention:
+        // a `cwd` that moved but where git detection failed for the new
+        // directory (not a repo, `git` missing) must not blank out an
+        // already-known repo/branch.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("overseer")).unwrap();
+        reg.sync_workspace_location(
+            &result.id,
+            PathBuf::from("/Users/nikita/projects/gh-view"),
+            Some("gh-view".to_string()),
+            Some("main".to_string()),
+        );
+        reg.sync_workspace_location(&result.id, PathBuf::from("/tmp/not-a-repo"), None, None);
+        let dto = reg.get(&result.id).unwrap();
+        assert_eq!(dto.repo, "gh-view");
+        assert_eq!(dto.branch, "main");
+        assert_eq!(dto.cwd, PathBuf::from("/tmp/not-a-repo"), "cwd itself is unconditional -- the OS is always right");
+    }
+
+    #[test]
+    fn sync_workspace_location_does_not_broadcast_when_nothing_changed() {
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("overseer")).unwrap();
+        let cwd = PathBuf::from(".");
+        // Same cwd/repo/branch already on the node (repo registered as
+        // "overseer", branch "main" by `make_register_root`/`register`).
+        reg.sync_workspace_location(&result.id, cwd, Some("overseer".to_string()), Some("main".to_string()));
+        let mut rx = reg.subscribe();
+        reg.sync_workspace_location(
+            &result.id,
+            PathBuf::from("."),
+            Some("overseer".to_string()),
+            Some("main".to_string()),
+        );
+        assert!(rx.try_recv().is_err(), "an unchanged sync must not broadcast");
+    }
+
+    #[test]
+    fn sync_workspace_location_broadcasts_when_cwd_alone_changes() {
+        // Cosmetically identical repo/branch, but a different `cwd` (e.g. a
+        // `cd` within the same repo's subdirectory back to its root) must
+        // still be recorded and broadcast -- `TuiSpawnChild` reads `cwd`
+        // directly off the node for where to launch a manually spawned
+        // child, so a stale value there is a real functional bug, not just
+        // a display one.
+        let reg = AgentRegistry::new();
+        let result = reg.register(make_register_root("overseer")).unwrap();
+        let mut rx = reg.subscribe();
+        reg.sync_workspace_location(
+            &result.id,
+            PathBuf::from("/Users/nikita/projects/overseer/crates"),
+            Some("overseer".to_string()),
+            Some("main".to_string()),
+        );
+        assert!(rx.try_recv().is_ok(), "a cwd-only change must still broadcast");
+        assert_eq!(
+            reg.get(&result.id).unwrap().cwd,
+            PathBuf::from("/Users/nikita/projects/overseer/crates")
+        );
+    }
+
+    #[test]
+    fn sync_workspace_location_unknown_id_does_not_panic() {
+        let reg = AgentRegistry::new();
+        reg.sync_workspace_location(&AgentId::new(), PathBuf::from("/tmp"), None, None);
     }
 
     #[test]

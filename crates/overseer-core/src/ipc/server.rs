@@ -9,7 +9,8 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-use crate::agent::{drop::drop_agent, AgentRegistry, AgentRole, AgentStatus};
+use crate::agent::{drop::drop_agent, AgentId, AgentRegistry, AgentRole, AgentStatus};
+use crate::git::GitClient;
 use crate::ipc::{
     handlers::{dispatch, AppCtx},
     protocol::{AttachEvent, Request, Response, MAX_WRITE_DATA_BYTES},
@@ -160,6 +161,7 @@ pub async fn run(
 
     if ctx.watch_sessions {
         tokio::spawn(session_watcher(ctx.clone()));
+        tokio::spawn(workspace_location_watcher(ctx.clone()));
     }
 
     // Bounds in-flight connections (SECURITY-AUDIT.md F9): without this, any
@@ -704,6 +706,64 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     }
 }
 
+/// How often the daemon re-checks every live workspace's PTY-owned process
+/// for a changed working directory. Not urgent the way `session_watcher`'s
+/// exit detection is (nothing looks broken while this lags a moment) — just
+/// frequent enough that "`cd`, then look at the tree" reads as instant. The
+/// OS-level read itself (`SessionManager::pty_cwd`) is a single cheap
+/// syscall; the `git` subprocesses it can trigger only run when that check
+/// finds a real change (`sync_workspace_locations`), so this interval never
+/// turns into a `git` spawn per tick for an idle fleet of workspaces.
+const WORKSPACE_LOCATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Background task: periodically re-syncs every live workspace's `cwd`/
+/// `repo`/`branch`/`name` from the OS truth of its own PTY process — the
+/// agent-independent counterpart to the self-reported top-up in
+/// `AgentRegistry::set_status_update_with_model` (AGENTS.md "Agent
+/// Awareness"). Spawned alongside `session_watcher`, gated by the same
+/// `ctx.watch_sessions` flag (off in `--mock`/tests, which have no real PTYs
+/// for `pty_cwd` to read anyway).
+async fn workspace_location_watcher(ctx: Arc<AppCtx>) {
+    loop {
+        tokio::time::sleep(WORKSPACE_LOCATION_POLL_INTERVAL).await;
+
+        let sessions = ctx.sessions.clone();
+        let registry = ctx.registry.clone();
+        let git = ctx.git.clone();
+        tokio::task::spawn_blocking(move || sync_workspace_locations(&registry, &sessions, &git))
+            .await
+            .ok();
+    }
+}
+
+/// One tick: for every live root (workspace), reads its PTY child's own
+/// current directory straight from the OS and, only when that directory
+/// actually moved since the node's last known `cwd`, re-derives `repo`/
+/// `branch` via the same `GitClient` calls `Request::Start` uses at
+/// registration time and applies them (`AgentRegistry::sync_workspace_location`).
+/// The cheap OS-level read runs every tick for every live root; the `git`
+/// subprocesses only run on an actual change, so an idle fleet of
+/// workspaces costs nothing beyond one syscall per root per tick.
+fn sync_workspace_locations(registry: &AgentRegistry, sessions: &SessionManager, git: &GitClient) {
+    let root_ids: Vec<AgentId> = registry.with_tree(|tree| {
+        tree.flatten()
+            .into_iter()
+            .filter(|node| node.role == AgentRole::Root && node.session_alive)
+            .map(|node| node.id)
+            .collect()
+    });
+    for id in root_ids {
+        let Some(cwd) = sessions.pty_cwd(&id) else { continue };
+        let Some(current) = registry.get(&id) else { continue };
+        if current.cwd == cwd {
+            continue;
+        }
+        let repo = git.repo_name(&cwd).ok();
+        let branch = git.current_branch(&cwd).ok();
+        registry.sync_workspace_location(&id, cwd, repo, branch);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,5 +1077,102 @@ mod tests {
         assert_eq!(root.status, AgentStatus::Error);
         let child = registry.get(&child_id).expect("live child must survive the parent's sweep");
         assert_eq!(child.status, AgentStatus::Spawning, "live child's own status must be untouched");
+    }
+
+    // ── sync_workspace_locations (OS-truth cwd/repo/branch watcher) ──────────
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    #[test]
+    fn sync_workspace_locations_updates_repo_branch_and_cwd_after_a_real_cd() {
+        // End-to-end: a real PTY, a real plain-shell `cd` (no agent, no hook,
+        // no push involved at all), a real `git` subprocess -- exactly the
+        // reported scenario of a workspace launched in one repo, then `cd`'d
+        // into another before any agent ever ran inside it.
+        //
+        // Forces `$SHELL` to `/bin/sh` for determinism: `spawn_root` launches
+        // whatever the test runner's own `$SHELL` is (e.g. an interactive
+        // zsh with a slow-starting prompt framework), which can take well
+        // over a second to become ready for input -- `/bin/sh` starts
+        // instantly and is what the equivalent `session::pty` test already
+        // validates this same OS-level read against.
+        let _env = crate::test_env::EnvGuard::set("SHELL", "/bin/sh");
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::new();
+        let config = Config::default();
+
+        let base = std::env::temp_dir().join(format!("ovsr-sync-loc-test-{}", uuid::Uuid::new_v4()));
+        let repo_a = base.join("repo-a");
+        let repo_b = base.join("repo-b");
+        for dir in [&repo_a, &repo_b] {
+            std::fs::create_dir_all(dir).unwrap();
+            run_git(dir, &["init", "-q"]);
+            run_git(
+                dir,
+                &["-c", "user.email=test@test.com", "-c", "user.name=test", "commit", "--allow-empty", "-q", "-m", "init"],
+            );
+        }
+        run_git(&repo_b, &["checkout", "-q", "-b", "feature-x"]);
+        let repo_a = std::fs::canonicalize(&repo_a).unwrap();
+        let repo_b = std::fs::canonicalize(&repo_b).unwrap();
+
+        let root = spawn_agent(
+            &registry,
+            &sessions,
+            &PathBuf::from("/tmp/overseer.sock"),
+            &config,
+            SpawnRequest {
+                role: AgentRole::Root,
+                parent_id: None,
+                task: String::new(),
+                name: None,
+                adapter_name: String::new(),
+                cwd: repo_a.clone(),
+                repo: "repo-a".to_string(),
+                branch: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(registry.get(&root.id).unwrap().repo, "repo-a");
+
+        sessions.write(&root.id, format!("cd {}\r", repo_b.display()).into_bytes());
+
+        let moved = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sessions.pty_cwd(&root.id).as_deref() == Some(repo_b.as_path())
+        });
+        assert!(moved, "the real shell must have cd'd into repo_b by now");
+
+        sync_workspace_locations(&registry, &sessions, &GitClient::new());
+
+        let dto = registry.get(&root.id).unwrap();
+        assert_eq!(dto.repo, "repo-b", "repo must follow the shell's real cd, no agent involved");
+        assert_eq!(dto.name, "repo-b");
+        assert_eq!(dto.branch, "feature-x");
+        assert_eq!(dto.cwd, repo_b);
+
+        sessions.kill(&root.id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sync_workspace_locations_dry_run_sessions_is_a_harmless_noop() {
+        // `pty_cwd` always returns `None` in dry-run mode (no real PTY to
+        // read) -- must skip cleanly rather than panic or spuriously wipe
+        // out the node's already-registered values.
+        let registry = AgentRegistry::new();
+        let sessions = SessionManager::dry_run();
+        let root_id = spawn(&registry, &sessions, AgentRole::Root, None);
+        let before = registry.get(&root_id).unwrap();
+
+        sync_workspace_locations(&registry, &sessions, &GitClient::new());
+
+        let after = registry.get(&root_id).unwrap();
+        assert_eq!(before.cwd, after.cwd);
+        assert_eq!(before.repo, after.repo);
+        assert_eq!(before.branch, after.branch);
     }
 }
