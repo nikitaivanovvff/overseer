@@ -8,14 +8,6 @@ const ROOT_SKILL_PATH: &str = "skills/overseer-root/SKILL.md";
 const CHILD_SKILL_PATH: &str = "skills/overseer-child/SKILL.md";
 const SETTINGS_PATH: &str = "settings.json";
 
-/// The old single-skill layout, superseded by the root/child split above —
-/// deleted on install/uninstall so a stale copy doesn't keep pointing agents
-/// at content that no longer matches the (now role-specific) hook behavior.
-const LEGACY_SKILL_DIR: &str = "skills/overseer";
-
-const ROOT_SKILL_CONTENT: &str = include_str!("claude/overseer_root_skill.md");
-const CHILD_SKILL_CONTENT: &str = include_str!("claude/overseer_child_skill.md");
-
 pub struct ClaudeAdapter {
     overseer_bin: PathBuf,
 }
@@ -33,13 +25,17 @@ impl ClaudeAdapter {
     }
 
     fn hook_command(&self, args: &str) -> String {
-        format!("{} {}", self.overseer_bin.display(), args)
+        format!("'{}' {}", self.overseer_bin.to_string_lossy().replace('\'', "'\\''"), args)
     }
 
     fn settings_content(&self) -> String {
-        let running_cmd = self.hook_command("status running --from-hook --clear-attention permission");
-        let idle_cmd = self.hook_command("status idle --from-hook --clear-attention permission");
-        let blocked_cmd = self.hook_command("status blocked --from-hook --attention permission");
+        let quiet_status = |args| format!(
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && [ -n "$OVERSEER_SOCKET" ] && {} >/dev/null || true"#,
+            self.hook_command(args),
+        );
+        let running_cmd = quiet_status("status running --from-hook --clear-attention permission");
+        let idle_cmd = quiet_status("status idle --from-hook --clear-attention permission");
+        let blocked_cmd = quiet_status("status blocked --from-hook --attention permission");
         // SessionStart's own push additionally self-identifies as "claude" —
         // the only place this needs saying, since a bare-shell root's own
         // registered adapter is always the honest-but-uninformative "shell"
@@ -54,25 +50,14 @@ impl ClaudeAdapter {
         // Roots and taskless TUI-created children wait for a human prompt;
         // CLI-spawned children already have their initial task.
         let session_start_status_cmd = format!(
-            r#"if [ -n "$OVERSEER_TASK" ]; then {session_start_running_cmd}; else {session_start_idle_cmd}; fi"#
+            r#"if [ -n "$OVERSEER_TASK" ]; then {session_start_running_cmd} >/dev/null; else {session_start_idle_cmd} >/dev/null; fi"#
         );
-        // The printed message carries the single most-violated rule inline,
-        // per role, rather than just pointing at the skill file — this fires
-        // exactly once, at the very start of the session, and unlike
-        // opencode (whose instructions load into the system prompt on
-        // every turn) a Claude skill is only re-consulted if the agent
-        // chooses to invoke it again, which a real user reported it failing
-        // to do mid-conversation. Baking the rule into the transcript itself
-        // means it survives even if the skill is never re-opened.
-        let session_start_msg_cmd = concat!(
-            r#"if [ "$OVERSEER_ROLE" = "root" ]; then "#,
-            r#"printf 'You are managed by Overseer (role: root). Follow the overseer-root skill: delegate via overseer spawn, never your own built-in subagent/Task tool.\n'; "#,
-            r#"else "#,
-            r#"printf 'You are managed by Overseer (role: child). Follow the overseer-child skill: set up your own git worktree/branch first, e.g. git worktree add ../<repo>-<slug> -b ovsr/<slug>.\n'; "#,
-            r#"fi"#
-        );
+        // SessionStart stdout is context on startup, resume and compaction.
+        // Only the daemon-verified role bootstrap reaches the model; status
+        // acknowledgements stay quiet. Reference skills are optional.
+        let context_cmd = self.hook_command("context");
         let session_start_cmd = format!(
-            r#"[ -n "$OVERSEER_AGENT_ID" ] && {{ {session_start_msg_cmd}; {session_start_status_cmd}; }} || true"#
+            r#"[ -n "$OVERSEER_AGENT_ID" ] && [ -n "$OVERSEER_SOCKET" ] && {{ {session_start_status_cmd}; {context_cmd}; }} || true"#
         );
 
         serde_json::json!({
@@ -144,27 +129,16 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn install_files(&self) -> Vec<InstalledFile> {
-        vec![
-            InstalledFile {
-                path: PathBuf::from(ROOT_SKILL_PATH),
-                content: ROOT_SKILL_CONTENT.to_string(),
-                merge: MergeStrategy::Overwrite,
-            },
-            InstalledFile {
-                path: PathBuf::from(CHILD_SKILL_PATH),
-                content: CHILD_SKILL_CONTENT.to_string(),
-                merge: MergeStrategy::Overwrite,
-            },
-            InstalledFile {
-                path: PathBuf::from(SETTINGS_PATH),
-                content: self.settings_content(),
-                merge: MergeStrategy::JsonMerge,
-            },
-        ]
+        vec![InstalledFile {
+            path: PathBuf::from(SETTINGS_PATH),
+            content: self.settings_content(),
+            merge: MergeStrategy::JsonMerge,
+        }]
     }
 
     fn legacy_paths(&self) -> Vec<PathBuf> {
-        vec![PathBuf::from(LEGACY_SKILL_DIR)]
+        ["skills/overseer/SKILL.md", ROOT_SKILL_PATH, CHILD_SKILL_PATH]
+            .into_iter().map(PathBuf::from).collect()
     }
 
     fn spawn_command(&self, ctx: &LaunchContext) -> Command {
@@ -232,16 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn install_files_returns_two_skills_and_settings() {
-        let a = make_adapter();
-        let files = a.install_files();
-        assert_eq!(files.len(), 3);
-        assert_eq!(files[0].path, Path::new(ROOT_SKILL_PATH));
-        assert!(matches!(files[0].merge, MergeStrategy::Overwrite));
-        assert_eq!(files[1].path, Path::new(CHILD_SKILL_PATH));
-        assert!(matches!(files[1].merge, MergeStrategy::Overwrite));
-        assert_eq!(files[2].path, Path::new(SETTINGS_PATH));
-        assert!(matches!(files[2].merge, MergeStrategy::JsonMerge));
+    fn install_files_returns_only_settings() {
+        let files = make_adapter().install_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, Path::new(SETTINGS_PATH));
+        assert!(matches!(files[0].merge, MergeStrategy::JsonMerge));
     }
 
     #[test]
@@ -254,82 +223,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_paths_targets_the_old_single_skill_dir() {
-        let a = make_adapter();
-        assert_eq!(a.legacy_paths(), vec![PathBuf::from("skills/overseer")]);
-    }
-
-    #[test]
-    fn root_skill_content_is_not_empty_and_has_frontmatter() {
-        assert!(!ROOT_SKILL_CONTENT.is_empty());
-        assert!(ROOT_SKILL_CONTENT.contains("name: overseer-root"), "missing name frontmatter");
-        assert!(ROOT_SKILL_CONTENT.contains("description:"), "missing description frontmatter");
-    }
-
-    #[test]
-    fn child_skill_content_is_not_empty_and_has_frontmatter() {
-        assert!(!CHILD_SKILL_CONTENT.is_empty());
-        assert!(CHILD_SKILL_CONTENT.contains("name: overseer-child"), "missing name frontmatter");
-        assert!(CHILD_SKILL_CONTENT.contains("description:"), "missing description frontmatter");
-    }
-
-    #[test]
-    fn root_skill_documents_spawn_and_depth_three_limit() {
-        assert!(ROOT_SKILL_CONTENT.contains("overseer spawn"));
-        assert!(ROOT_SKILL_CONTENT.contains("depth-3 leaf"));
-    }
-
-    #[test]
-    fn root_skill_forbids_the_built_in_subagent_tool_for_delegation() {
-        // A real user reported the model using its own Task/subagent tool
-        // instead of `overseer spawn` — those subagents are invisible to
-        // Overseer entirely (no tree row, no tracking).
-        let lower = ROOT_SKILL_CONTENT.to_lowercase();
-        assert!(lower.contains("do not use your own built-in subagent"));
-    }
-
-    #[test]
-    fn root_skill_documents_the_name_flag_for_short_kebab_labels() {
-        assert!(ROOT_SKILL_CONTENT.contains("--name"));
-        assert!(ROOT_SKILL_CONTENT.contains("kebab-case"));
-    }
-
-    #[test]
-    fn root_skill_documents_status_secs() {
-        assert!(ROOT_SKILL_CONTENT.contains("status_secs"));
-    }
-
-    #[test]
-    fn root_skill_blesses_cross_harness_spawn() {
-        assert!(ROOT_SKILL_CONTENT.contains("--adapter claude|opencode"));
-    }
-
-    #[test]
-    fn child_skill_documents_overseer_task_and_done_status() {
-        assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_TASK"));
-        assert!(CHILD_SKILL_CONTENT.contains("overseer status done"));
-    }
-
-    #[test]
-    fn child_skill_requires_visible_delegation_and_documents_depth_three() {
-        assert!(CHILD_SKILL_CONTENT.contains("never your harness's built-in"));
-        assert!(CHILD_SKILL_CONTENT.contains("read-only lookup"));
-        assert!(CHILD_SKILL_CONTENT.contains("OVERSEER_DEPTH"));
-    }
-
-    #[test]
-    fn child_skill_documents_the_worktree_convention_with_a_worked_example() {
-        // A one-sentence "set up your own git worktree/branch" with no
-        // example was the reported gap: an agent given nothing more had to
-        // be manually corrected into a naming convention by hand each time.
-        assert!(CHILD_SKILL_CONTENT.contains("git worktree add"), "must show a runnable worktree command");
-        assert!(CHILD_SKILL_CONTENT.contains("ovsr/<slug>"), "must state the branch naming convention");
+    fn migration_targets_only_owned_skill_files() {
+        assert_eq!(make_adapter().legacy_paths(), vec![
+            PathBuf::from("skills/overseer/SKILL.md"),
+            PathBuf::from(ROOT_SKILL_PATH),
+            PathBuf::from(CHILD_SKILL_PATH),
+        ]);
     }
 
     #[test]
     fn settings_contains_post_tool_use_hook() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         assert!(v["hooks"]["PostToolUse"].is_array());
         let cmd = v["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"));
@@ -338,7 +243,7 @@ mod tests {
     #[test]
     fn settings_contains_user_prompt_submit_hook_pushing_running() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         assert!(v["hooks"]["UserPromptSubmit"].is_array());
         let cmd = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status running"));
@@ -347,7 +252,7 @@ mod tests {
     #[test]
     fn settings_stop_hook_pushes_idle_not_done() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         assert!(v["hooks"]["Stop"].is_array());
         let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status idle"), "Stop must push idle, not done: {cmd}");
@@ -357,7 +262,7 @@ mod tests {
     #[test]
     fn settings_contains_notification_hook_pushing_blocked() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         assert!(v["hooks"]["Notification"].is_array());
         let cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status blocked"));
@@ -368,7 +273,7 @@ mod tests {
     #[test]
     fn settings_session_start_uses_task_presence_for_initial_status() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("status idle"), "SessionStart should push idle for a root: {cmd}");
         assert!(cmd.contains("status running"), "SessionStart should push running for a child: {cmd}");
@@ -383,24 +288,34 @@ mod tests {
         // otherwise; this is what an omitted `--adapter` on a later
         // `overseer spawn` inherits from.
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("--adapter claude"), "SessionStart should self-identify: {cmd}");
     }
 
     #[test]
-    fn settings_session_start_message_carries_the_hard_rule_inline_per_role() {
-        // Unlike opencode, whose role instructions load into the system
-        // prompt on every turn, a Claude skill is only re-consulted if the
-        // agent re-invokes it -- a real user reported it failing to do so
-        // mid-conversation. So the one-shot SessionStart message itself
-        // must carry the rule, not just point at the skill file.
-        let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
-        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("overseer spawn, never your own built-in subagent"), "root message must inline the delegation rule: {cmd}");
-        assert!(cmd.contains("git worktree add"), "child message must inline a worked worktree example: {cmd}");
-        assert!(cmd.contains("ovsr/<slug>"), "child message must show the branch convention: {cmd}");
+    fn session_start_emits_only_role_context_from_quoted_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("overseer-hook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("overseer's executable");
+        std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = context ]; then printf 'role context\\n'; else printf 'status response\\n'; fi\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let adapter = ClaudeAdapter::with_bin(bin);
+        let settings: serde_json::Value = serde_json::from_str(&adapter.settings_content()).unwrap();
+        let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        for task in ["", "assigned work"] {
+            let output = Command::new("/bin/sh").args(["-c", command])
+                .env("OVERSEER_AGENT_ID", "agent").env("OVERSEER_SOCKET", "/tmp/test.sock")
+                .env("OVERSEER_TASK", task).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "role context\n");
+        }
+        let output = Command::new("/bin/sh").args(["-c", command])
+            .env_remove("OVERSEER_AGENT_ID").env_remove("OVERSEER_SOCKET").output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -408,7 +323,7 @@ mod tests {
         // Only SessionStart needs to self-identify; every other push stays
         // exactly the plain status command it always was.
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         for event in ["UserPromptSubmit", "PostToolUse", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(!cmd.contains("--adapter"), "{event} should not repeat the adapter self-id: {cmd}");
@@ -418,17 +333,17 @@ mod tests {
     #[test]
     fn settings_hook_commands_use_absolute_path() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
-            assert!(cmd.starts_with('/'), "{event} hook must be absolute path, got: {cmd}");
+            assert!(cmd.contains("'/usr/local/bin/overseer'"), "{event} hook must quote its absolute path: {cmd}");
         }
     }
 
     #[test]
     fn settings_hook_commands_pass_from_hook_flag() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.contains("--from-hook"), "{event} hook must pass --from-hook, got: {cmd}");
@@ -443,7 +358,7 @@ mod tests {
         // tracked session cwd), so no hook command needs its own git
         // shelling or an explicit `--branch`.
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification", "SessionStart"] {
             let cmd = v["hooks"][event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(!cmd.contains("--branch"), "{event} hook must not pass --branch, got: {cmd}");
@@ -453,7 +368,7 @@ mod tests {
     #[test]
     fn settings_entries_are_marked_overseer_managed() {
         let a = make_adapter();
-        let v: serde_json::Value = serde_json::from_str(&a.install_files()[2].content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.install_files()[0].content).unwrap();
         for event in ["PostToolUse", "UserPromptSubmit", "Stop", "Notification", "SessionStart"] {
             assert_eq!(
                 v["hooks"][event][0]["_overseer"].as_bool(),
