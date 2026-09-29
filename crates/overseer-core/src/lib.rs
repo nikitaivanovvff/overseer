@@ -15,6 +15,7 @@ pub mod notify;
 pub mod selection;
 pub mod session;
 pub mod settings;
+pub mod tasks;
 
 /// Shared test-only helper for mutating process-global env vars, plus
 /// (behind the same gate) the escape-sequence-to-`GridSnapshot` render
