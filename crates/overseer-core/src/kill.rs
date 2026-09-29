@@ -75,8 +75,7 @@ fn run_with_timeouts(
         // Nobody holds the lock -- whatever daemon last ran here is already
         // gone (crash, kill -9, reboot). Only stale files can remain; there
         // is nothing left alive to signal.
-        let cleaned_socket = remove_if_exists(socket);
-        let cleaned_lockfile = remove_if_exists(&daemon::lockfile_path(socket));
+        let (cleaned_socket, cleaned_lockfile) = cleanup_unlocked(socket)?;
         return Ok(Outcome::AlreadyDead { cleaned_socket, cleaned_lockfile });
     }
 
@@ -84,49 +83,26 @@ fn run_with_timeouts(
         return Ok(Outcome::Graceful);
     }
 
-    // The lock is held (something is alive), but the graceful path never
-    // got a response in time. `prior_pid` came from the lockfile *before* we
-    // decided the daemon was unresponsive -- that's the pid the flock is
-    // actually pinned to, so it's still the right target even though we
-    // can't re-derive it now (a daemon that's genuinely wedged won't answer
-    // a fresh IPC request asking it to identify itself either).
-    //
-    // BUG B: before FIX A, a losing daemon's `File::create` truncated this
-    // exact lockfile out from under the live daemon, so `prior_pid` could be
-    // `None` even though a daemon is demonstrably alive (we're in this branch
-    // *because* the lock is held). FIX A stops that from happening going
-    // forward, but a lockfile can still be unreadable for other reasons (hand
-    // edited, truncated by something outside Overseer entirely -- the
-    // 2026-07-11 incident's original deleter was never identified, see
-    // AGENTS.md/NON-GOALS), so this fallback stays regardless: scan the
-    // process table for the one process whose argv proves it's *this*
-    // socket's daemon, rather than bailing out with a pid the lockfile no
-    // longer has.
-    let daemon_pid = match prior_pid {
-        Some(pid) => pid,
-        None => match discover_daemon_pid(socket) {
-            DaemonScan::Found(pid) => pid,
-            DaemonScan::NotFound => anyhow::bail!(
-                "daemon at {} is unresponsive, its lockfile has no readable pid, and no process was \
-                 found running `daemon --socket {}` -- refusing to force-kill blindly",
-                socket.display(),
-                socket.display()
-            ),
-            DaemonScan::Ambiguous(pids) => anyhow::bail!(
-                "daemon at {} is unresponsive, its lockfile has no readable pid, and multiple processes \
-                 matched `daemon --socket {}` ({pids:?}) -- refusing to guess which one to kill",
-                socket.display(),
-                socket.display()
-            ),
-        },
+    // Graceful shutdown may have completed without its reply reaching us.
+    if !daemon::lock_is_held(socket) {
+        let (cleaned_socket, cleaned_lockfile) = cleanup_unlocked(socket)?;
+        return Ok(Outcome::AlreadyDead { cleaned_socket, cleaned_lockfile });
+    }
+    // Text in a lockfile is only a hint. Verify the process after the wait,
+    // including when the file contains a syntactically valid positive PID.
+    let daemon_pid = match discover_daemon_pid(socket) {
+        DaemonScan::Found(pid) if pid > 1 && pid != std::process::id() as i32 => pid,
+        other => anyhow::bail!("cannot verify daemon identity at {} ({other:?}); refusing to force-kill", socket.display()),
     };
+    anyhow::ensure!(prior_pid.is_none_or(|pid| pid == daemon_pid), "lockfile PID does not identify this daemon; refusing to force-kill");
+    anyhow::ensure!(daemon::lock_is_held(socket), "daemon exited during identity verification; retry cleanup");
+    anyhow::ensure!(daemon::read_lockfile_pid(socket).is_none_or(|pid| pid == daemon_pid), "daemon changed during recovery; retry cleanup");
 
     let children = direct_children(daemon_pid);
     terminate_process_tree(daemon_pid);
     wait_for_death(daemon_pid, death_poll_timeout, death_poll_interval);
 
-    remove_if_exists(socket);
-    remove_if_exists(&daemon::lockfile_path(socket));
+    cleanup_unlocked(socket)?;
 
     Ok(Outcome::Forced { daemon_pid, reclaimed_children: children.len() })
 }
@@ -163,6 +139,26 @@ fn try_graceful_shutdown(socket: &Path, overall_timeout: Duration) -> bool {
     }
 }
 
+/// Hold the lock through unlinking. A replacement daemon must never lose its
+/// socket just because an earlier process died during recovery.
+fn cleanup_unlocked(socket: &Path) -> Result<(bool, bool)> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    let path = daemon::lockfile_path(socket);
+    let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, false)),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "daemon lock is held; refusing to remove its files");
+    let held = file.metadata()?;
+    let current = std::fs::metadata(&path)?;
+    anyhow::ensure!((held.dev(), held.ino()) == (current.dev(), current.ino()), "daemon lockfile changed during cleanup");
+    let socket_removed = remove_if_exists(socket);
+    let lock_removed = remove_if_exists(&path);
+    Ok((socket_removed, lock_removed))
+}
+
 fn remove_if_exists(path: &Path) -> bool {
     if path.exists() {
         std::fs::remove_file(path).is_ok()
@@ -197,6 +193,7 @@ pub(crate) fn terminate_process_tree(pid: i32) {
 }
 
 fn kill_pid(pid: i32) {
+    if pid <= 1 || pid == std::process::id() as i32 { return; }
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
@@ -389,6 +386,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(socket.parent().unwrap());
     }
 
+    #[test]
+    fn corrupt_lockfile_pid_cannot_target_unrelated_process() {
+        let socket = unique_socket("wrongpid");
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let lock = simulate_daemon_holding_lock(&socket, child.id() as i32);
+        let result = run_with_timeouts(&socket, Duration::from_millis(10), Duration::from_millis(10), Duration::from_millis(1));
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill(); let _ = child.wait(); drop(lock); cleanup(&socket);
+        assert!(result.is_err(), "must refuse a PID whose command is not this daemon");
+        assert!(still_running);
+    }
+
+    #[test]
+    fn lockfile_rejects_process_group_and_system_pids() {
+        let socket = unique_socket("invalidpid");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        for pid in [-1, 0, 1] {
+            std::fs::write(daemon::lockfile_path(&socket), pid.to_string()).unwrap();
+            assert_eq!(daemon::read_lockfile_pid(&socket), None);
+        }
+        cleanup(&socket);
+    }
+
+    #[test]
+    fn cleanup_preserves_a_replacement_daemons_locked_files() {
+        let socket = unique_socket("replacement");
+        let lock = simulate_daemon_holding_lock(&socket, std::process::id() as i32);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(cleanup_unlocked(&socket).is_err());
+        assert!(socket.exists());
+        assert!(daemon::lockfile_path(&socket).exists());
+        drop(listener); drop(lock); cleanup(&socket);
+    }
+
     // ── already dead ──────────────────────────────────────────────────────────
 
     #[test]
@@ -491,6 +522,7 @@ mod tests {
         let mut fake_daemon = std::process::Command::new("sh")
             .arg("-c")
             .arg("sleep 60 & sleep 60 & wait")
+            .args(["daemon", "--socket"]).arg(&socket)
             .spawn()
             .expect("failed to spawn fake daemon process for the test");
         let fake_daemon_pid = fake_daemon.id() as i32;
@@ -504,11 +536,11 @@ mod tests {
         // "alive" to `kill(pid, 0)` -- until reaped. Reap concurrently on a
         // background thread so `pid_is_alive` below reflects reality rather
         // than an artifact of this test being its own parent.
+        let lock = simulate_daemon_holding_lock(&socket, fake_daemon_pid);
         let reaper = std::thread::spawn(move || {
             let _ = fake_daemon.wait();
+            drop(lock);
         });
-
-        let _lock = simulate_daemon_holding_lock(&socket, fake_daemon_pid);
         assert!(!socket.exists(), "nothing ever binds this socket in this test -- IPC must be unreachable");
 
         let outcome = run_with_timeouts(

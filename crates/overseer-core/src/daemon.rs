@@ -114,7 +114,7 @@ pub(crate) fn lockfile_path(socket: &Path) -> PathBuf {
 /// its own, since a lockfile that predates any daemon run, or one left with
 /// stale/partial content, is an expected state, not a bug.
 pub(crate) fn read_lockfile_pid(socket: &Path) -> Option<i32> {
-    fs::read_to_string(lockfile_path(socket)).ok()?.trim().parse().ok()
+    fs::read_to_string(lockfile_path(socket)).ok()?.trim().parse::<i32>().ok().filter(|pid| *pid > 1)
 }
 
 /// True if some process currently holds `socket`'s daemon lock — the exact
