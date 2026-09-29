@@ -10,9 +10,6 @@ const CHILD_INSTRUCTIONS_PATH: &str = "overseer-child.md";
 const CONFIG_PATH: &str = "opencode.jsonc";
 const INSTRUCTIONS_KEY: &str = "instructions";
 
-const ROOT_INSTRUCTIONS_CONTENT: &str = include_str!("opencode/opencode_root.md");
-const CHILD_INSTRUCTIONS_CONTENT: &str = include_str!("opencode/opencode_child.md");
-
 pub struct OpencodeAdapter {
     overseer_bin: PathBuf,
 }
@@ -60,36 +57,80 @@ impl OpencodeAdapter {
         format!(
             r#"const OVERSEER_BIN = {bin};
 
-export const OverseerPlugin = async () => {{
-  if (!process.env.OVERSEER_AGENT_ID) {{
+export const OverseerPlugin = async ({{ client }}) => {{
+  if (!process.env.OVERSEER_AGENT_ID || !process.env.OVERSEER_SOCKET) {{
     return {{}};
   }}
   const {{ execFile }} = await import("node:child_process");
-  const push = (status, extra = []) => execFile(OVERSEER_BIN, ["status", status, ...extra], (error) => {{
-    if (error && process.env.OVERSEER_DEBUG) console.error(`overseer status push failed: ${{error.code || "unknown"}}`);
-  }});
+  // The system/compaction hooks are experimental interfaces, verified against
+  // installed @opencode-ai/plugin 1.17.13 with OpenCode 1.17.20. Native nested
+  // sessions must not receive this node's role or overwrite its telemetry.
+  let mainSession;
+  let bootstrap;
+  const isMainSession = async (id, activate = false) => {{
+    if (!id) return false;
+    if (id === mainSession) return true;
+    if (mainSession && !activate) return false;
+    try {{
+      const result = await client.session.get({{ path: {{ id }}, signal: AbortSignal.timeout(2000) }});
+      if (!result.data || result.data.parentID) return false;
+      mainSession = id;
+      bootstrap = undefined;
+      return true;
+    }} catch {{ return false; }}
+  }};
+  const context = async (refresh = false) => {{
+    if (refresh) bootstrap = undefined;
+    if (!bootstrap) {{
+      bootstrap = new Promise((resolve) => execFile(OVERSEER_BIN, ["context"],
+        {{ timeout: 2000, maxBuffer: 64 * 1024 }}, (error, stdout) => {{
+          if (error) bootstrap = undefined;
+          resolve(error ? "" : stdout.trim());
+        }}));
+    }}
+    return bootstrap;
+  }};
+  const push = (status, extra = []) => new Promise((resolve) =>
+    execFile(OVERSEER_BIN, ["status", status, ...extra], {{ timeout: 2000 }}, (error) => {{
+      if (error && process.env.OVERSEER_DEBUG) console.error(`overseer status push failed: ${{error.code || "unknown"}}`);
+      resolve();
+    }}));
 
   return {{
+    "experimental.chat.system.transform": async (input, output) => {{
+      if (!await isMainSession(input.sessionID, true)) return;
+      const text = await context();
+      if (text && !output.system.some((entry) => entry === text)) output.system.push(text);
+    }},
+    "experimental.session.compacting": async (input, output) => {{
+      if (!await isMainSession(input.sessionID)) return;
+      const text = await context(true);
+      if (text) output.context.push(text);
+    }},
     "chat.message": async (input) => {{
+      if (!await isMainSession(input.sessionID, true)) return;
       if (input.model?.modelID) {{
         const model = input.model.providerID ? `${{input.model.providerID}}/${{input.model.modelID}}` : input.model.modelID;
-        push("running", ["--model-name", model]);
+        await push("running", ["--model-name", model]);
       }}
     }},
     event: async ({{ event }}) => {{
+      const info = event.properties?.info;
+      const id = event.properties?.sessionID || info?.id;
+      if (info?.parentID || !await isMainSession(id)) return;
       if (event.type === "session.created") {{
         // Roots and taskless TUI-created children wait for a human prompt;
         // CLI-spawned children already have their initial task.
         const initial = process.env.OVERSEER_TASK ? "running" : "idle";
-        execFile(OVERSEER_BIN, ["status", initial, "--adapter", "opencode", "--clear-context"], () => {{}});
+        await push(initial, ["--adapter", "opencode", "--clear-context"]);
       }} else if (event.type === "session.status" && event.properties?.status?.type === "busy") {{
-        push("running");
+        await push("running");
       }} else if (event.type === "session.idle") {{
-        push("idle");
+        await push("idle");
       }} else if (event.type === "permission.asked" || event.type === "permission.v2.asked") {{
-        push("blocked", ["--attention", "permission"]);
+        await push("blocked", ["--attention", "permission"]);
       }} else if (event.type === "permission.replied" || event.type === "permission.v2.replied") {{
-        push("running", ["--clear-attention", "permission"]);
+        await push("running", ["--clear-attention", "permission"]);
       }} else if (event.type === "session.error" && event.properties?.error?.name === "APIError") {{
         const error = event.properties.error.data || {{}};
         const status = error.statusCode;
@@ -98,7 +139,7 @@ export const OverseerPlugin = async () => {{
         if (typeof error.message === "string") extra.push("--message", error.message.slice(0, 4096));
         const retry = error.responseHeaders?.["retry-after"] ?? error.responseHeaders?.["Retry-After"];
         if (retry) extra.push("--retry-after", String(retry));
-        push("running", extra);
+        await push("running", extra);
       }}
     }},
   }};
@@ -156,24 +197,9 @@ impl AgentAdapter for OpencodeAdapter {
                 merge: MergeStrategy::Overwrite,
             },
             InstalledFile {
-                path: PathBuf::from(ROOT_INSTRUCTIONS_PATH),
-                content: ROOT_INSTRUCTIONS_CONTENT.to_string(),
-                merge: MergeStrategy::Overwrite,
-            },
-            InstalledFile {
-                path: PathBuf::from(CHILD_INSTRUCTIONS_PATH),
-                content: CHILD_INSTRUCTIONS_CONTENT.to_string(),
-                merge: MergeStrategy::Overwrite,
-            },
-            // Both role docs are always registered — each one's own opening
-            // line ("only applies when $OVERSEER_ROLE=...") is what makes
-            // loading both, every session, harmless (same self-filtering
-            // posture as Claude's root/child skills, which both install
-            // unconditionally too).
-            InstalledFile {
                 path: PathBuf::from(CONFIG_PATH),
                 content: String::new(),
-                merge: MergeStrategy::JsonArrayMerge {
+                merge: MergeStrategy::JsonArrayRemove {
                     key: INSTRUCTIONS_KEY,
                     entries: vec![
                         ROOT_INSTRUCTIONS_PATH.to_string(),
@@ -182,6 +208,10 @@ impl AgentAdapter for OpencodeAdapter {
                 },
             },
         ]
+    }
+
+    fn legacy_paths(&self) -> Vec<PathBuf> {
+        vec![ROOT_INSTRUCTIONS_PATH.into(), CHILD_INSTRUCTIONS_PATH.into()]
     }
 
     fn spawn_command(&self, ctx: &LaunchContext) -> Command {
@@ -247,22 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn install_files_returns_plugin_two_instructions_and_config_merge() {
-        let a = make_adapter();
-        let files = a.install_files();
-        assert_eq!(files.len(), 4);
+    fn install_files_registers_plugin_and_removes_old_global_role_instructions() {
+        let files = make_adapter().install_files();
+        assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, PathBuf::from(PLUGIN_PATH));
         assert!(matches!(files[0].merge, MergeStrategy::Overwrite));
-        assert_eq!(files[1].path, PathBuf::from(ROOT_INSTRUCTIONS_PATH));
-        assert_eq!(files[2].path, PathBuf::from(CHILD_INSTRUCTIONS_PATH));
-        assert_eq!(files[3].path, PathBuf::from(CONFIG_PATH));
-        match &files[3].merge {
-            MergeStrategy::JsonArrayMerge { key, entries } => {
+        assert_eq!(files[1].path, PathBuf::from(CONFIG_PATH));
+        match &files[1].merge {
+            MergeStrategy::JsonArrayRemove { key, entries } => {
                 assert_eq!(*key, INSTRUCTIONS_KEY);
                 assert_eq!(entries, &vec![ROOT_INSTRUCTIONS_PATH.to_string(), CHILD_INSTRUCTIONS_PATH.to_string()]);
             }
-            _ => panic!("expected JsonArrayMerge for the config file"),
+            _ => panic!("expected removal of legacy instructions"),
         }
+        assert_eq!(make_adapter().legacy_paths(), vec![PathBuf::from(ROOT_INSTRUCTIONS_PATH), PathBuf::from(CHILD_INSTRUCTIONS_PATH)]);
     }
 
     #[test]
@@ -374,43 +402,65 @@ mod tests {
     }
 
     #[test]
-    fn root_instructions_guard_on_role() {
-        assert!(ROOT_INSTRUCTIONS_CONTENT.contains("OVERSEER_ROLE=root"));
-    }
-
-    #[test]
-    fn root_instructions_forbid_the_built_in_subagent_tool_for_delegation() {
-        // A real user reported the model using its own Task/subagent tool
-        // instead of `overseer spawn` — those subagents are invisible to
-        // Overseer entirely (no tree row, no tracking).
-        assert!(ROOT_INSTRUCTIONS_CONTENT.to_lowercase().contains("do not use your own built-in subagent"));
-    }
-
-    #[test]
-    fn child_instructions_guard_on_role_and_document_done_status() {
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("OVERSEER_ROLE=child"));
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("overseer status done"));
-    }
-
-    #[test]
-    fn child_instructions_require_visible_delegation_and_document_depth_three() {
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("never your harness's built-in"));
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("read-only lookup"));
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("OVERSEER_DEPTH"));
-    }
-
-    #[test]
-    fn root_instructions_bless_cross_harness_spawn() {
-        assert!(ROOT_INSTRUCTIONS_CONTENT.contains("--adapter claude|opencode"));
-    }
-
-    #[test]
-    fn child_instructions_document_the_worktree_convention_with_a_worked_example() {
-        // A one-sentence "set up your own git worktree/branch" with no
-        // example was the reported gap: an agent given nothing more had to
-        // be manually corrected into a naming convention by hand each time.
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("git worktree add"), "must show a runnable worktree command");
-        assert!(CHILD_INSTRUCTIONS_CONTENT.contains("ovsr/<slug>"), "must state the branch naming convention");
+    fn plugin_injects_cached_role_context_and_filters_nested_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("overseer-plugin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("overseer's executable");
+        std::fs::write(&bin, r#"#!/bin/sh
+printf '%s\n' "$*" >> "$OVERSEER_TEST_LOG"
+if [ "$1" = context ]; then printf 'role:%s\n' "$OVERSEER_ROLE"; fi
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plugin = dir.join("plugin.mjs");
+        std::fs::write(&plugin, OpencodeAdapter::with_bin(bin).plugin_content()).unwrap();
+        let fixture = dir.join("fixture.mjs");
+        std::fs::write(&fixture, r#"
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const { OverseerPlugin } = await import(pathToFileURL(process.argv[2]));
+const client = { session: { get: async ({path}) => ({data: {id: path.id, parentID: path.id === 'nested' ? 'main' : undefined}}) } };
+delete process.env.OVERSEER_AGENT_ID;
+assert.deepEqual(await OverseerPlugin({client}), {});
+process.env.OVERSEER_AGENT_ID = 'agent';
+delete process.env.OVERSEER_SOCKET;
+assert.deepEqual(await OverseerPlugin({client}), {});
+process.env.OVERSEER_SOCKET = '/tmp/test.sock';
+for (const role of ['root', 'child']) {
+  process.env.OVERSEER_ROLE = role;
+  const hooks = await OverseerPlugin({client});
+  const input = { sessionID: 'main', model: {providerID: 'provider', modelID: 'model'} };
+  const transform = hooks['experimental.chat.system.transform'];
+  const system = { system: ['user context'] };
+  await transform(input, system);
+  await transform(input, system);
+  assert.deepEqual(system.system, ['user context', `role:${role}`]);
+  const nested = {system: []};
+  await transform({...input, sessionID: 'nested'}, nested);
+  assert.deepEqual(nested.system, []);
+  await hooks['chat.message']({...input, sessionID: 'nested'});
+  await hooks.event({event: {type: 'permission.asked', properties: {sessionID: 'nested'}}});
+  await hooks.event({event: {type: 'session.created', properties: {info: {id: 'nested', parentID: 'main'}}}});
+  const compact = {context: ['existing']};
+  await hooks['experimental.session.compacting'](input, compact);
+  assert.deepEqual(compact.context, ['existing', `role:${role}`]);
+  await hooks['chat.message'](input);
+  await hooks.event({event: {type: 'permission.asked', properties: {sessionID: 'main'}}});
+  await hooks.event({event: {type: 'session.error', properties: {sessionID: 'main', error: {name: 'APIError', data: {statusCode: 429}}}}});
+}
+const lines = readFileSync(process.env.OVERSEER_TEST_LOG, 'utf8').trim().split('\n');
+assert.equal(lines.filter(line => line === 'context').length, 4, 'context cached per session and refreshed at compaction');
+assert.equal(lines.filter(line => line.startsWith('status ')).length, 6, 'only main-session events report status');
+assert.equal(lines.filter(line => line.includes('--attention permission')).length, 2);
+assert.equal(lines.filter(line => line.includes('--attention rate-limit')).length, 2);
+"#).unwrap();
+        let output = Command::new("node").arg(&fixture).arg(&plugin)
+            .env("OVERSEER_TEST_LOG", dir.join("calls.log")).output()
+            .expect("node is required to validate generated OpenCode plugins");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(), "generated plugin failed its executable fixture: {stderr}");
     }
 
     #[test]
