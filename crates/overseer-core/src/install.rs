@@ -54,12 +54,12 @@ fn install_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()
                 "{}".to_string()
             };
             let mut existing: serde_json::Value =
-                serde_json::from_str(&existing_raw).unwrap_or_else(|_| serde_json::json!({}));
+                parse_settings(&existing_raw, &full_path)?;
             let overlay: serde_json::Value =
                 serde_json::from_str(&file.content).context("adapter returned invalid JSON")?;
             settings::merge_hooks(&mut existing, &overlay);
             let out = serde_json::to_string_pretty(&existing)?;
-            std::fs::write(&full_path, out + "\n")
+            write_settings(&full_path, &(out + "\n"))
                 .with_context(|| format!("failed to write {}", full_path.display()))?;
             println!("merged   {}", full_path.display());
         }
@@ -71,15 +71,85 @@ fn install_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()
                 "{}".to_string()
             };
             let mut existing: serde_json::Value =
-                serde_json::from_str(&existing_raw).unwrap_or_else(|_| serde_json::json!({}));
+                parse_settings(&existing_raw, &full_path)?;
             settings::merge_json_array(&mut existing, key, entries);
             let out = serde_json::to_string_pretty(&existing)?;
-            std::fs::write(&full_path, out + "\n")
+            write_settings(&full_path, &(out + "\n"))
                 .with_context(|| format!("failed to write {}", full_path.display()))?;
             println!("merged   {}", full_path.display());
         }
     }
     Ok(())
+}
+
+/// JSONC permits comments and trailing commas, but otherwise uses JSON syntax.
+/// Replace extensions with whitespace so JSON validation still catches errors.
+fn parse_settings(raw: &str, path: &std::path::Path) -> Result<serde_json::Value> {
+    let mut bytes = raw.as_bytes().to_vec();
+    if path.extension().is_some_and(|ext| ext == "jsonc") {
+        let mut i = 0;
+        let mut quoted = false;
+        while i < bytes.len() {
+            if quoted {
+                match bytes[i] {
+                    b'\\' => { i += 2; continue; }
+                    b'"' => quoted = false,
+                    _ => {}
+                }
+            } else if bytes[i] == b'"' {
+                quoted = true;
+            } else if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    bytes[i] = b' '; i += 1;
+                }
+                continue;
+            } else if bytes[i..].starts_with(b"/*") {
+                let start = i;
+                i += 2;
+                while i + 1 < bytes.len() && !bytes[i..].starts_with(b"*/") { i += 1; }
+                anyhow::ensure!(i + 1 < bytes.len(), "unterminated comment in {}", path.display());
+                i += 2;
+                for byte in &mut bytes[start..i] { if *byte != b'\n' { *byte = b' '; } }
+                continue;
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        quoted = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if quoted => { i += 2; continue; }
+                b'"' => quoted = !quoted,
+                b',' if !quoted => {
+                    let next = bytes[i + 1..].iter().find(|b| !b.is_ascii_whitespace());
+                    if matches!(next, Some(b'}' | b']')) { bytes[i] = b' '; }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid settings in {}; original file preserved", path.display()))?;
+    anyhow::ensure!(value.is_object(), "settings in {} must be an object", path.display());
+    Ok(value)
+}
+
+fn write_settings(path: &std::path::Path, content: &str) -> Result<()> {
+    use std::io::Write;
+    // Resolve an existing symlink so atomic replacement preserves that link.
+    let target = if path.exists() { path.canonicalize()? } else { path.to_path_buf() };
+    let temporary = target.with_file_name(format!(".overseer-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        if let Ok(metadata) = std::fs::metadata(&target) { file.set_permissions(metadata.permissions())?; }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &target)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    result
 }
 
 fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()> {
@@ -97,10 +167,10 @@ fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<
                 let raw = std::fs::read_to_string(&full_path)
                     .with_context(|| format!("failed to read {}", full_path.display()))?;
                 let mut json: serde_json::Value =
-                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                    parse_settings(&raw, &full_path)?;
                 settings::remove_hooks(&mut json);
                 let out = serde_json::to_string_pretty(&json)?;
-                std::fs::write(&full_path, out + "\n")
+                write_settings(&full_path, &(out + "\n"))
                     .with_context(|| format!("failed to write {}", full_path.display()))?;
                 println!("updated  {} (removed overseer hooks)", full_path.display());
             }
@@ -110,10 +180,10 @@ fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<
                 let raw = std::fs::read_to_string(&full_path)
                     .with_context(|| format!("failed to read {}", full_path.display()))?;
                 let mut json: serde_json::Value =
-                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                    parse_settings(&raw, &full_path)?;
                 settings::remove_json_array(&mut json, key, entries);
                 let out = serde_json::to_string_pretty(&json)?;
-                std::fs::write(&full_path, out + "\n")
+                write_settings(&full_path, &(out + "\n"))
                     .with_context(|| format!("failed to write {}", full_path.display()))?;
                 println!("updated  {} (removed overseer entries)", full_path.display());
             }
@@ -139,4 +209,32 @@ fn remove_legacy_paths(adapter: &dyn AgentAdapter, config_dir: &std::path::Path)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn settings_merge_preserves_jsonc_and_rejects_invalid_input() {
+        let dir = std::env::temp_dir().join(format!("overseer-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.jsonc");
+        let file = InstalledFile { path: "opencode.jsonc".into(), content: String::new(), merge: MergeStrategy::JsonArrayMerge { key: "instructions", entries: vec!["ours.md".into()] } };
+        std::fs::write(&path, "{ // comment\n \"model\": \"https://example/*literal*/\", /* block */ \"instructions\": [\"user.md\",], }").unwrap();
+        install_file(&file, &dir).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["model"], "https://example/*literal*/");
+        assert_eq!(value["instructions"], serde_json::json!(["user.md", "ours.md"]));
+        uninstall_file(&file, &dir).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["instructions"], serde_json::json!(["user.md"]));
+        for bad in ["{broken", "{/* unterminated", "[]"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(install_file(&file, &dir).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+            assert!(uninstall_file(&file, &dir).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
