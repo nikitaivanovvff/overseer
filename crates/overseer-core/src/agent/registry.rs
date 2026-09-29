@@ -9,7 +9,7 @@ use crate::ipc::protocol::AgentDto;
 
 /// Capacity of the registry's broadcast channel — generous enough that a slow
 /// attach client only misses events under sustained, unrealistic load; a
-/// lagged receiver just skips ahead rather than blocking a writer (AGENTS.md
+/// lagged receiver takes a new snapshot rather than blocking a writer (AGENTS.md
 /// "status is push, not pull" — pushes must never back up on the sender).
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -56,6 +56,8 @@ pub enum RegistryEvent {
 }
 
 pub struct AgentRegistry {
+    // Keep this lock through each mutation's broadcast send: snapshot+subscribe
+    // and every receiver must observe the same order as the authoritative tree.
     tree: Mutex<AgentTree>,
     /// Serializes register/launch/drop transactions; true once shutdown begins.
     lifecycle: Mutex<bool>,
@@ -127,6 +129,7 @@ impl AgentRegistry {
     /// own forwarding task, not tied to when *this* caller's response gets
     /// written.
     pub fn announce_shutdown(&self) {
+        let _guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.events.send(RegistryEvent::Shutdown);
     }
 
@@ -156,7 +159,6 @@ impl AgentRegistry {
                 };
                 let dto = AgentDto::from_node(&node, None);
                 guard.add_root(node);
-                drop(guard);
                 let _ = self.events.send(RegistryEvent::Registered { agent: dto });
                 Ok(RegisterResult { id, branch })
             }
@@ -191,7 +193,6 @@ impl AgentRegistry {
                 };
                 let dto = AgentDto::from_node(&node, Some(parent_id.clone()));
                 if guard.insert_child(&parent_id, node) {
-                    drop(guard);
                     let _ = self.events.send(RegistryEvent::Registered { agent: dto });
                     Ok(RegisterResult { id, branch })
                 } else {
@@ -323,8 +324,8 @@ impl AgentRegistry {
         adapter: Option<String>,
         pushed_at: std::time::SystemTime,
     ) -> Result<(), RegistryError> {
+        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let applied = {
-            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) => {
                     let is_stale = node.last_status_pushed_at.is_some_and(|last| pushed_at < last);
@@ -461,8 +462,8 @@ impl AgentRegistry {
         repo: Option<String>,
         branch: Option<String>,
     ) {
+        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let applied = {
-            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) if node.role == AgentRole::Root => {
                     let mut changed = node.cwd != cwd;
@@ -538,8 +539,8 @@ impl AgentRegistry {
     /// nothing else about this transition necessarily produces its own
     /// status push.
     pub fn mark_session_exited(&self, id: &AgentId) {
+        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
         let applied = {
-            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
             match guard.find_mut(id) {
                 Some(node) if node.session_alive => {
                     node.session_alive = false;
@@ -581,6 +582,15 @@ impl AgentRegistry {
         tree_to_dtos(&guard.roots)
     }
 
+    /// Captures current state together with the stream of subsequent mutations.
+    /// Mutations publish while holding the tree lock, so the returned receiver
+    /// contains only changes newer than this snapshot. Replacing a lagged
+    /// receiver with this pair also discards events already covered by the snapshot.
+    pub fn snapshot_and_subscribe(&self) -> (Vec<AgentDto>, broadcast::Receiver<RegistryEvent>) {
+        let guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        (tree_to_dtos(&guard.roots), self.events.subscribe())
+    }
+
     /// Returns the DTO for a single agent by id.
     pub fn get(&self, id: &AgentId) -> Option<crate::ipc::protocol::AgentDto> {
         let guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,10 +612,8 @@ impl AgentRegistry {
 
     /// Removes an agent from the tree. Returns `true` if found and removed.
     pub fn remove(&self, id: &AgentId) -> bool {
-        let removed = {
-            let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
-            guard.remove(id)
-        };
+        let mut guard = self.tree.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard.remove(id);
         if removed {
             let _ = self.events.send(RegistryEvent::Removed { agent_id: id.clone() });
         }
@@ -1451,6 +1459,69 @@ mod tests {
         let mut rx = reg.subscribe();
         assert!(!reg.remove(&AgentId::new()));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn snapshot_subscription_excludes_history_and_retains_new_events() {
+        let reg = AgentRegistry::new();
+        let root = reg.register(make_register_root("agent")).unwrap();
+        let (snapshot, mut rx) = reg.snapshot_and_subscribe();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, root.id);
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        reg.set_status(&root.id, AgentStatus::Blocked, None, None, None, std::time::SystemTime::now()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), RegistryEvent::StatusChanged { status: AgentStatus::Blocked, .. }));
+        reg.remove(&root.id);
+        assert!(matches!(rx.try_recv().unwrap(), RegistryEvent::Removed { .. }));
+    }
+
+    #[test]
+    fn fresh_subscription_after_lag_never_replays_old_status() {
+        let reg = AgentRegistry::new();
+        let root = reg.register(make_register_root("agent")).unwrap();
+        let (_, mut rx) = reg.snapshot_and_subscribe();
+        for _ in 0..=EVENT_CHANNEL_CAPACITY {
+            reg.set_status(&root.id, AgentStatus::Running, None, None, None, std::time::SystemTime::now()).unwrap();
+        }
+        reg.set_status(&root.id, AgentStatus::Done, None, None, None, std::time::SystemTime::now()).unwrap();
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Lagged(_))));
+        let (snapshot, fresh_rx) = reg.snapshot_and_subscribe();
+        rx = fresh_rx;
+        assert_eq!(snapshot[0].status, AgentStatus::Done);
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        reg.remove(&root.id);
+        assert!(matches!(rx.try_recv().unwrap(), RegistryEvent::Removed { .. }));
+    }
+
+    #[test]
+    fn concurrent_status_events_follow_accepted_mutation_order() {
+        let reg = std::sync::Arc::new(AgentRegistry::new());
+        let root = reg.register(make_register_root("agent")).unwrap();
+        let (_, mut rx) = reg.snapshot_and_subscribe();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let epoch = std::time::SystemTime::now();
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let reg = &reg;
+                let id = &root.id;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..16 {
+                        let sequence = iteration * 4 + worker;
+                        reg.set_status(id, AgentStatus::Running, None, Some(sequence), None,
+                            epoch + std::time::Duration::from_millis(sequence.into())).unwrap();
+                    }
+                });
+            }
+        });
+        let mut last = None;
+        while let Ok(RegistryEvent::StatusChanged { context_pct: Some(sequence), .. }) = rx.try_recv() {
+            assert!(last.is_none_or(|previous| sequence > previous), "events must follow accepted mutation order");
+            last = Some(sequence);
+        }
+        assert_eq!(last, Some(63));
+        assert_eq!(reg.get(&root.id).unwrap().context_pct, last);
     }
 
     #[test]

@@ -376,12 +376,12 @@ async fn handle_attach(
 ) {
     let write_half = Arc::new(AsyncMutex::new(write_half));
 
-    let snapshot = AttachEvent::Snapshot { agents: ctx.registry.snapshot() };
+    let (agents, mut registry_rx) = ctx.registry.snapshot_and_subscribe();
+    let snapshot = AttachEvent::Snapshot { agents };
     if !send_event(&write_half, &snapshot).await {
         return;
     }
 
-    let mut registry_rx = ctx.registry.subscribe();
     let watch: Arc<std::sync::Mutex<WatchState>> =
         Arc::new(std::sync::Mutex::new(WatchState { agent_id: None, last_sent_gen: 0, scroll_dirty: false }));
 
@@ -399,20 +399,13 @@ async fn handle_attach(
                             break;
                         }
                     }
-                    // A slow client missed some events — there's nothing to
-                    // replay them from (the registry only broadcasts), but
-                    // silently moving on used to leave the client's local
-                    // tree permanently stale for whichever agent's specific
-                    // update got dropped in the gap (a real, reported bug:
-                    // "agent is not running" shown for a live agent — the
-                    // client's own is_alive() reads its last-known status,
-                    // per `App::is_alive`'s doc comment, and a missed
-                    // StatusChanged with nothing after it to correct the
-                    // record leaves that wrong forever). A fresh `Snapshot`
-                    // is a full resync — the same mechanism `Watch` already
-                    // uses to avoid staleness on switching agents.
+                    // Replace the receiver at the snapshot boundary. Keeping
+                    // the old backlog could replay older statuses over current
+                    // state or resurrect an agent the snapshot already removed.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let snapshot = AttachEvent::Snapshot { agents: ctx.registry.snapshot() };
+                        let (agents, fresh_rx) = ctx.registry.snapshot_and_subscribe();
+                        registry_rx = fresh_rx;
+                        let snapshot = AttachEvent::Snapshot { agents };
                         if !send_event(&write_half, &snapshot).await {
                             break;
                         }
