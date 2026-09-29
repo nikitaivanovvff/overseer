@@ -64,3 +64,9 @@ wedged-daemon recovery test.
 - **Quit is a detach.** `q`/`Ctrl-C` never kills agents or the daemon; only
   `d`/`D`/`Q` (all confirmed) destroy anything, and workspace drops go
   through the TUI-only `Request::TuiDrop` wire request.
+
+## Task workflow surface
+
+The CLI exposes retained task coordination (`tasks`, `task`, `assign`, `complete`, `wait`, `accept`, `archive`). `context` prints the role bootstrap only for a live managed session; the hidden `codex-hook` command validates a bounded hook payload and bridges experimental Codex lifecycle events. Hook calls use bounded IPC timeouts and remain inert outside Overseer.
+
+The TUI still displays live sessions. A retained task inbox and result review/history screens are not implemented yet; use the CLI for that workflow. Keep future history I/O off the input/render loop.

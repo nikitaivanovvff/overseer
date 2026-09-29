@@ -26,8 +26,9 @@ src/
 │   ├── adapters/     Pluggable per-agent-type behaviour
 │   │   ├── mod       AgentAdapter trait (capabilities, install_files, spawn_command, env_inject) +
 │   │   │             identity_env(); the *.md files are the installed skills/instructions
-│   │   ├── claude    Claude Code adapter (user-level skills + hooks, launch cmd)
-│   │   └── opencode  opencode adapter (auto-loaded plugin.js + instructions array)
+│   │   ├── claude    Claude Code adapter (user-level status/context hooks, launch cmd)
+│   │   ├── opencode  opencode adapter (auto-loaded plugin + conditional context transform)
+│   │   └── codex     Experimental Codex CLI adapter (managed hooks.json, explicit hook trust)
 │   ├── spawn         Orchestrates session launch + env injection + register — the one shared
 │   │                 path under Start and Spawn (spawn_root_shell vs spawn_child_agent)
 │   └── drop          Kills an agent's PTY (and, recursively, its subtree) + deregisters it
@@ -44,6 +45,8 @@ src/
 ├── kill              `overseer kill`: forceful fallback for an unreachable daemon — graceful
 │                     Shutdown attempt first, then SIGKILL by lockfile pid (ps-scan fallback),
 │                     orphaned-PTY cleanup, stale socket/lockfile removal
+├── tasks             Retained assignments/results: bounded atomic journal, review/archive, condition-variable waits
+├── integration       Shared role bootstrap rendered from verified live registry identity
 ├── install           `overseer install/uninstall <agent>`: writes adapters' user-level files
 ├── settings          Pure JSON merge/remove for Claude's settings.json hooks (incl. legacy
 │                     untagged-entry recognition — see is_overseer_entry)
@@ -90,3 +93,13 @@ mutation lock), `SessionManager`'s dry-run constructors + `is_dry_run`, the
 `snapshot_from_bytes*` render fixtures, and the `RegisterArgs` re-export.
 Add new cross-crate test helpers under the same gate — never widen them to
 unconditional `pub` and never duplicate them in a consumer crate.
+
+## Retained work and integration context
+
+`AgentRegistry::tasks` owns a `TaskStore` independently of live tree nodes. The daemon opens `daemon.tasks.json` beside the default socket; mock/test registries default to memory only. Complete/accept/archive are explicit task operations, while hook-driven lifecycle updates continue to describe runtime activity. Removing a session preserves its result and interrupts an unfinished assignment. Restart reloads records without restoring PTYs.
+
+Task journals are bounded to 512 records and 8 MiB, with result space reserved when assigning. Inbox summaries project directly from stored records. Journal I/O and bounded waits run on the server's blocking workers; they do not add work to the terminal rendering path. An interrupted task remains interrupted in memory even if saving fails, and the error is logged.
+
+`Request::Context` verifies a live registry node and renders one concrete role through `integration::context`. Each harness delivers that context using its supported mechanism. This is identity lookup and instruction delivery; full integration-health handshakes and harness-session epochs remain future work.
+
+Registry mutations publish under the tree lock. Initial attach and lag recovery take a snapshot plus a fresh subscription under that same lock, so queued older events cannot overwrite a recovered snapshot.
