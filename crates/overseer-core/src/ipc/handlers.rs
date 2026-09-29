@@ -91,7 +91,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             }))
         }
         Request::Tasks { parent_id, archived } => Response::ok(Some(OkBody::Tasks {
-            tasks: ctx.registry.tasks.list(parent_id.as_ref(), archived).into_iter().map(Into::into).collect(),
+            tasks: ctx.registry.tasks.summaries(parent_id.as_ref(), archived),
         })),
         Request::Task { agent_id } => task_response(ctx.registry.tasks.get(&agent_id).ok_or_else(|| anyhow::anyhow!("unknown task"))),
         Request::Assign { agent_id, task } => {
@@ -644,12 +644,16 @@ mod tests {
             Some(OkBody::Context { context, contract_version: 1 }) => context,
             other => panic!("expected context, got {other:?}"),
         };
-        let root_context = context(root);
+        let root_context = context(root.clone());
         assert!(root_context.contains("workspace agent"));
         assert!(!root_context.contains("overseer complete"));
         let child_context = context(child);
         assert!(child_context.contains("team lead"));
         assert!(child_context.contains("overseer complete"));
+        let taskless = registered_id(spawn_child(&ctx, root, ""));
+        let taskless_context = context(taskless);
+        assert!(taskless_context.contains("overseer assign"));
+        assert!(taskless_context.contains("overseer complete"));
         let leaf_context = context(leaf.clone());
         assert!(leaf_context.contains("leaf contributor"));
         assert!(!leaf_context.contains("overseer spawn"));

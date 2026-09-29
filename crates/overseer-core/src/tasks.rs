@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(store.get(&completed).unwrap().result, Some(result()));
         assert_eq!(store.get(&pending).unwrap().state, TaskState::Interrupted);
         assert_eq!(store.list(Some(&parent), false).len(), 2);
-        store.interrupt(&[completed.clone()]).unwrap();
+        store.interrupt(std::slice::from_ref(&completed)).unwrap();
         assert_eq!(store.get(&completed).unwrap().state, TaskState::Complete);
         assert!(store.archive(&completed).is_err());
         store.accept(&completed).unwrap();
