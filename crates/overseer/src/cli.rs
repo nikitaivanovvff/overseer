@@ -385,7 +385,15 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 .map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             Ok(Some(Request::Agent { agent_id }))
         }
-        Command::Start { cwd } => Ok(Some(Request::Start { cwd })),
+        Command::Start { cwd } => {
+            let cwd = match cwd {
+                Some(path) if path.is_absolute() => path,
+                path => std::env::current_dir()
+                    .map_err(|e| anyhow::anyhow!("failed to resolve current directory: {e}"))?
+                    .join(path.unwrap_or_default()),
+            };
+            Ok(Some(Request::Start { cwd: Some(cwd) }))
+        },
         Command::Spawn { task, name, adapter } => {
             let parent_id_str = std::env::var("OVERSEER_AGENT_ID").map_err(|_| {
                 anyhow::anyhow!("overseer spawn must be run from an agent session (missing $OVERSEER_AGENT_ID)")
@@ -609,6 +617,15 @@ mod tests {
                 assert_eq!(attention.retry_at, Some(pushed_at + std::time::Duration::from_secs(30)));
             }
             other => panic!("expected attention update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_sends_an_absolute_caller_directory() {
+        let current = std::env::current_dir().unwrap();
+        for (input, expected) in [(None, current.clone()), (Some(PathBuf::from("child")), current.join("child")), (Some(PathBuf::from("/tmp/absolute")), PathBuf::from("/tmp/absolute"))] {
+            let request = build_request(Command::Start { cwd: input }, std::time::SystemTime::now()).unwrap().unwrap();
+            assert!(matches!(request, Request::Start { cwd: Some(path) } if path == expected));
         }
     }
 
