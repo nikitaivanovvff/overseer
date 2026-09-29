@@ -84,14 +84,17 @@ export const OverseerPlugin = async ({{ client }}) => {{
     if (!bootstrap) {{
       bootstrap = new Promise((resolve) => execFile(OVERSEER_BIN, ["context"],
         {{ timeout: 2000, maxBuffer: 64 * 1024 }}, (error, stdout) => {{
-          if (error) bootstrap = undefined;
-          resolve(error ? "" : stdout.trim());
+          const text = error ? "" : stdout.trim();
+          // `context` intentionally exits successfully with empty stdout when
+          // the daemon is unavailable. Allow the next boundary to retry.
+          if (!text) bootstrap = undefined;
+          resolve(text);
         }}));
     }}
     return bootstrap;
   }};
   const push = (status, extra = []) => new Promise((resolve) =>
-    execFile(OVERSEER_BIN, ["status", status, ...extra], {{ timeout: 2000 }}, (error) => {{
+    execFile(OVERSEER_BIN, ["status", status, "--adapter", "opencode", ...extra], {{ timeout: 2000 }}, (error) => {{
       if (error && process.env.OVERSEER_DEBUG) console.error(`overseer status push failed: ${{error.code || "unknown"}}`);
       resolve();
     }}));
@@ -122,7 +125,7 @@ export const OverseerPlugin = async ({{ client }}) => {{
         // Roots and taskless TUI-created children wait for a human prompt;
         // CLI-spawned children already have their initial task.
         const initial = process.env.OVERSEER_TASK ? "running" : "idle";
-        await push(initial, ["--adapter", "opencode", "--clear-context"]);
+        await push(initial, ["--clear-context"]);
       }} else if (event.type === "session.status" && event.properties?.status?.type === "busy") {{
         await push("running");
       }} else if (event.type === "session.idle") {{
@@ -320,16 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn plugin_self_identifies_as_opencode_only_on_session_created() {
-        // The only place this needs saying — a bare-shell root's registered
-        // adapter is always "shell" until the real harness inside it says
-        // otherwise; this is what an omitted --adapter on a later
-        // `overseer spawn` inherits.
+    fn plugin_self_identifies_on_each_genuine_status_push() {
+        // Resuming need not emit session.created. The next real status push
+        // establishes the adapter without inventing extra activity events.
         let content = make_adapter().plugin_content();
         assert!(content.contains(r#""--adapter", "opencode""#));
-        // Every other push (busy/idle/permission.replied/permission.ask)
-        // stays a plain two-element argv — only session.created's gets the
-        // extra pair.
+        assert!(content.contains(r#"["status", status, "--adapter", "opencode", ...extra]"#));
         let adapter_occurrences = content.matches("--adapter").count();
         assert_eq!(adapter_occurrences, 1, "adapter self-id should appear exactly once: {content}");
     }
@@ -409,7 +408,7 @@ mod tests {
         let bin = dir.join("overseer's executable");
         std::fs::write(&bin, r#"#!/bin/sh
 printf '%s\n' "$*" >> "$OVERSEER_TEST_LOG"
-if [ "$1" = context ]; then printf 'role:%s\n' "$OVERSEER_ROLE"; fi
+if [ "$1" = context ] && [ -z "$OVERSEER_TEST_EMPTY_CONTEXT" ]; then printf 'role:%s\n' "$OVERSEER_ROLE"; fi
 "#).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
         let plugin = dir.join("plugin.mjs");
@@ -427,6 +426,21 @@ process.env.OVERSEER_AGENT_ID = 'agent';
 delete process.env.OVERSEER_SOCKET;
 assert.deepEqual(await OverseerPlugin({client}), {});
 process.env.OVERSEER_SOCKET = '/tmp/test.sock';
+// A successful CLI exit with no context means the daemon could not resolve
+// this session. Retry at the next transform, then cache the nonempty result.
+process.env.OVERSEER_ROLE = 'root';
+process.env.OVERSEER_TEST_EMPTY_CONTEXT = '1';
+const resumed = await OverseerPlugin({client});
+const resumedSystem = {system: []};
+await resumed['experimental.chat.system.transform']({sessionID: 'resumed'}, resumedSystem);
+assert.deepEqual(resumedSystem.system, []);
+delete process.env.OVERSEER_TEST_EMPTY_CONTEXT;
+await Promise.all([1, 2].map(() => resumed['experimental.chat.system.transform']({sessionID: 'resumed'}, resumedSystem)));
+await resumed['experimental.chat.system.transform']({sessionID: 'resumed'}, resumedSystem);
+assert.deepEqual(resumedSystem.system, ['role:root']);
+// A resumed session may never emit session.created. Its next real lifecycle
+// event must identify the harness without transforms fabricating activity.
+await resumed.event({event: {type: 'session.status', properties: {sessionID: 'resumed', status: {type: 'busy'}}}});
 for (const role of ['root', 'child']) {
   process.env.OVERSEER_ROLE = role;
   const hooks = await OverseerPlugin({client});
@@ -450,8 +464,10 @@ for (const role of ['root', 'child']) {
   await hooks.event({event: {type: 'session.error', properties: {sessionID: 'main', error: {name: 'APIError', data: {statusCode: 429}}}}});
 }
 const lines = readFileSync(process.env.OVERSEER_TEST_LOG, 'utf8').trim().split('\n');
-assert.equal(lines.filter(line => line === 'context').length, 4, 'context cached per session and refreshed at compaction');
-assert.equal(lines.filter(line => line.startsWith('status ')).length, 6, 'only main-session events report status');
+assert.equal(lines.filter(line => line === 'context').length, 6, 'empty context retried once; nonempty context cached until compaction');
+const pushes = lines.filter(line => line.startsWith('status '));
+assert.equal(pushes.length, 7, 'only genuine main-session events report status');
+assert.ok(pushes.every(line => line.includes('--adapter opencode')), 'resumed sessions identify themselves on every genuine status push');
 assert.equal(lines.filter(line => line.includes('--attention permission')).length, 2);
 assert.equal(lines.filter(line => line.includes('--attention rate-limit')).length, 2);
 "#).unwrap();
