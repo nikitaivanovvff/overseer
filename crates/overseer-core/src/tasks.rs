@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 const MAX_RECORDS: usize = 512;
 const MAX_RESULT_BYTES: usize = 16 * 1024;
+const MAX_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
+// Timestamp precision and state names can grow slightly during later transitions.
+const RECORD_METADATA_RESERVE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,11 +52,26 @@ pub struct TaskSummary {
     pub archived: bool,
 }
 
+impl From<&TaskRecord> for TaskSummary {
+    fn from(task: &TaskRecord) -> Self {
+        let text = task
+            .result
+            .as_ref()
+            .map(|r| r.summary.as_str())
+            .unwrap_or(&task.assignment);
+        Self {
+            agent_id: task.agent_id.clone(),
+            parent_id: task.parent_id.clone(),
+            state: task.state.clone(),
+            summary: text.chars().take(120).collect(),
+            archived: task.archived,
+        }
+    }
+}
+
 impl From<TaskRecord> for TaskSummary {
     fn from(task: TaskRecord) -> Self {
-        let text = task.result.as_ref().map(|r| r.summary.as_str()).unwrap_or(&task.assignment);
-        Self { agent_id: task.agent_id, parent_id: task.parent_id, state: task.state,
-            summary: text.chars().take(120).collect(), archived: task.archived }
+        Self::from(&task)
     }
 }
 
@@ -71,12 +89,27 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut records: Journal = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .context("invalid task journal; existing file was preserved")?,
+        use std::io::Read;
+        let mut records: Journal = match std::fs::File::open(path) {
+            Ok(file) => {
+                // Bound the read itself, including files that grow after open.
+                let mut bytes = Vec::new();
+                file.take((MAX_JOURNAL_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= MAX_JOURNAL_BYTES,
+                    "task journal exceeds 8 MiB; existing file was preserved"
+                );
+                serde_json::from_slice(&bytes)
+                    .context("invalid task journal; existing file was preserved")?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Journal::default(),
             Err(e) => return Err(e.into()),
         };
+        ensure!(
+            records.records.len() <= MAX_RECORDS,
+            "task journal exceeds 512 records; existing file was preserved"
+        );
         for task in records.records.values_mut() {
             if task.state == TaskState::Assigned {
                 task.state = TaskState::Interrupted;
@@ -95,6 +128,11 @@ impl TaskStore {
     fn persist(&self, journal: &Journal) -> Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        let encoded = serde_json::to_vec(journal)?;
+        ensure!(
+            encoded.len() <= MAX_JOURNAL_BYTES,
+            "task journal exceeds 8 MiB"
+        );
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -105,7 +143,7 @@ impl TaskStore {
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            file.write_all(&serde_json::to_vec(journal)?)?;
+            file.write_all(&encoded)?;
             file.sync_all()?;
             std::fs::rename(&tmp, path)?;
             Ok(())
@@ -138,18 +176,6 @@ impl TaskStore {
                 !journal.records.contains_key(&agent_id.0.to_string()),
                 "session already has an assignment"
             );
-            if journal.records.len() >= MAX_RECORDS {
-                let oldest = journal
-                    .records
-                    .iter()
-                    .filter(|(_, t)| t.archived)
-                    .min_by_key(|(_, t)| t.updated_at)
-                    .map(|(id, _)| id.clone());
-                let Some(oldest) = oldest else {
-                    bail!("task history is full; archive reviewed tasks first")
-                };
-                journal.records.remove(&oldest);
-            }
             journal.records.insert(
                 agent_id.0.to_string(),
                 TaskRecord {
@@ -162,8 +188,36 @@ impl TaskStore {
                     updated_at: SystemTime::now(),
                 },
             );
+            // Reserve each open task's maximum result now, so a full inbox
+            // cannot prevent reporting completion later. Include JSON escaping
+            // in the budget, not just the assignment's UTF-8 byte length.
+            let mut usage = serde_json::to_vec(journal)?.len()
+                + journal.records.values().map(Self::reserved_bytes).sum::<usize>();
+            while journal.records.len() > MAX_RECORDS || usage > MAX_JOURNAL_BYTES {
+                let oldest = journal.records.iter()
+                    .filter(|(_, task)| task.archived)
+                    .min_by_key(|(_, task)| task.updated_at)
+                    .map(|(id, _)| id.clone());
+                let Some(oldest) = oldest else {
+                    bail!("task history is full (512 records or 8 MiB including reserved results); archive reviewed tasks first")
+                };
+                let removed = journal.records.remove(&oldest).unwrap();
+                // At least the new unarchived record remains: removing this
+                // object member also removes exactly one colon and comma.
+                usage -= serde_json::to_vec(&oldest)?.len() + serde_json::to_vec(&removed)?.len()
+                    + 2 + Self::reserved_bytes(&removed);
+            }
             Ok(())
         })
+    }
+
+    fn reserved_bytes(task: &TaskRecord) -> usize {
+        RECORD_METADATA_RESERVE
+            + if task.state == TaskState::Assigned {
+                MAX_RESULT_BYTES + RECORD_METADATA_RESERVE
+            } else {
+                0
+            }
     }
 
     pub fn complete(&self, id: &AgentId, result: TaskResult) -> Result<TaskRecord> {
@@ -228,24 +282,46 @@ impl TaskStore {
     }
 
     pub fn interrupt(&self, ids: &[AgentId]) -> Result<()> {
-        // Ordinary root drops have no task; avoid unnecessary journal writes.
-        if !ids
-            .iter()
-            .any(|id| self.get(id).is_some_and(|t| t.state == TaskState::Assigned))
-        {
+        let mut current = self.records.lock().unwrap();
+        if !ids.iter().any(|id| {
+            current
+                .records
+                .get(&id.0.to_string())
+                .is_some_and(|task| task.state == TaskState::Assigned)
+        }) {
             return Ok(());
         }
-        self.update(|journal| {
-            for id in ids {
-                if let Some(task) = journal.records.get_mut(&id.0.to_string()) {
-                    if task.state == TaskState::Assigned {
-                        task.state = TaskState::Interrupted;
-                        task.updated_at = SystemTime::now();
-                    }
+        let mut next = current.clone();
+        for id in ids {
+            if let Some(task) = next.records.get_mut(&id.0.to_string()) {
+                if task.state == TaskState::Assigned {
+                    task.state = TaskState::Interrupted;
+                    task.updated_at = SystemTime::now();
                 }
             }
-            Ok(())
-        })
+        }
+        // A process exit cannot be rolled back when storage fails. Publish the
+        // truth and wake waiters anyway; return the error for the daemon log.
+        // A later successful mutation persists this state along with its own.
+        let persisted = self.persist(&next);
+        *current = next;
+        self.changed.notify_all();
+        persisted
+    }
+
+    /// Projects only inbox fields; large assignments/results are never cloned.
+    pub fn summaries(&self, parent: Option<&AgentId>, include_archived: bool) -> Vec<TaskSummary> {
+        self.records
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .filter(|task| {
+                parent.is_none_or(|id| &task.parent_id == id)
+                    && (include_archived || !task.archived)
+            })
+            .map(TaskSummary::from)
+            .collect()
     }
 
     pub fn list(&self, parent: Option<&AgentId>, include_archived: bool) -> Vec<TaskRecord> {
@@ -394,6 +470,189 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(store.complete(&id, result()).is_err());
         assert_eq!(store.get(&id).unwrap().state, TaskState::Assigned);
+    }
+
+    #[test]
+    fn interrupted_state_wakes_waiters_even_when_persistence_fails() {
+        let dir = std::env::temp_dir().join(format!("ovsr-tasks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("tasks.json");
+        let store = std::sync::Arc::new(TaskStore::open(&path).unwrap());
+        let id = AgentId::new();
+        store
+            .assign(id.clone(), AgentId::new(), "work".into())
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let waiting = store.clone();
+        let waiting_id = id.clone();
+        let waiter =
+            std::thread::spawn(move || waiting.wait(&waiting_id, Duration::from_secs(2)).unwrap());
+        assert!(store.interrupt(std::slice::from_ref(&id)).is_err());
+        let (record, timed_out) = waiter.join().unwrap();
+        assert!(!timed_out);
+        assert_eq!(record.state, TaskState::Interrupted);
+        std::fs::create_dir(&dir).unwrap();
+        store
+            .assign(AgentId::new(), AgentId::new(), "next work".into())
+            .unwrap();
+        assert_eq!(
+            TaskStore::open(&path).unwrap().get(&id).unwrap().state,
+            TaskState::Interrupted
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serialized_budget_includes_escaping_and_reserves_all_completion_results() {
+        let store = TaskStore::default();
+        let assignment = "\u{0001}".repeat(crate::ipc::protocol::MAX_SPAWN_TASK_BYTES);
+        let mut admitted = Vec::new();
+        for _ in 0..16 {
+            let id = AgentId::new();
+            if store
+                .assign(id.clone(), AgentId::new(), assignment.clone())
+                .is_err()
+            {
+                assert!(
+                    store.get(&id).is_none(),
+                    "rejected assignment must roll back"
+                );
+                break;
+            }
+            admitted.push(id);
+        }
+        assert!(
+            !admitted.is_empty() && admitted.len() < 16,
+            "escaped JSON must hit the byte budget first"
+        );
+        let mut largest = result();
+        largest.summary.clear();
+        largest.summary =
+            "x".repeat(MAX_RESULT_BYTES - serde_json::to_vec(&largest).unwrap().len());
+        assert_eq!(
+            serde_json::to_vec(&largest).unwrap().len(),
+            MAX_RESULT_BYTES
+        );
+        for id in &admitted {
+            store
+                .complete(id, largest.clone())
+                .expect("capacity must not prevent an admitted task completing");
+        }
+        assert!(
+            serde_json::to_vec(&*store.records.lock().unwrap())
+                .unwrap()
+                .len()
+                <= MAX_JOURNAL_BYTES
+        );
+        let oldest = &admitted[0];
+        store.accept(oldest).unwrap();
+        store.archive(oldest).unwrap();
+        store
+            .assign(AgentId::new(), AgentId::new(), assignment)
+            .unwrap();
+        assert!(
+            store.get(oldest).is_none(),
+            "archived entries also make room under the byte cap"
+        );
+        assert!(admitted[1..].iter().all(|id| store.get(id).is_some()));
+    }
+
+    fn closed_record(id: AgentId) -> TaskRecord {
+        TaskRecord {
+            agent_id: id,
+            parent_id: AgentId::new(),
+            assignment: "work".into(),
+            state: TaskState::Interrupted,
+            result: None,
+            archived: false,
+            updated_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn full_history_prunes_oldest_archived_only_and_rolls_back_on_save_failure() {
+        let mut journal = Journal::default();
+        let oldest = AgentId::new();
+        let newer = AgentId::new();
+        for id in [oldest.clone(), newer.clone()]
+            .into_iter()
+            .chain((2..MAX_RECORDS).map(|_| AgentId::new()))
+        {
+            let mut record = closed_record(id.clone());
+            record.archived = id == oldest || id == newer;
+            if id == newer {
+                record.updated_at += Duration::from_secs(1);
+            }
+            journal.records.insert(id.0.to_string(), record);
+        }
+        let dir = std::env::temp_dir().join(format!("ovsr-tasks-missing-{}", uuid::Uuid::new_v4()));
+        let mut store = TaskStore {
+            records: Mutex::new(journal),
+            path: Some(dir.join("tasks.json")),
+            ..Default::default()
+        };
+        assert!(store
+            .assign(AgentId::new(), AgentId::new(), "new".into())
+            .is_err());
+        assert!(
+            store.get(&oldest).is_some(),
+            "failed persistence must not discard archived history"
+        );
+        store.path = None;
+        store
+            .assign(AgentId::new(), AgentId::new(), "new".into())
+            .unwrap();
+        assert!(store.get(&oldest).is_none());
+        assert!(store.get(&newer).is_some());
+        assert_eq!(store.summaries(None, true).len(), MAX_RECORDS);
+    }
+
+    #[test]
+    fn oversized_journals_are_rejected_without_rewriting() {
+        let path = std::env::temp_dir().join(format!("ovsr-tasks-{}.json", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_JOURNAL_BYTES + 1) as u64).unwrap();
+        drop(file);
+        assert!(TaskStore::open(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (MAX_JOURNAL_BYTES + 1) as u64
+        );
+        let mut journal = Journal::default();
+        for _ in 0..=MAX_RECORDS {
+            let id = AgentId::new();
+            journal.records.insert(id.0.to_string(), closed_record(id));
+        }
+        let encoded = serde_json::to_vec(&journal).unwrap();
+        std::fs::write(&path, &encoded).unwrap();
+        assert!(TaskStore::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn summaries_filter_parent_archive_and_project_bounded_unicode_text() {
+        let store = TaskStore::default();
+        let id = AgentId::new();
+        let parent = AgentId::new();
+        store
+            .assign(id.clone(), parent.clone(), "🌲".repeat(1000))
+            .unwrap();
+        store
+            .assign(AgentId::new(), AgentId::new(), "other team".into())
+            .unwrap();
+        let summaries = store.summaries(Some(&parent), false);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].summary, "🌲".repeat(120));
+        store.complete(&id, result()).unwrap();
+        assert_eq!(
+            store.summaries(Some(&parent), false)[0].summary,
+            result().summary
+        );
+        store.accept(&id).unwrap();
+        store.archive(&id).unwrap();
+        assert!(store.summaries(Some(&parent), false).is_empty());
+        assert_eq!(store.summaries(Some(&parent), true).len(), 1);
     }
 
     #[test]
