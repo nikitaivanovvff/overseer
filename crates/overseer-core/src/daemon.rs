@@ -199,7 +199,7 @@ pub fn run_daemon(socket: PathBuf) -> Result<()> {
     )?;
 
     let ctx = Arc::new(AppCtx {
-        registry: Arc::new(AgentRegistry::new()),
+        registry: Arc::new(AgentRegistry::with_tasks(crate::tasks::TaskStore::open(&socket.with_extension("tasks.json"))?)),
         sessions: Arc::new(SessionManager::new()),
         socket: socket.clone(),
         git: Arc::new(GitClient::new()),

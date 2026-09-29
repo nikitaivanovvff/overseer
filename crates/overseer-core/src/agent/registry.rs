@@ -56,6 +56,7 @@ pub enum RegistryEvent {
 }
 
 pub struct AgentRegistry {
+    pub tasks: crate::tasks::TaskStore,
     // Keep this lock through each mutation's broadcast send: snapshot+subscribe
     // and every receiver must observe the same order as the authoritative tree.
     tree: Mutex<AgentTree>,
@@ -101,14 +102,18 @@ pub struct RegisterResult {
 }
 
 impl AgentRegistry {
+    pub fn with_tasks(tasks: crate::tasks::TaskStore) -> Self {
+        Self { tasks, ..Self::new() }
+    }
+
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { tree: Mutex::new(AgentTree::new()), lifecycle: Mutex::new(false), events }
+        Self { tasks: crate::tasks::TaskStore::default(), tree: Mutex::new(AgentTree::new()), lifecycle: Mutex::new(false), events }
     }
 
     pub fn from_tree(tree: AgentTree) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { tree: Mutex::new(tree), lifecycle: Mutex::new(false), events }
+        Self { tasks: crate::tasks::TaskStore::default(), tree: Mutex::new(tree), lifecycle: Mutex::new(false), events }
     }
 
     pub(crate) fn lifecycle(&self) -> std::sync::MutexGuard<'_, bool> {

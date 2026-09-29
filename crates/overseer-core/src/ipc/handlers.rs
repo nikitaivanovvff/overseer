@@ -29,6 +29,13 @@ pub struct AppCtx {
     pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
+fn task_response(result: anyhow::Result<crate::tasks::TaskRecord>) -> Response {
+    match result {
+        Ok(task) => Response::ok(Some(OkBody::Task { task: Box::new(task), timed_out: false })),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
 /// Dispatches a parsed request to the registry and returns a wire response.
 /// No socket I/O occurs here — this is the unit-testable seam.
 /// Blocking calls (git, session launch) are expected to run inside `spawn_blocking` at the call site.
@@ -71,6 +78,40 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 Err(e) => Response::err(e.to_string()),
             }
         }
+
+        Request::Context { agent_id } => {
+            let Some(agent) = ctx.registry.get(&agent_id) else { return Response::err("unknown managed session") };
+            if !agent.session_alive { return Response::err("managed session has exited"); }
+            let depth = ctx.registry.with_tree(|tree| tree.depth(&agent_id));
+            let Some(depth) = depth else { return Response::err("managed session was removed") };
+            let task = ctx.registry.tasks.get(&agent_id);
+            Response::ok(Some(OkBody::Context {
+                context: crate::integration::context(&agent, depth, task.as_ref()),
+                contract_version: crate::integration::CONTRACT_VERSION,
+            }))
+        }
+        Request::Tasks { parent_id, archived } => Response::ok(Some(OkBody::Tasks {
+            tasks: ctx.registry.tasks.list(parent_id.as_ref(), archived).into_iter().map(Into::into).collect(),
+        })),
+        Request::Task { agent_id } => task_response(ctx.registry.tasks.get(&agent_id).ok_or_else(|| anyhow::anyhow!("unknown task"))),
+        Request::Assign { agent_id, task } => {
+            let closing = ctx.registry.lifecycle();
+            if *closing { return Response::err("daemon is shutting down"); }
+            let Some(agent) = ctx.registry.get(&agent_id) else { return Response::err("unknown agent") };
+            if !agent.session_alive { return Response::err("session has exited"); }
+            let Some(parent) = agent.parent_id else { return Response::err("only children have delegated assignments") };
+            match ctx.registry.tasks.assign(agent_id.clone(), parent, task) {
+                Ok(()) => task_response(ctx.registry.tasks.get(&agent_id).ok_or_else(|| anyhow::anyhow!("unknown task"))),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::Complete { agent_id, result } => task_response(ctx.registry.tasks.complete(&agent_id, result)),
+        Request::Accept { agent_id } => task_response(ctx.registry.tasks.accept(&agent_id)),
+        Request::Archive { agent_id } => task_response(ctx.registry.tasks.archive(&agent_id)),
+        Request::Wait { agent_id, timeout_secs } => match ctx.registry.tasks.wait(&agent_id, std::time::Duration::from_secs(timeout_secs)) {
+            Ok((task, timed_out)) => Response::ok(Some(OkBody::Task { task: Box::new(task), timed_out })),
+            Err(e) => Response::err(e.to_string()),
+        },
 
         Request::List => Response::ok(Some(OkBody::Agents { agents: ctx.registry.snapshot() })),
 
@@ -591,6 +632,52 @@ mod tests {
             }
             other => panic!("expected Agents, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn context_resolves_role_from_registry_and_rejects_removed_sessions() {
+        let ctx = make_ctx();
+        let root = start_root(&ctx);
+        let child = registered_id(spawn_child(&ctx, root.clone(), "implement auth"));
+        let leaf = registered_id(spawn_child(&ctx, child.clone(), "review tests"));
+        let context = |id: AgentId| match dispatch(&ctx, Request::Context { agent_id: id }).data {
+            Some(OkBody::Context { context, contract_version: 1 }) => context,
+            other => panic!("expected context, got {other:?}"),
+        };
+        let root_context = context(root);
+        assert!(root_context.contains("workspace agent"));
+        assert!(!root_context.contains("overseer complete"));
+        let child_context = context(child);
+        assert!(child_context.contains("team lead"));
+        assert!(child_context.contains("overseer complete"));
+        let leaf_context = context(leaf.clone());
+        assert!(leaf_context.contains("leaf contributor"));
+        assert!(!leaf_context.contains("overseer spawn"));
+        assert!(dispatch(&ctx, Request::Drop { agent_id: leaf.clone(), recursive: false }).ok);
+        assert!(!dispatch(&ctx, Request::Context { agent_id: leaf }).ok);
+    }
+
+    #[test]
+    fn task_result_survives_hooks_drop_and_parent_review() {
+        let ctx = make_ctx();
+        let parent = start_root(&ctx);
+        let child = registered_id(spawn_child(&ctx, parent.clone(), "the full assignment"));
+        assert_eq!(ctx.registry.tasks.get(&child).unwrap().assignment, "the full assignment");
+        let report = crate::tasks::TaskResult {
+            summary: "implemented".into(), work_dir: PathBuf::from("/tmp/repo"),
+            artifacts: vec!["commit:123".into()], validation: "tests passed".into(),
+        };
+        assert!(dispatch(&ctx, Request::Complete { agent_id: child.clone(), result: report.clone() }).ok);
+        for status in [crate::agent::AgentStatus::Running, crate::agent::AgentStatus::Idle] {
+            ctx.registry.set_status(&child, status, None, None, None, std::time::SystemTime::now()).unwrap();
+        }
+        assert!(dispatch(&ctx, Request::Drop { agent_id: child.clone(), recursive: false }).ok);
+        assert!(ctx.registry.get(&child).is_none());
+        assert_eq!(ctx.registry.tasks.get(&child).unwrap().result, Some(report));
+        assert!(dispatch(&ctx, Request::Accept { agent_id: child.clone() }).ok);
+        assert!(dispatch(&ctx, Request::Archive { agent_id: child.clone() }).ok);
+        assert!(ctx.registry.tasks.list(Some(&parent), false).is_empty());
+        assert_eq!(ctx.registry.tasks.list(Some(&parent), true).len(), 1);
     }
 
     fn start_root(ctx: &AppCtx) -> AgentId {

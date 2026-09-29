@@ -51,6 +51,8 @@ pub enum SpawnError {
     AdapterNotInstalled(String),
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    #[error("task registration failed: {0}")]
+    Task(anyhow::Error),
     #[error("launch failed: {0}")]
     Launch(anyhow::Error),
 }
@@ -144,6 +146,7 @@ fn spawn_root(
     let cmd = Command::new(resolve_shell());
 
     if let Err(e) = sessions.launch(result.id.clone(), &req.cwd, &cmd, &env) {
+        let _ = registry.tasks.interrupt(std::slice::from_ref(&result.id));
         registry.remove(&result.id);
         return Err(SpawnError::Launch(e));
     }
@@ -237,6 +240,14 @@ fn spawn_child_agent(
         initial_status,
     };
     let result = registry.register(args)?;
+    if !req.task.trim().is_empty() {
+        if let Some(parent) = &req.parent_id {
+            if let Err(error) = registry.tasks.assign(result.id.clone(), parent.clone(), req.task.clone()) {
+                registry.remove(&result.id);
+                return Err(SpawnError::Task(error));
+            }
+        }
+    }
     let depth = registry
         .with_tree(|tree| tree.depth(&result.id))
         .expect("newly registered child must be in tree");
@@ -260,6 +271,7 @@ fn spawn_child_agent(
 
     if let Err(e) = launch(&launch_ctx, adapter.as_ref(), sessions) {
         // Don't leave a phantom "Running" node behind with no session backing it.
+        let _ = registry.tasks.interrupt(std::slice::from_ref(&result.id));
         registry.remove(&result.id);
         return Err(SpawnError::Launch(e));
     }

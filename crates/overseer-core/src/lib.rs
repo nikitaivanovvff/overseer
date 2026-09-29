@@ -9,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod git;
 pub mod install;
+pub mod integration;
 pub mod ipc;
 pub mod kill;
 pub mod notify;

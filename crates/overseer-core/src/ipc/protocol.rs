@@ -115,6 +115,15 @@ pub enum Request {
         pushed_at: std::time::SystemTime,
     },
     List,
+    Context { agent_id: AgentId },
+    Tasks { parent_id: Option<AgentId>, #[serde(default)] archived: bool },
+    Task { agent_id: AgentId },
+    Assign { agent_id: AgentId, task: String },
+    Complete { agent_id: AgentId, result: crate::tasks::TaskResult },
+    Accept { agent_id: AgentId },
+    Archive { agent_id: AgentId },
+    Wait { agent_id: AgentId, timeout_secs: u64 },
+
     Agent {
         agent_id: AgentId,
     },
@@ -435,6 +444,9 @@ pub struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OkBody {
+    Context { context: String, contract_version: u32 },
+    Tasks { tasks: Vec<crate::tasks::TaskSummary> },
+    Task { task: Box<crate::tasks::TaskRecord>, #[serde(default)] timed_out: bool },
     Registered { agent_id: AgentId, branch: String },
     Agents { agents: Vec<AgentDto> },
     Agent { agent: Box<AgentDto> },

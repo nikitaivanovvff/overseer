@@ -58,6 +58,9 @@ pub(crate) fn drop_agent_locked(
         sessions.kill(descendant_id);
     }
 
+    if let Err(error) = registry.tasks.interrupt(&subtree) {
+        eprintln!("overseer: could not retain interrupted task state: {error}");
+    }
     registry.remove(id);
     Ok(())
 }

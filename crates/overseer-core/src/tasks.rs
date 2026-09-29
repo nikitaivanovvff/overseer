@@ -39,6 +39,24 @@ pub struct TaskRecord {
     pub updated_at: SystemTime,
 }
 
+/// Compact inbox entries keep a full history listing below the IPC response limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub agent_id: AgentId,
+    pub parent_id: AgentId,
+    pub state: TaskState,
+    pub summary: String,
+    pub archived: bool,
+}
+
+impl From<TaskRecord> for TaskSummary {
+    fn from(task: TaskRecord) -> Self {
+        let text = task.result.as_ref().map(|r| r.summary.as_str()).unwrap_or(&task.assignment);
+        Self { agent_id: task.agent_id, parent_id: task.parent_id, state: task.state,
+            summary: text.chars().take(120).collect(), archived: task.archived }
+    }
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Journal {
     records: BTreeMap<String, TaskRecord>,

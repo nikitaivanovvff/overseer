@@ -649,6 +649,9 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
     let _lifecycle = registry.lifecycle();
     for (id, success) in sessions.drain_exits() {
         registry.mark_session_exited(&id);
+        if let Err(error) = registry.tasks.interrupt(std::slice::from_ref(&id)) {
+            eprintln!("overseer: could not retain exited task state: {error}");
+        }
 
         let agent = registry.get(&id);
         // A childless agent (child, or a Root with no live descendants) is
