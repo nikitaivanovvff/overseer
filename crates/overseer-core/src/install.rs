@@ -29,6 +29,9 @@ pub fn run_install(agent_name: &str, uninstall: bool) -> Result<()> {
         // single skills/overseer/) sitting alongside the new one.
         remove_legacy_paths(adapter.as_ref(), &config_dir)?;
         println!("installed '{agent_name}' adapter → config dir: {}", config_dir.display());
+        if agent_name == "codex" {
+            println!("Codex integration is experimental. In Codex, open /hooks, review and trust the Overseer hooks, then restart the session. Hook trust is never changed by Overseer.");
+        }
     }
 
     Ok(())
@@ -214,6 +217,26 @@ fn remove_legacy_paths(adapter: &dyn AgentAdapter, config_dir: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_hooks_install_upgrade_and_uninstall_preserve_user_hooks() {
+        use crate::agent::adapters::codex::CodexAdapter;
+        let dir = std::env::temp_dir().join(format!("overseer-codex-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hooks.json");
+        let original = serde_json::json!({"description":"user hooks", "hooks": {
+            "Stop": [{"hooks":[{"type":"command","command":"echo user"}]}]
+        }});
+        std::fs::write(&path, original.to_string()).unwrap();
+        let files = CodexAdapter::new().install_files();
+        install_file(&files[0], &dir).unwrap();
+        install_file(&files[0], &dir).unwrap();
+        let installed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(installed["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        uninstall_file(&files[0], &dir).unwrap();
+        let removed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed, original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn settings_merge_preserves_jsonc_and_rejects_invalid_input() {
         let dir = std::env::temp_dir().join(format!("overseer-install-{}", uuid::Uuid::new_v4()));

@@ -143,6 +143,10 @@ fn default_adapters() -> HashMap<String, AdapterConfig> {
         "opencode".to_string(),
         AdapterConfig { command: "opencode".to_string(), extra_args: vec![] },
     );
+    adapters.insert(
+        "codex".to_string(),
+        AdapterConfig { command: "codex".to_string(), extra_args: vec![] },
+    );
     adapters
 }
 

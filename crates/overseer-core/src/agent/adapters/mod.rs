@@ -6,6 +6,7 @@ use crate::agent::{AgentId, AgentRole};
 use serde::{Deserialize, Serialize};
 
 pub mod claude;
+pub mod codex;
 pub mod opencode;
 
 /// Identity passed to an adapter at launch time.
@@ -181,6 +182,7 @@ pub fn capabilities_for(name: &str) -> AdapterCapabilities {
 pub fn adapter_for(name: &str) -> Option<Box<dyn AgentAdapter>> {
     match name {
         "claude" => Some(Box::new(claude::ClaudeAdapter::new())),
+        "codex" => Some(Box::new(codex::CodexAdapter::new())),
         "opencode" => Some(Box::new(opencode::OpencodeAdapter::new())),
         _ => None,
     }

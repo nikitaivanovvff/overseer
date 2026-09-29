@@ -61,6 +61,7 @@ fn is_overseer_entry(entry: &Value) -> bool {
             .map(|cmd| {
                 LEGACY_SIGNATURE_PARTS.iter().all(|part| cmd.contains(part))
                     || invokes_overseer_status_subcommand(cmd)
+                    || cmd.ends_with(crate::agent::adapters::codex::HOOK_MARKER)
             })
             .unwrap_or(false)
     })
