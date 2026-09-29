@@ -636,10 +636,11 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
     let content = term.renderable_content();
     for cell in content.display_iter {
         let point = cell.point;
-        if point.line.0 < 0 {
+        let viewport_row = point.line.0 + content.display_offset as i32;
+        if viewport_row < 0 {
             continue;
         }
-        let row = point.line.0 as usize;
+        let row = viewport_row as usize;
         let col = point.column.0;
         if row >= lines || col >= cols || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
@@ -657,8 +658,9 @@ fn grid_snapshot_from_term<T: EventListener>(term: &Term<T>) -> GridSnapshot {
     }
 
     let cursor_point = content.cursor.point;
-    let cursor = if cursor_point.line.0 >= 0 {
-        let row = cursor_point.line.0 as usize;
+    let cursor_row = cursor_point.line.0 + content.display_offset as i32;
+    let cursor = if cursor_row >= 0 {
+        let row = cursor_row as usize;
         let col = cursor_point.column.0;
         (row < lines && col < cols).then_some((row as u16, col as u16))
     } else {
@@ -751,6 +753,20 @@ pub fn snapshot_from_bytes(cols: usize, lines: usize, bytes: &[u8]) -> GridSnaps
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn scrollback_exports_exact_history_rows() {
+        let bytes: Vec<u8> = (0..30).flat_map(|i| format!("line{i}\r\n").into_bytes()).collect();
+        for offset in [1, 3, 10] {
+            let grid = snapshot_from_bytes_scrolled(20, 5, &bytes, offset, false);
+            for row in 0..5 {
+                let text: String = grid.cells[row * 20..(row + 1) * 20].iter().map(|c| c.as_ref().map_or(' ', |c| c.ch)).collect();
+                let line = 26 + row as i32 - offset;
+                assert_eq!(text.trim_end(), format!("line{line}"));
+            }
+            if offset >= 5 { assert!(grid.cursor.is_none()); }
+        }
+    }
 
     #[test]
     fn dry_run_launch_is_noop() {

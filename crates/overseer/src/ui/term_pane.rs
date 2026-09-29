@@ -274,18 +274,19 @@ mod tests {
         let live = snapshot_from_bytes(10, 5, &bytes);
         let mut live_buf = Buffer::empty(area);
         paint_grid_snapshot(&live, area, &mut live_buf, false, None);
-        let live_top: String = (0..5).map(|c| live_buf[(c, 0)].symbol()).collect();
+        let live_top: String = (0..10).map(|c| live_buf[(c, 0)].symbol()).collect();
 
         let scrolled = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, false);
         let mut scrolled_buf = Buffer::empty(area);
         paint_grid_snapshot(&scrolled, area, &mut scrolled_buf, false, None);
-        let scrolled_top: String = (0..5).map(|c| scrolled_buf[(c, 0)].symbol()).collect();
-        assert_ne!(scrolled_top, live_top, "scrolling up must show older content");
+        let scrolled_top: String = (0..10).map(|c| scrolled_buf[(c, 0)].symbol()).collect();
+        assert_eq!(live_top.trim_end(), "line16");
+        assert_eq!(scrolled_top.trim_end(), "line11");
 
         let restored = snapshot_from_bytes_scrolled(10, 5, &bytes, 5, true);
         let mut restored_buf = Buffer::empty(area);
         paint_grid_snapshot(&restored, area, &mut restored_buf, false, None);
-        let restored_top: String = (0..5).map(|c| restored_buf[(c, 0)].symbol()).collect();
+        let restored_top: String = (0..10).map(|c| restored_buf[(c, 0)].symbol()).collect();
         assert_eq!(restored_top, live_top, "scrolling back to bottom must restore the live view");
     }
 
