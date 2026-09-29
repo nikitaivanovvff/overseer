@@ -38,6 +38,9 @@ pub fn run_install(agent_name: &str, uninstall: bool) -> Result<()> {
 }
 
 fn install_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()> {
+    if matches!(file.merge, MergeStrategy::JsonArrayRemove { .. }) {
+        return uninstall_file(file, config_dir);
+    }
     let full_path = config_dir.join(&file.path);
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)
@@ -81,6 +84,7 @@ fn install_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<()
                 .with_context(|| format!("failed to write {}", full_path.display()))?;
             println!("merged   {}", full_path.display());
         }
+        MergeStrategy::JsonArrayRemove { .. } => unreachable!("removal handled before creating paths"),
     }
     Ok(())
 }
@@ -178,7 +182,8 @@ fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<
                 println!("updated  {} (removed overseer hooks)", full_path.display());
             }
         }
-        MergeStrategy::JsonArrayMerge { key, ref entries } => {
+        MergeStrategy::JsonArrayMerge { key, ref entries }
+        | MergeStrategy::JsonArrayRemove { key, ref entries } => {
             if full_path.exists() {
                 let raw = std::fs::read_to_string(&full_path)
                     .with_context(|| format!("failed to read {}", full_path.display()))?;
@@ -195,21 +200,26 @@ fn uninstall_file(file: &InstalledFile, config_dir: &std::path::Path) -> Result<
     Ok(())
 }
 
-/// Deletes each of the adapter's `legacy_paths()` under `config_dir`, if present.
-/// A path may be a file or a directory — either is removed outright (deletion is
-/// the documented preference over leaving a stale "superseded" pointer behind).
+/// Deletes only the exact owned files named by `legacy_paths()`. A directory
+/// may contain user additions and must never be removed recursively.
 fn remove_legacy_paths(adapter: &dyn AgentAdapter, config_dir: &std::path::Path) -> Result<()> {
     for path in adapter.legacy_paths() {
         let full_path = config_dir.join(&path);
-        if full_path.is_dir() {
-            std::fs::remove_dir_all(&full_path)
-                .with_context(|| format!("failed to remove legacy {}", full_path.display()))?;
-            println!("removed  {} (legacy)", full_path.display());
-        } else if full_path.exists() {
-            std::fs::remove_file(&full_path)
-                .with_context(|| format!("failed to remove legacy {}", full_path.display()))?;
-            println!("removed  {} (legacy)", full_path.display());
+        remove_legacy_file(&full_path)?;
+    }
+    Ok(())
+}
+
+fn remove_legacy_file(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(!metadata.is_dir(), "refusing to remove legacy directory {}; expected an owned file", path.display());
+            std::fs::remove_file(path)
+                .with_context(|| format!("failed to remove legacy {}", path.display()))?;
+            println!("removed  {} (legacy)", path.display());
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -217,6 +227,38 @@ fn remove_legacy_paths(adapter: &dyn AgentAdapter, config_dir: &std::path::Path)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_cleanup_preserves_directories_and_symlink_targets() {
+        let dir = std::env::temp_dir().join(format!("overseer-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user_file = dir.join("user.md");
+        std::fs::write(&user_file, "user instructions").unwrap();
+        assert!(remove_legacy_file(&dir).is_err());
+        let link = dir.join("owned-link");
+        std::os::unix::fs::symlink(&user_file, &link).unwrap();
+        remove_legacy_file(&link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "user instructions");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn instruction_migration_removes_only_exact_entries_without_creating_config() {
+        let dir = std::env::temp_dir().join(format!("overseer-migrate-{}", uuid::Uuid::new_v4()));
+        let file = InstalledFile {
+            path: "opencode.jsonc".into(), content: String::new(),
+            merge: MergeStrategy::JsonArrayRemove { key: "instructions", entries: vec!["overseer-root.md".into()] },
+        };
+        install_file(&file, &dir).unwrap();
+        assert!(!dir.exists());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.jsonc");
+        std::fs::write(&path, r#"{"model":"user-model","instructions":["overseer-root.md","user.md"]}"#).unwrap();
+        install_file(&file, &dir).unwrap();
+        uninstall_file(&file, &dir).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"model":"user-model","instructions":["user.md"]}));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn codex_hooks_install_upgrade_and_uninstall_preserve_user_hooks() {
         use crate::agent::adapters::codex::CodexAdapter;

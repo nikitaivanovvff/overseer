@@ -98,6 +98,9 @@ pub enum MergeStrategy {
     /// for an `_overseer` sentinel, so uninstall removes exactly `entries`
     /// rather than anything tagged as Overseer's.
     JsonArrayMerge { key: &'static str, entries: Vec<String> },
+    /// Migration-only removal of obsolete owned instruction entries. Missing
+    /// configuration is left untouched on both install and uninstall.
+    JsonArrayRemove { key: &'static str, entries: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
