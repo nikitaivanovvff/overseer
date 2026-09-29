@@ -43,6 +43,8 @@ pub struct SpawnRequest {
 
 #[derive(Debug, Error)]
 pub enum SpawnError {
+    #[error("daemon is shutting down")]
+    ShuttingDown,
     #[error("unknown adapter: {0}")]
     UnknownAdapter(String),
     #[error("'{0}' adapter is not installed -- run `overseer install {0}` first")]
@@ -64,6 +66,8 @@ pub fn spawn_agent(
     config: &Config,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
+    let closing = registry.lifecycle();
+    if *closing { return Err(SpawnError::ShuttingDown); }
     match req.role.clone() {
         AgentRole::Root => spawn_root(registry, sessions, socket, req),
         AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Spawning),
@@ -77,6 +81,8 @@ pub fn spawn_manual_child(
     config: &Config,
     req: SpawnRequest,
 ) -> Result<RegisterResult, SpawnError> {
+    let closing = registry.lifecycle();
+    if *closing { return Err(SpawnError::ShuttingDown); }
     spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Idle)
 }
 
@@ -246,6 +252,34 @@ mod tests {
     use crate::agent::adapters::LaunchContext;
     use crate::config::Config;
     use std::path::PathBuf;
+
+    #[test]
+    fn launch_and_drop_wait_for_lifecycle_transaction() {
+        use std::{sync::{Arc, mpsc}, time::Duration};
+        let registry = Arc::new(AgentRegistry::new());
+        let sessions = Arc::new(SessionManager::dry_run());
+        let guard = registry.lifecycle();
+        let (tx, rx) = mpsc::channel();
+        let r = registry.clone(); let sessions_clone = sessions.clone();
+        let worker = std::thread::spawn(move || {
+            let result = spawn_agent(&r, &sessions_clone, Path::new("/tmp/test.sock"), &Config::default(), base_request(AgentRole::Root, None)).unwrap();
+            tx.send(result.id).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(registry.snapshot().is_empty());
+        drop(guard);
+        let id = rx.recv_timeout(Duration::from_secs(2)).unwrap(); worker.join().unwrap();
+        let guard = registry.lifecycle(); let (tx, rx) = mpsc::channel();
+        let r = registry.clone(); let id_clone = id.clone();
+        let worker = std::thread::spawn(move || {
+            crate::agent::drop::drop_agent(&r, &sessions, &id_clone, true, true).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(registry.get(&id).is_some());
+        drop(guard); rx.recv_timeout(Duration::from_secs(2)).unwrap(); worker.join().unwrap();
+        assert!(registry.snapshot().is_empty());
+    }
 
     #[test]
     fn launch_dry_run_succeeds() {

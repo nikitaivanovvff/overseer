@@ -26,6 +26,18 @@ pub fn drop_agent(
     recursive: bool,
     allow_root: bool,
 ) -> Result<(), DropError> {
+    let _lifecycle = registry.lifecycle();
+    drop_agent_locked(registry, sessions, id, recursive, allow_root)
+}
+
+/// Caller must hold the registry lifecycle lock throughout this operation.
+pub(crate) fn drop_agent_locked(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    id: &AgentId,
+    recursive: bool,
+    allow_root: bool,
+) -> Result<(), DropError> {
     let agent = registry.get(id).ok_or_else(|| DropError::NotFound(id.clone()))?;
 
     if agent.role == AgentRole::Root && !allow_root {

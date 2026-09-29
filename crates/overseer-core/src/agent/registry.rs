@@ -57,6 +57,8 @@ pub enum RegistryEvent {
 
 pub struct AgentRegistry {
     tree: Mutex<AgentTree>,
+    /// Serializes register/launch/drop transactions; true once shutdown begins.
+    lifecycle: Mutex<bool>,
     events: broadcast::Sender<RegistryEvent>,
 }
 
@@ -99,12 +101,16 @@ pub struct RegisterResult {
 impl AgentRegistry {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { tree: Mutex::new(AgentTree::new()), events }
+        Self { tree: Mutex::new(AgentTree::new()), lifecycle: Mutex::new(false), events }
     }
 
     pub fn from_tree(tree: AgentTree) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { tree: Mutex::new(tree), events }
+        Self { tree: Mutex::new(tree), lifecycle: Mutex::new(false), events }
+    }
+
+    pub(crate) fn lifecycle(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.lifecycle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Subscribes to every registration/removal/status-change from this point

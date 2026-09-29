@@ -235,13 +235,15 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
         // request's own response (written by the caller *after* `dispatch`
         // returns) is never raced against the runtime tearing down.
         Request::Shutdown => {
+            let mut closing = ctx.registry.lifecycle();
+            *closing = true;
             let root_ids: Vec<AgentId> =
                 ctx.registry.with_tree(|t| t.roots.iter().map(|r| r.id.clone()).collect());
             for root_id in root_ids {
                 // Best-effort: a root could in principle already be gone by
                 // the time we get to it (e.g. a racing `drop` from another
                 // connection) — that's not a shutdown failure.
-                let _ = drop_agent(&ctx.registry, &ctx.sessions, &root_id, true, true);
+                let _ = crate::agent::drop::drop_agent_locked(&ctx.registry, &ctx.sessions, &root_id, true, true);
             }
             ctx.registry.announce_shutdown();
             Response::ok(None)
@@ -303,6 +305,15 @@ mod tests {
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    #[test]
+    fn shutdown_closes_spawn_admission() {
+        let ctx = make_ctx();
+        assert!(dispatch(&ctx, Request::Shutdown).ok);
+        let response = dispatch(&ctx, Request::Start { cwd: Some(std::env::temp_dir()) });
+        assert!(!response.ok, "shutdown must reject a start racing the response");
+        assert!(ctx.registry.snapshot().is_empty());
     }
 
     #[test]

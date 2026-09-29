@@ -9,7 +9,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-use crate::agent::{drop::drop_agent, AgentId, AgentRegistry, AgentRole, AgentStatus};
+use crate::agent::{drop::drop_agent_locked, AgentId, AgentRegistry, AgentRole, AgentStatus};
 use crate::git::GitClient;
 use crate::ipc::{
     handlers::{dispatch, AppCtx},
@@ -653,6 +653,7 @@ async fn session_watcher(ctx: Arc<AppCtx>) {
 /// stops being true, not silently dropped because its status update is
 /// skipped.
 fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
+    let _lifecycle = registry.lifecycle();
     for (id, success) in sessions.drain_exits() {
         registry.mark_session_exited(&id);
 
@@ -680,7 +681,7 @@ fn sweep_exited_sessions(registry: &AgentRegistry, sessions: &SessionManager) {
                     agent.role,
                 );
             }
-            if let Err(error) = drop_agent(registry, sessions, &id, true, true) {
+            if let Err(error) = drop_agent_locked(registry, sessions, &id, true, true) {
                 eprintln!("overseer: failed to auto-drop agent {} after clean exit: {error}", id.short());
             }
             continue;
