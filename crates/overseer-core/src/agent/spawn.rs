@@ -68,6 +68,17 @@ pub fn spawn_agent(
 ) -> Result<RegisterResult, SpawnError> {
     let closing = registry.lifecycle();
     if *closing { return Err(SpawnError::ShuttingDown); }
+    spawn_agent_locked(registry, sessions, socket, config, req)
+}
+
+/// Caller must hold the registry lifecycle lock through admission and launch.
+pub(crate) fn spawn_agent_locked(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    config: &Config,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
     match req.role.clone() {
         AgentRole::Root => spawn_root(registry, sessions, socket, req),
         AgentRole::Child => spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Spawning),
@@ -83,6 +94,17 @@ pub fn spawn_manual_child(
 ) -> Result<RegisterResult, SpawnError> {
     let closing = registry.lifecycle();
     if *closing { return Err(SpawnError::ShuttingDown); }
+    spawn_manual_child_locked(registry, sessions, socket, config, req)
+}
+
+/// Caller must hold the registry lifecycle lock through admission and launch.
+pub(crate) fn spawn_manual_child_locked(
+    registry: &AgentRegistry,
+    sessions: &SessionManager,
+    socket: &Path,
+    config: &Config,
+    req: SpawnRequest,
+) -> Result<RegisterResult, SpawnError> {
     spawn_child_agent(registry, sessions, socket, config, req, AgentStatus::Idle)
 }
 

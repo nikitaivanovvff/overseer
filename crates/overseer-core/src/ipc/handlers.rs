@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::drop::drop_agent;
-use crate::agent::spawn::{spawn_agent, spawn_manual_child, SpawnRequest};
+use crate::agent::spawn::{spawn_agent, spawn_agent_locked, spawn_manual_child_locked, SpawnRequest};
 use crate::agent::{AgentId, AgentRegistry, AgentRole};
 use crate::config::Config;
 use crate::git::{dir_basename, GitClient};
@@ -125,6 +125,10 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                     "task exceeds max size of {MAX_SPAWN_TASK_BYTES} bytes"
                 ));
             }
+            let closing = ctx.registry.lifecycle();
+            if *closing {
+                return Response::err("daemon is shutting down");
+            }
             let parent = match spawn_parent(ctx, &parent_id) {
                 Ok(parent) => parent,
                 Err(response) => return response,
@@ -154,7 +158,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 branch: None,
             };
 
-            match spawn_agent(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
+            match spawn_agent_locked(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
                 Ok(result) => Response::ok(Some(OkBody::Registered {
                     agent_id: result.id,
                     branch: result.branch,
@@ -167,6 +171,10 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
             let name = name.trim().to_string();
             if name.is_empty() {
                 return Response::err("child name cannot be empty");
+            }
+            let closing = ctx.registry.lifecycle();
+            if *closing {
+                return Response::err("daemon is shutting down");
             }
             let parent = match spawn_parent(ctx, &parent_id) {
                 Ok(parent) => parent,
@@ -185,7 +193,7 @@ pub fn dispatch(ctx: &AppCtx, req: Request) -> Response {
                 repo: parent.repo,
                 branch: None,
             };
-            match spawn_manual_child(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
+            match spawn_manual_child_locked(&ctx.registry, &ctx.sessions, &ctx.socket, &ctx.config, req) {
                 Ok(result) => Response::ok(Some(OkBody::Registered {
                     agent_id: result.id,
                     branch: result.branch,
@@ -305,6 +313,36 @@ mod tests {
             watch_sessions: false,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    #[test]
+    fn concurrent_cli_and_manual_spawns_share_one_child_cap() {
+        use std::{sync::Barrier, time::Duration};
+        let mut ctx = make_ctx();
+        Arc::make_mut(&mut ctx.config).defaults.max_children = 1;
+        let root = start_root(&ctx);
+        ctx.registry.set_status(&root, crate::agent::AgentStatus::Idle, None, None, Some("claude".into()), std::time::SystemTime::now()).unwrap();
+        let ctx = Arc::new(ctx);
+        let gate = ctx.registry.lifecycle();
+        let barrier = Arc::new(Barrier::new(13));
+        let workers: Vec<_> = (0..12).map(|i| {
+            let ctx = ctx.clone(); let parent_id = root.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let request = if i % 2 == 0 {
+                    Request::Spawn { parent_id, task: "work".into(), name: None, adapter: None, cwd: std::env::temp_dir() }
+                } else { Request::TuiSpawnChild { parent_id, name: format!("child-{i}") } };
+                dispatch(&ctx, request).ok
+            })
+        }).collect();
+        barrier.wait();
+        // Hold launch long enough for callers to race admission. Before the
+        // fix every caller admitted itself before waiting for this lock.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(gate);
+        let successes = workers.into_iter().map(|worker| worker.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(successes, 1);
+        assert_eq!(ctx.registry.spawn_metrics(&root).unwrap().1, 1);
     }
 
     #[test]
