@@ -122,10 +122,7 @@ fn run_with_timeouts(
     };
 
     let children = direct_children(daemon_pid);
-    for pid in &children {
-        kill_pid(*pid);
-    }
-    kill_pid(daemon_pid);
+    terminate_process_tree(daemon_pid);
     wait_for_death(daemon_pid, death_poll_timeout, death_poll_interval);
 
     remove_if_exists(socket);
@@ -172,6 +169,31 @@ fn remove_if_exists(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+/// Stop each owner before enumerating its children, so it cannot launch more
+/// work while its tree is being torn down. Descendants can have their own
+/// process groups (interactive shell jobs), so a group signal alone is not enough.
+/// Call only for a process whose identity/ownership the caller established.
+pub(crate) fn terminate_process_tree(pid: i32) {
+    if pid <= 1 || pid == std::process::id() as i32 { return; }
+    if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 { return; }
+    // A successful SIGSTOP send is asynchronous; wait until the kernel reports
+    // the process stopped before taking its child snapshot.
+    for _ in 0..100 {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()]).output();
+        match output {
+            Ok(output) => {
+                let state = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success() || state.trim().starts_with(['T', 'Z']) { break; }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for child in direct_children(pid) { terminate_process_tree(child); }
+    kill_pid(pid);
 }
 
 fn kill_pid(pid: i32) {

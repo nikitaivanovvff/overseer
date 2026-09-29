@@ -364,10 +364,10 @@ impl SessionManager {
     pub fn kill(&self, id: &AgentId) {
         let session = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         let Some(session) = session else { return };
-        let _ = session.channel.send(Msg::Shutdown);
-        unsafe {
-            libc::kill(session.pid as libc::pid_t, libc::SIGKILL);
+        if session.alive.load(Ordering::Relaxed) {
+            crate::kill::terminate_process_tree(session.pid as i32);
         }
+        let _ = session.channel.send(Msg::Shutdown);
         if let Some(handle) = session.reader {
             let _ = handle.join();
         }
@@ -766,6 +766,30 @@ mod tests {
             }
             if offset >= 5 { assert!(grid.cursor.is_none()); }
         }
+    }
+
+    #[test]
+    fn kill_terminates_hangup_ignoring_descendants() {
+        let path = std::env::temp_dir().join(format!("ovsr-descendant-{}", uuid::Uuid::new_v4()));
+        let sessions = SessionManager::new(); let id = AgentId::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP; sleep 60 & echo $! > \"$AUDIT_PID_FILE\"; wait"]);
+        let env = HashMap::from([("AUDIT_PID_FILE".into(), path.to_str().unwrap().into())]);
+        sessions.launch(id.clone(), Path::new("/tmp"), &cmd, &env).unwrap();
+        for _ in 0..100 { if path.exists() { break; } std::thread::sleep(std::time::Duration::from_millis(10)); }
+        let pid: i32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+        sessions.kill(&id);
+        let mut alive = true;
+        for _ in 0..100 {
+            let output = Command::new("/bin/ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            alive = output.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z');
+            if !alive { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+        std::fs::remove_file(path).unwrap();
+        assert!(!alive, "PTY descendant survived dropping its owner");
     }
 
     #[test]
