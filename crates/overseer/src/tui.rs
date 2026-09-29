@@ -21,7 +21,6 @@ use crate::app::{
 use overseer_core::config::{Action, Config, KeyBinding, Keybindings};
 use overseer_core::daemon;
 use overseer_core::git::GitClient;
-use overseer_core::ipc;
 use overseer_core::ipc::protocol::Request;
 use overseer_core::ipc::AppCtx;
 use overseer_core::session::{self, SessionManager};
@@ -75,13 +74,6 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
         DisableBracketedPaste
     );
     let _ = terminal.show_cursor();
-    // Only mock mode owns its socket (a throwaway, per-invocation IPC server
-    // it started itself) — real mode attached to the daemon's stable,
-    // persistent socket and must leave it alone; the daemon owns it across
-    // TUI restarts, that's the whole point of the split.
-    if mock {
-        let _ = std::fs::remove_file(&socket);
-    }
 
     res
 }
@@ -89,7 +81,7 @@ pub fn run_tui(socket: PathBuf, mock: bool) -> Result<()> {
 /// `--mock` is inert demo data run fully in-process, exactly as before the
 /// daemon split — it never spawns a real PTY and never touches a daemon.
 fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
-    let ctx = Arc::new(AppCtx {
+    Arc::new(AppCtx {
         registry: Arc::new(overseer_core::agent::AgentRegistry::from_tree(AgentTree::with_mock_data())),
         sessions: Arc::new(SessionManager::dry_run()),
         socket: socket.clone(),
@@ -97,17 +89,7 @@ fn mock_ctx(socket: PathBuf) -> Arc<AppCtx> {
         config: Arc::new(Config::load()),
         watch_sessions: false,
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-    });
-
-    let ipc_ctx = ctx.clone();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        if let Err(e) = ipc::serve_blocking(ipc_ctx, socket, Some(ready_tx)) {
-            eprintln!("IPC server error: {e}");
-        }
-    });
-    ready_rx.recv().ok();
-    ctx
+    })
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -903,6 +885,18 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> bool {
 mod tests {
     use super::*;
     use overseer_core::agent::{AgentId, AgentRegistry, AgentRole, AgentStatus};
+
+    #[test]
+    fn mock_does_not_replace_an_existing_socket() {
+        use std::os::unix::fs::MetadataExt;
+        let path = PathBuf::from(format!("/tmp/ovsr-mock-safe-{}.sock", uuid::Uuid::new_v4()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let _ctx = mock_ctx(path.clone());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn mock_ctx_never_gets_a_real_session_manager() {
