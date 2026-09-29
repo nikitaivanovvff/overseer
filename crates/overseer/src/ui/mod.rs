@@ -156,11 +156,18 @@ pub fn render(
     };
 
     let tree_rect = left[0];
+    // Keep complete two-line items in view. Rendering and mouse hit testing
+    // consume this same slice, including during search and after a resize.
+    let capacity = tree_rect.height.saturating_sub(2) as usize / 2;
+    let start = (display_cursor + 1).saturating_sub(capacity).min(display_flat.len());
+    let end = (start + capacity).min(display_flat.len());
+    let display_flat = &display_flat[start..end];
+    let display_cursor = display_cursor.saturating_sub(start);
     let tree_rows: Vec<AgentId> = display_flat
         .iter()
         .flat_map(|node| [node.id.clone(), node.id.clone()])
         .collect();
-    render_agent_tree(frame, display_cursor, tick, tree_rect, &display_flat, matched.as_ref(), theme, search_query);
+    render_agent_tree(frame, display_cursor, tick, tree_rect, display_flat, matched.as_ref(), theme, search_query);
     render_agent_detail(frame, left[1], &selected, theme);
     let pane_rect =
         render_term_pane(frame, columns[1], pane_grid, selected.as_ref(), pane_focused, pane_selection);
@@ -921,6 +928,35 @@ fn focused_border(focused: bool, theme: &Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_viewport_keeps_selection_visible_and_mouse_rows_aligned() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut tree = AgentTree::with_mock_data();
+        let mut template = tree.roots[0].clone(); template.children.clear(); template.status = AgentStatus::Idle;
+        tree.roots = (0..20).map(|i| { let mut node = template.clone(); node.id = AgentId::new(); node.name = format!("node{i:02}"); node }).collect();
+        for height in [24, 40] {
+            for cursor in [0, 10, 19, 3] {
+                tree.cursor = cursor;
+                let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+                let mut layout = None;
+                terminal.draw(|f| { layout = Some(render(f, &tree, 0, None, None, None, None, false, None, &Theme::default(), &Keybindings::default(), false)); }).unwrap();
+                let layout = layout.unwrap(); let rect = layout.tree_rect;
+                let buffer = terminal.backend().buffer();
+                let text: String = (rect.y..rect.bottom()).flat_map(|y| (rect.x..rect.right()).map(move |x| buffer[(x,y)].symbol())).collect();
+                assert!(text.contains(&format!("node{cursor:02}")), "selected row not visible: {cursor}");
+                assert!(layout.tree_rows.len() <= rect.height.saturating_sub(2) as usize);
+                for (row, id) in layout.tree_rows.iter().enumerate() {
+                    assert_eq!(hit_test_tree(rect, &layout.tree_rows, rect.x + 1, rect.y + 1 + row as u16).as_ref(), Some(id));
+                    if row % 2 == 0 {
+                        let name = &tree.find(id).unwrap().name;
+                        let line: String = (rect.x..rect.right()).map(|x| buffer[(x, rect.y + 1 + row as u16)].symbol()).collect();
+                        assert!(line.contains(name));
+                    }
+                }
+            }
+        }
+    }
 
     // ── status_badge / status_style ──────────────────────────────────────────
 
