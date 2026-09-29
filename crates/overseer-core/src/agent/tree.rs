@@ -167,8 +167,10 @@ impl AgentTree {
     /// Inserts `node` as a child of the node identified by `parent_id`.
     /// Returns `true` if the parent was found, `false` otherwise.
     pub fn insert_child(&mut self, parent_id: &AgentId, node: AgentNode) -> bool {
+        let selected = self.selected().map(|node| node.id);
         if let Some(parent) = self.find_mut(parent_id) {
             parent.children.push(node);
+            if let Some(id) = selected { self.select_by_id(&id); }
             true
         } else {
             false
@@ -178,6 +180,7 @@ impl AgentTree {
     /// Removes the node with the given id (root or descendant).
     /// Returns `true` if found and removed.
     pub fn remove(&mut self, id: &AgentId) -> bool {
+        let selected = self.selected().map(|node| node.id);
         let removed = if let Some(pos) = self.roots.iter().position(|n| n.id == *id) {
             self.roots.remove(pos);
             true
@@ -190,6 +193,7 @@ impl AgentTree {
             // otherwise `selected()` can silently start returning `None`.
             let len = self.flatten().len();
             self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
+            if let Some(id) = selected { self.select_by_id(&id); }
         }
         removed
     }

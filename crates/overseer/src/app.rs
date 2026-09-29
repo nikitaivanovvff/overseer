@@ -142,7 +142,14 @@ impl App {
         let Backend::Daemon(state) = &mut self.backend else { return };
         loop {
             match state.events.try_recv() {
-                Ok(event) => apply_event(state, event),
+                Ok(event) => {
+                    let selected = state.tree.selected().map(|node| node.id);
+                    apply_event(state, event);
+                    if selected != state.tree.selected().map(|node| node.id) {
+                        self.focus = Focus::Tree;
+                        self.selection = None;
+                    }
+                },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     state.disconnected = true;
@@ -544,6 +551,24 @@ mod tests {
             events: rx,
             disconnected: false,
         }
+    }
+
+    #[test]
+    fn registry_mutations_preserve_input_target_and_release_removed_focus() {
+        let mut state = empty_daemon_state();
+        let a = AgentId::new(); let b = AgentId::new(); let c = AgentId::new();
+        apply_event(&mut state, AttachEvent::Snapshot { agents: vec![dto(a.clone(), None, AgentStatus::Idle), dto(b.clone(), None, AgentStatus::Idle), dto(c, None, AgentStatus::Idle)] });
+        state.tree.select_by_id(&b);
+        let (tx, rx) = mpsc::channel(); state.events = rx;
+        let mut app = App::new_daemon(state); app.focus = Focus::Pane;
+        tx.send(AttachEvent::AgentRegistered { agent: dto(AgentId::new(), Some(a.clone()), AgentStatus::Idle) }).unwrap();
+        app.tick();
+        assert_eq!(app.with_tree(|t| t.selected().unwrap().id), b);
+        tx.send(AttachEvent::AgentRemoved { agent_id: a }).unwrap(); app.tick();
+        assert_eq!(app.with_tree(|t| t.selected().unwrap().id), b);
+        assert_eq!(app.focus, Focus::Pane);
+        tx.send(AttachEvent::AgentRemoved { agent_id: b }).unwrap(); app.tick();
+        assert_eq!(app.focus, Focus::Tree);
     }
 
     #[test]
