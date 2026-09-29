@@ -24,6 +24,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 pub enum Command {
+    /// Print the current session's role contract. Silent outside a live managed session.
+    Context,
+    /// Codex lifecycle integration; consumes a hook JSON payload on stdin.
+    #[command(hide = true)]
+    CodexHook,
     /// Push a status update. Agent identity comes from $OVERSEER_AGENT_ID.
     /// When $OVERSEER_AGENT_ID is unset (non-Overseer session), exits 0 silently.
     Status {
@@ -70,6 +75,27 @@ pub enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// List retained assignments and results (defaults to your own direct children).
+    Tasks {
+        #[arg(long)] parent: Option<String>,
+        #[arg(long)] archived: bool,
+    },
+    /// Read a full retained assignment and result, including after its session exits.
+    Task { id: String },
+    /// Record the first assignment for a manually created child; does not type into its terminal.
+    Assign { id: String, #[arg(long)] task: String },
+    /// Report this session's task complete with a retained result, independent of activity hooks.
+    Complete {
+        #[arg(long)] summary: String,
+        #[arg(long = "artifact")] artifacts: Vec<String>,
+        #[arg(long, default_value = "Not reported")] validation: String,
+    },
+    /// Wait for a task result or interruption without polling (maximum 60 seconds).
+    Wait { id: String, #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(0..=60))] timeout: u64 },
+    /// Mark a completed task as reviewed and accepted. Does not merge code.
+    Accept { id: String },
+    /// Hide an accepted or interrupted task from the inbox. Does not delete files or kill sessions.
+    Archive { id: String },
     /// List all agents.
     List,
     /// Get agent detail.
@@ -223,6 +249,11 @@ pub fn run_client(socket: PathBuf, cmd: Command, pushed_at: std::time::SystemTim
     // by `ipc::client::prompt`, so it's intercepted here rather than routed
     // through `build_request`/`ipc::client::send`'s one-request/response flow.
     let cmd = match cmd {
+        Command::Context => {
+            if let Some(context) = managed_context(&socket) { println!("{context}"); }
+            return Ok(());
+        }
+        Command::CodexHook => return run_codex_hook(&socket, pushed_at),
         Command::Prompt { id, text } => {
             let agent_id = id.parse::<AgentId>().map_err(|e| anyhow::anyhow!("invalid agent id: {e}"))?;
             return ipc::client::prompt(&socket, &agent_id, &text);
@@ -235,7 +266,11 @@ pub fn run_client(socket: PathBuf, cmd: Command, pushed_at: std::time::SystemTim
         None => return Ok(()), // silent no-op (Status outside an Overseer session)
     };
 
-    let resp = match ipc::client::send(&socket, &req) {
+    let response = match &req {
+        Request::Wait { timeout_secs, .. } => ipc::client::send_with_timeout(&socket, &req, std::time::Duration::from_secs(timeout_secs + 2)),
+        _ => ipc::client::send(&socket, &req),
+    };
+    let resp = match response {
         Ok(r) => r,
         // Status is hook-invoked: if the socket is unreachable, exit silently.
         Err(_) if matches!(req, Request::Status { .. }) => return Ok(()),
@@ -250,6 +285,45 @@ pub fn run_client(socket: PathBuf, cmd: Command, pushed_at: std::time::SystemTim
         eprintln!("error: {error}");
         std::process::exit(1);
     }
+}
+
+fn managed_context(socket: &std::path::Path) -> Option<String> {
+    let id = std::env::var("OVERSEER_AGENT_ID").ok()?.parse().ok()?;
+    let response = ipc::client::send_with_timeout(socket, &Request::Context { agent_id: id }, std::time::Duration::from_secs(1)).ok()?;
+    match response.data {
+        Some(ipc::protocol::OkBody::Context { context, .. }) if response.ok => Some(context),
+        _ => None,
+    }
+}
+
+fn run_codex_hook(socket: &std::path::Path, pushed_at: std::time::SystemTime) -> Result<()> {
+    use std::io::Read;
+    let Some(id) = std::env::var("OVERSEER_AGENT_ID").ok().and_then(|s| s.parse::<AgentId>().ok()) else {
+        println!("{{}}"); return Ok(());
+    };
+    let mut bytes = Vec::new();
+    std::io::stdin().take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    let update = (bytes.len() <= 64 * 1024).then(|| serde_json::from_slice(&bytes).ok()).flatten()
+        .and_then(|payload| agent::adapters::codex::normalize_hook(&payload, std::env::var("OVERSEER_TASK").is_ok_and(|s| !s.is_empty())));
+    let Some(update) = update else { println!("{{}}"); return Ok(()) };
+    let req = Request::Status {
+        agent_id: id, status: update.status, message: None, context_pct: None,
+        model_name: update.model_name, clear_context: update.bootstrap, attention: None,
+        adapter: Some("codex".into()),
+        branch: std::env::current_dir().ok().and_then(|cwd| detect_current_branch(&cwd)),
+        repo: if std::env::var("OVERSEER_ROLE").ok().as_deref() == Some("root") {
+            std::env::current_dir().ok().map(|cwd| detect_current_repo(&cwd))
+        } else { None }, pushed_at,
+    };
+    let _ = ipc::client::send_with_timeout(socket, &req, std::time::Duration::from_secs(1));
+    if update.bootstrap {
+        if let Some(context) = managed_context(socket) {
+            println!("{}", serde_json::json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}));
+            return Ok(());
+        }
+    }
+    println!("{{}}");
+    Ok(())
 }
 
 /// Reads and parses the hook payload JSON from stdin. `None` on any I/O or parse
@@ -378,6 +452,18 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
                 pushed_at,
             }))
         }
+        Command::Tasks { parent, archived } => Ok(Some(Request::Tasks {
+            parent_id: parent.or_else(|| std::env::var("OVERSEER_AGENT_ID").ok()).map(|id| id.parse()).transpose()?, archived,
+        })),
+        Command::Task { id } => Ok(Some(Request::Task { agent_id: id.parse()? })),
+        Command::Assign { id, task } => Ok(Some(Request::Assign { agent_id: id.parse()?, task })),
+        Command::Complete { summary, artifacts, validation } => Ok(Some(Request::Complete {
+            agent_id: std::env::var("OVERSEER_AGENT_ID").map_err(|_| anyhow::anyhow!("complete requires an Overseer child session"))?.parse()?,
+            result: overseer_core::tasks::TaskResult { summary, artifacts, validation, work_dir: std::env::current_dir()? },
+        })),
+        Command::Wait { id, timeout } => Ok(Some(Request::Wait { agent_id: id.parse()?, timeout_secs: timeout })),
+        Command::Accept { id } => Ok(Some(Request::Accept { agent_id: id.parse()? })),
+        Command::Archive { id } => Ok(Some(Request::Archive { agent_id: id.parse()? })),
         Command::List => Ok(Some(Request::List)),
         Command::Agent { id } => {
             let agent_id = id
@@ -412,6 +498,7 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
             Ok(Some(Request::Drop { agent_id, recursive }))
         }
         Command::Shutdown => Ok(Some(Request::Shutdown)),
+        Command::Context | Command::CodexHook => unreachable!("context hooks are handled before build_request"),
         Command::Install { .. } => unreachable!("Install is handled before run_client"),
         Command::Uninstall { .. } => unreachable!("Uninstall is handled before run_client"),
         Command::Daemon => unreachable!("Daemon is handled before run_client"),
@@ -424,6 +511,30 @@ fn build_request(cmd: Command, pushed_at: std::time::SystemTime) -> Result<Optio
 mod tests {
     use super::*;
     use overseer_core::test_env::EnvGuard;
+
+    #[test]
+    fn task_commands_preserve_results_and_bound_waiting() {
+        use clap::Parser;
+        let id = AgentId::new();
+        let _env = EnvGuard::set("OVERSEER_AGENT_ID", &id.0.to_string());
+        let parsed = Cli::try_parse_from(["overseer", "complete", "--summary", "fixed login",
+            "--artifact", "commit:abc", "--artifact", "tests/login.rs", "--validation", "3 tests passed"]).unwrap();
+        let req = build_request(parsed.cmd.unwrap(), std::time::SystemTime::now()).unwrap().unwrap();
+        match req {
+            Request::Complete { agent_id, result } => {
+                assert_eq!(agent_id, id);
+                assert_eq!(result.summary, "fixed login");
+                assert_eq!(result.artifacts, ["commit:abc", "tests/login.rs"]);
+                assert_eq!(result.work_dir, std::env::current_dir().unwrap());
+                assert_eq!(result.validation, "3 tests passed");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+        let wait = Cli::try_parse_from(["overseer", "wait", &id.0.to_string(), "--timeout", "61"]);
+        assert!(wait.is_err());
+        let req = build_request(Command::Tasks { parent: None, archived: false }, std::time::SystemTime::now()).unwrap().unwrap();
+        assert!(matches!(req, Request::Tasks { parent_id: Some(parent), archived: false } if parent == id));
+    }
 
     #[test]
     fn build_request_status_no_env_var_returns_none() {
